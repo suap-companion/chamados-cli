@@ -1,0 +1,9 @@
+[package]
+name = "chamados-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+suap-core = { path = "../suap-core" }
+thiserror = "2"

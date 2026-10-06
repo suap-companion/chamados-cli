@@ -1,0 +1,9 @@
+[package]
+name = "suap-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = "2"
+url = "2"
