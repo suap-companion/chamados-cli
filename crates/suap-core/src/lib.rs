@@ -4,11 +4,10 @@ use std::{fs, io::{BufReader, Write}, path::{Path, PathBuf}, sync::Arc};
 
 use directories::ProjectDirs;
 use reqwest::{Client, StatusCode, Url};
-use reqwest_cookie_store::CookieStore;
+use reqwest_cookie_store::{CookieStore, CookieStoreMutex};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::Mutex;
 
 const QUALIFIER: &str = "br.edu.ifrn";
 const ORGANIZATION: &str = "suap-companion";
@@ -94,7 +93,7 @@ fn validate_config(config: &SuapConfig) -> Result<(), SuapError> {
 #[derive(Debug)]
 pub struct SessionStore {
     path: PathBuf,
-    cookies: Arc<Mutex<CookieStore>>,
+    cookies: Arc<CookieStoreMutex>,
 }
 
 impl SessionStore {
@@ -104,10 +103,10 @@ impl SessionStore {
         } else {
             CookieStore::default()
         };
-        Ok(Self { path, cookies: Arc::new(Mutex::new(cookies)) })
+        Ok(Self { path, cookies: Arc::new(CookieStoreMutex::new(cookies)) })
     }
 
-    pub fn cookie_provider(&self) -> Arc<Mutex<CookieStore>> { Arc::clone(&self.cookies) }
+    pub fn cookie_provider(&self) -> Arc<CookieStoreMutex> { Arc::clone(&self.cookies) }
 
     pub async fn save(&self) -> Result<(), SuapError> {
         let parent = self.path.parent().ok_or_else(|| SuapError::InvalidConfiguration("session path has no parent directory".to_owned()))?;
@@ -115,7 +114,7 @@ impl SessionStore {
         let temporary = self.path.with_extension("cookies.tmp");
         let file = fs::File::create(&temporary)?;
         let mut writer = std::io::BufWriter::new(file);
-        let cookies = self.cookies.lock().await;
+        let cookies = self.cookies.lock().map_err(|_| SuapError::CookieStore("cookie store lock poisoned".to_owned()))?;
         cookies.save_json(&mut writer)?;
         drop(cookies);
         writer.flush()?;
@@ -146,9 +145,7 @@ impl SuapClient {
     pub async fn login(&self, username: &str, password: &str) -> Result<(), SuapError> {
         let login_url = self.base_url.join(LOGIN_PATH)?;
         let page = self.client.get(login_url.clone()).send().await?;
-        if !page.status().is_success() {
-            return Err(SuapError::AuthenticationFailed);
-        }
+        if !page.status().is_success() { return Err(SuapError::AuthenticationFailed); }
         let html = page.text().await?;
         let csrf = extract_csrf_token(&html)?;
         let response = self.client.post(login_url).form(&[
