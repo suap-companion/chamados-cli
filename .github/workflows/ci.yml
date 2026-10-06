@@ -24,7 +24,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --all-targets
 
   build:
     name: Build workspace
@@ -41,4 +41,4 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build release binaries
-        run: cargo build --workspace --release
+        run: cargo build --workspace --all-targets --release
