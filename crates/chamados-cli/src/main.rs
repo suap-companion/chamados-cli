@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use suap_core::{load_config, save_config, AppPaths, SuapConfig};
+use suap_core::{load_config, save_config, AppPaths};
 
 #[derive(Debug, Parser)]
 #[command(name = "chamados", version, about = "Cliente local para chamados do SUAP")]

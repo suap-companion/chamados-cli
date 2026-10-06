@@ -47,6 +47,12 @@ async fn login_sends_csrf_credentials_and_persists_session_cookie() {
         .mount(&server)
         .await;
 
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("dashboard"))
+        .mount(&server)
+        .await;
+
     let (_directory, paths) = paths();
     let client = SuapClient::open(&paths, &config(&server)).unwrap();
     client.login("kelson", "secret").await.unwrap();
