@@ -1,10 +1,13 @@
-//! Shared SUAP configuration and session primitives.
+//! Shared SUAP configuration and persistent session primitives.
 
-use std::{fs, path::{Path, PathBuf}};
+use std::{fs, io::{BufReader, Write}, path::{Path, PathBuf}, sync::Arc};
 
 use directories::ProjectDirs;
+use reqwest::Client;
+use reqwest_cookie_store::CookieStore;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::sync::Mutex;
 use url::Url;
 
 const QUALIFIER: &str = "br.edu.ifrn";
@@ -103,6 +106,87 @@ fn validate_config(config: &SuapConfig) -> Result<(), SuapError> {
     }
 }
 
+#[derive(Debug)]
+pub struct SessionStore {
+    path: PathBuf,
+    cookies: Arc<Mutex<CookieStore>>,
+}
+
+impl SessionStore {
+    pub fn open(path: PathBuf) -> Result<Self, SuapError> {
+        let cookies = if path.exists() {
+            let file = fs::File::open(&path)?;
+            CookieStore::load_json(BufReader::new(file))?
+        } else {
+            CookieStore::default()
+        };
+
+        Ok(Self {
+            path,
+            cookies: Arc::new(Mutex::new(cookies)),
+        })
+    }
+
+    pub fn cookie_provider(&self) -> Arc<Mutex<CookieStore>> {
+        Arc::clone(&self.cookies)
+    }
+
+    pub async fn save(&self) -> Result<(), SuapError> {
+        let parent = self.path.parent().ok_or_else(|| {
+            SuapError::InvalidConfiguration("session path has no parent directory".to_owned())
+        })?;
+        fs::create_dir_all(parent)?;
+        let temporary = self.path.with_extension("cookies.tmp");
+        let file = fs::File::create(&temporary)?;
+        let mut writer = std::io::BufWriter::new(file);
+        let cookies = self.cookies.lock().await;
+        cookies.save_json(&mut writer)?;
+        drop(cookies);
+        writer.flush()?;
+        fs::rename(temporary, &self.path)?;
+        restrict_permissions(&self.path)?;
+        Ok(())
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+pub struct SuapClient {
+    client: Client,
+    session: SessionStore,
+}
+
+impl SuapClient {
+    pub fn open(paths: &AppPaths) -> Result<Self, SuapError> {
+        let session = SessionStore::open(paths.session_file())?;
+        let client = Client::builder()
+            .cookie_provider(session.cookie_provider())
+            .build()?;
+        Ok(Self { client, session })
+    }
+
+    pub fn http_client(&self) -> &Client {
+        &self.client
+    }
+
+    pub fn session(&self) -> &SessionStore {
+        &self.session
+    }
+}
+
+fn restrict_permissions(path: &Path) -> Result<(), SuapError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 pub enum SuapError {
     #[error("application directories are unavailable")]
@@ -119,10 +203,20 @@ pub enum SuapError {
     Parse(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("HTTP error: {0}")]
+    Http(#[from] reqwest::Error),
+    #[error("cookie store error: {0}")]
+    CookieStore(String),
     #[error("TOML error: {0}")]
     Toml(#[from] toml::ser::Error),
     #[error("TOML parsing error: {0}")]
     TomlDe(#[from] toml::de::Error),
+}
+
+impl From<Box<dyn std::error::Error + Send + Sync>> for SuapError {
+    fn from(error: Box<dyn std::error::Error + Send + Sync>) -> Self {
+        Self::CookieStore(error.to_string())
+    }
 }
 
 #[cfg(test)]
