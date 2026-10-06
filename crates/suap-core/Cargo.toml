@@ -5,5 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+directories = "6"
+serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-url = "2"
+toml = "0.8"
+url = { version = "2", features = ["serde"] }

@@ -6,15 +6,37 @@ Cliente local para acompanhar chamados do SUAP, inicialmente como uma CLI em Rus
 
 O projeto é um workspace Cargo com três crates:
 
-- `suap-core`: autenticação, sessão, cookies, configuração e transporte compartilhados.
+- `suap-core`: configuração, diretórios, autenticação, sessão, cookies e transporte compartilhados.
 - `chamados-core`: domínio de chamados, sincronização e recursos locais como títulos e adiamentos.
 - `chamados-cli`: interface de linha de comando.
 
 A separação permite reutilizar o núcleo Rust no Android sem colocar regras de chamados dentro da camada de autenticação do SUAP.
 
-## Estado atual
+## Configuração local
 
-Esta primeira versão cria somente a fundação compilável. Ainda não implementa login, persistência de cookies, requisições ao SUAP ou parsing HTML.
+A aplicação usa `ProjectDirs` para obter diretórios apropriados para cada sistema operacional. O arquivo de configuração é `config.toml`; o arquivo reservado para a sessão fica no diretório de dados como `session.cookies`.
+
+Consulte os caminhos com:
+
+```bash
+cargo run -p chamados-cli -- paths
+```
+
+Crie a configuração inicial com:
+
+```bash
+cargo run -p chamados-cli -- config-init \
+  --base-url https://suap.ifrn.edu.br/ \
+  --username seu_usuario
+```
+
+Consulte a configuração sem exibir senha:
+
+```bash
+cargo run -p chamados-cli -- config-show
+```
+
+A senha e os cookies ainda não são persistidos nesta etapa.
 
 ## Desenvolvimento
 
@@ -24,11 +46,3 @@ cargo test --workspace
 cargo run -p chamados-cli -- --help
 cargo run -p chamados-cli -- status
 ```
-
-## Próximos passos
-
-1. Implementar configuração local.
-2. Implementar cookie jar persistente em `suap-core`.
-3. Implementar `session-status`.
-4. Implementar login e reutilização de sessão.
-5. Adicionar parser HTML do SUAP com fixtures testáveis.

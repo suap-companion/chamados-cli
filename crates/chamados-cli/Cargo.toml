@@ -6,3 +6,4 @@ license.workspace = true
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+suap-core = { path = "../suap-core" }
