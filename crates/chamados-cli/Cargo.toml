@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+chamados-core = { path = "../chamados-core" }
 suap-core = { path = "../suap-core" }
 tokio = { version = "1", features = ["rt"] }
 

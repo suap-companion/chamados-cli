@@ -47,6 +47,17 @@ cargo run -p chamados-cli -- login --username seu_usuario
 
 Após o login, apenas os cookies de sessão são salvos em `session.cookies`.
 
+### Listar chamados
+
+Com a sessão salva por `login`, liste os chamados (uma linha por chamado: `#id`, situação e assunto, separados por tabulação):
+
+```bash
+cargo run -p chamados-cli -- list           # fila de suporte (menu "Chamados")
+cargo run -p chamados-cli -- list --meus    # "Meus chamados" ativos
+```
+
+Se a sessão estiver ausente ou expirada, o comando orienta a executar `chamados login`.
+
 ## Requisitos de software
 
 - **RS-01 — Cobertura de testes de 100%.** Os testes automatizados do workspace devem cobrir 100% das linhas de código. A verificação roda no CI (`ci.yml`) e o build falha se a cobertura ficar abaixo disso. O ponto de entrada `main.rs` de cada binário deve conter apenas o encadeamento mínimo e é excluído da medição; toda a lógica fica em `lib.rs`, onde é testada.
