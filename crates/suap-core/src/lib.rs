@@ -131,6 +131,13 @@ impl SessionStore {
     pub fn path(&self) -> &Path { &self.path }
 }
 
+/// Result of submitting a form: the path reached after redirects and the page body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormResponse {
+    pub path: String,
+    pub body: String,
+}
+
 pub struct SuapClient {
     client: Client,
     session: SessionStore,
@@ -183,6 +190,20 @@ impl SuapClient {
             return Err(SuapError::Transport(format!("unexpected status {}", response.status())));
         }
         Ok(response.text().await?)
+    }
+
+    /// Posts `fields` as a form to `path` and returns where SUAP ended up after redirects.
+    ///
+    /// Fails with [`SuapError::NotAuthenticated`] when SUAP redirects to the login page.
+    pub async fn submit_form(&self, path: &str, fields: &[(String, String)]) -> Result<FormResponse, SuapError> {
+        let url = self.base_url.join(path)?;
+        let response = self.client.post(url.clone()).form(fields).header("Referer", url.as_str()).send().await?;
+        if response.url().path() == LOGIN_PATH { return Err(SuapError::NotAuthenticated); }
+        if !response.status().is_success() {
+            return Err(SuapError::Transport(format!("unexpected status {}", response.status())));
+        }
+        let final_path = response.url().path().to_owned();
+        Ok(FormResponse { path: final_path, body: response.text().await? })
     }
 
     pub fn base_url(&self) -> &Url { &self.base_url }
@@ -451,6 +472,31 @@ mod tests {
         assert_eq!(client.fetch_page("/ok/").await.unwrap(), "corpo");
         assert!(matches!(client.fetch_page("/erro/").await, Err(SuapError::Transport(_))));
         assert!(matches!(client.fetch_page("/protegido/").await, Err(SuapError::NotAuthenticated)));
+    }
+
+    #[tokio::test]
+    async fn submit_form_posts_fields_and_reports_destination() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ok/"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "/destino/"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET")).and(path("/destino/")).respond_with(ResponseTemplate::new(200).set_body_string("fim")).mount(&server).await;
+        Mock::given(method("POST")).and(path("/erro/")).respond_with(ResponseTemplate::new(500)).mount(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/protegido/"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", LOGIN_PATH))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET")).and(path(LOGIN_PATH)).respond_with(ResponseTemplate::new(200)).mount(&server).await;
+        let (_dir, paths) = paths();
+        let client = SuapClient::open(&paths, &config_for(&server)).unwrap();
+        let fields = [("a".to_owned(), "1".to_owned())];
+        let response = client.submit_form("/ok/", &fields).await.unwrap();
+        assert_eq!(response, FormResponse { path: "/destino/".to_owned(), body: "fim".to_owned() });
+        assert!(matches!(client.submit_form("/erro/", &fields).await, Err(SuapError::Transport(_))));
+        assert!(matches!(client.submit_form("/protegido/", &fields).await, Err(SuapError::NotAuthenticated)));
     }
 
     #[test]

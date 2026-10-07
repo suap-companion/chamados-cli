@@ -60,6 +60,14 @@ cargo run -p chamados-cli -- list --meus    # "Meus chamados" ativos
 
 Se a sessão estiver ausente ou expirada, o comando orienta a executar `chamados login`.
 
+### Abrir um chamado
+
+```bash
+cargo run -p chamados-cli -- open 53 --interested 1 --description "Não consigo acessar as bibliotecas virtuais"
+```
+
+`53` é o número do serviço no SUAP (o mesmo de `/centralservicos/abrir_chamado/53/`). O campus padrão é o do usuário e o centro de atendimento padrão é o único disponível para o campus; se houver vários, o comando lista as opções e pede `--center`. Outros campos do formulário podem ser enviados com `--field NOME=VALOR` (ex.: `--field patrimonio=123`), e `--campus` e `--center` sobrescrevem os padrões. `--interested` (id do vínculo da pessoa interessada, que o formulário do SUAP exige) é obrigatório.
+
 ### Ver detalhes de um chamado
 
 ```bash
@@ -67,6 +75,16 @@ cargo run -p chamados-cli -- show 559298
 ```
 
 Exibe título, situação, serviço, URL, dados do interessado, descrição e a linha do tempo completa do chamado. Também exige a sessão salva por `login`.
+
+### SUAP local de desenvolvimento
+
+Para testar `open`, `list` e `show` sem tocar na produção, suba um SUAP local e rode o seed da Central de Serviços (idempotente; cria campus, servidor de teste, catálogo e grupo de atendimento). **Nunca** rode contra homologação ou produção:
+
+```bash
+docker exec -i docker-web-1 python manage.py shell < scripts/seed_central_servicos.py
+```
+
+O script imprime `servico_id`, `campus_id` e `centro_id`.
 
 ## Requisitos de software
 

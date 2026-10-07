@@ -1,11 +1,18 @@
 //! Domain logic for the SUAP ticket companion.
 
+use std::collections::HashSet;
+
 use scraper::{ElementRef, Html, Selector};
+use serde::Deserialize;
 use suap_core::{SuapClient, SuapError};
 use thiserror::Error;
 use url::Url;
 
 const TICKET_PATH_PREFIX: &str = "/centralservicos/chamado/";
+const OPEN_PATH_PREFIX: &str = "/centralservicos/abrir_chamado/";
+const CAMPUS_PATH_PREFIX: &str = "/centralservicos/get_campus_com_centros_atendimento/";
+const CENTERS_PATH_PREFIX: &str = "/centralservicos/get_centros_atendimento_por_servico_e_campus/";
+const OPENED_MARKER: &str = "Número do chamado:";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteTicket {
@@ -44,6 +51,22 @@ pub struct TicketDetails {
     pub details_url: String,
 }
 
+/// Data needed to open a new ticket.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NewTicket {
+    /// SUAP service id (`/centralservicos/abrir_chamado/<id>/`).
+    pub service_id: u64,
+    pub description: String,
+    /// Campus (`uo`) id; defaults to the user's campus as suggested by SUAP.
+    pub campus: Option<String>,
+    /// Service center id; defaults to the only center available for the campus.
+    pub center: Option<String>,
+    /// Interested person (a SUAP "vínculo" id); SUAP defaults to the logged user.
+    pub interested: Option<String>,
+    /// Any other form field, overriding the form defaults (e.g. `patrimonio`).
+    pub extra_fields: Vec<(String, String)>,
+}
+
 /// Which SUAP ticket listing to read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TicketQueue {
@@ -66,6 +89,8 @@ impl TicketQueue {
 pub trait TicketSource {
     async fn list_tickets(&self) -> Result<Vec<RemoteTicket>, TicketError>;
     async fn get_ticket(&self, id: &str) -> Result<TicketDetails, TicketError>;
+    /// Opens a new ticket and returns its id.
+    async fn open_ticket(&self, ticket: &NewTicket) -> Result<String, TicketError>;
 }
 
 /// Reads tickets from the SUAP web interface using an authenticated session.
@@ -93,6 +118,41 @@ impl TicketSource for SuapTicketSource<'_> {
         let html = self.client.fetch_page(&format!("{TICKET_PATH_PREFIX}{id}/")).await?;
         parse_ticket_details(&html, self.client.base_url(), id)
             .ok_or_else(|| TicketError::Source(format!("could not parse ticket {id}")))
+    }
+
+    async fn open_ticket(&self, ticket: &NewTicket) -> Result<String, TicketError> {
+        let form_path = format!("{OPEN_PATH_PREFIX}{}/", ticket.service_id);
+        let html = self.client.fetch_page(&form_path).await?;
+        let mut fields = parse_open_form(&html)
+            .ok_or_else(|| TicketError::Source(format!("service {} has no ticket form", ticket.service_id)))?;
+
+        let campus = match &ticket.campus {
+            Some(campus) => campus.clone(),
+            None => {
+                let reply = self.client.fetch_page(&format!("{CAMPUS_PATH_PREFIX}{}/0/", ticket.service_id)).await?;
+                default_campus(&reply)?
+            }
+        };
+        let center = match &ticket.center {
+            Some(center) => center.clone(),
+            None => {
+                let path = format!("{CENTERS_PATH_PREFIX}{}/{campus}/", ticket.service_id);
+                default_center(&self.client.fetch_page(&path).await?)?
+            }
+        };
+
+        set_field(&mut fields, "descricao", &ticket.description);
+        set_field(&mut fields, "uo", &campus);
+        set_field(&mut fields, "centro_atendimento", &center);
+        if let Some(interested) = &ticket.interested {
+            set_field(&mut fields, "interessado", interested);
+        }
+        for (name, value) in &ticket.extra_fields {
+            set_field(&mut fields, name, value);
+        }
+
+        let response = self.client.submit_form(&form_path, &fields).await?;
+        parse_open_result(&response.path, &response.body)
     }
 }
 
@@ -129,6 +189,102 @@ fn flat_text(element: ElementRef<'_>) -> String {
 
 fn selector(css: &str) -> Selector {
     Selector::parse(css).expect("static selector is valid")
+}
+
+/// Sets `name` to `value`, replacing every existing entry with that name.
+fn set_field(fields: &mut Vec<(String, String)>, name: &str, value: &str) {
+    fields.retain(|(existing, _)| existing != name);
+    fields.push((name.to_owned(), value.to_owned()));
+}
+
+/// Collects the default values of the "open ticket" form (hidden fields, CSRF token, selected options...).
+///
+/// Returns `None` if the page has no form with a `descricao` field.
+pub fn parse_open_form(html: &str) -> Option<Vec<(String, String)>> {
+    let document = Html::parse_document(html);
+    let (forms, description) = (selector("form"), selector("[name=descricao]"));
+    let form = document.select(&forms).find(|form| form.select(&description).next().is_some())?;
+
+    let (controls, options) = (selector("input, textarea, select"), selector("option"));
+    let mut fields = Vec::new();
+    for control in form.select(&controls) {
+        let Some(name) = control.value().attr("name") else { continue };
+        let value = match control.value().name() {
+            "textarea" => text_of(control),
+            "select" => {
+                let all: Vec<_> = control.select(&options).collect();
+                let chosen = all.iter().find(|option| option.value().attr("selected").is_some()).or(all.first());
+                match chosen {
+                    Some(option) => option.value().attr("value").map_or_else(|| text_of(*option), str::to_owned),
+                    None => continue,
+                }
+            }
+            _ => {
+                let kind = control.value().attr("type").unwrap_or("text");
+                let toggled = matches!(kind, "checkbox" | "radio");
+                let skipped = matches!(kind, "submit" | "button" | "file" | "image" | "reset");
+                if skipped || (toggled && control.value().attr("checked").is_none()) {
+                    continue;
+                }
+                control.value().attr("value").unwrap_or(if toggled { "on" } else { "" }).to_owned()
+            }
+        };
+        fields.push((name.to_owned(), value));
+    }
+    Some(fields)
+}
+
+#[derive(Deserialize)]
+struct CampusReply {
+    /// `[id, acronym, selected]`
+    campus: Vec<(u64, String, bool)>,
+}
+
+#[derive(Deserialize)]
+struct CentersReply {
+    /// `[id, name, is_local]`
+    centros: Vec<(u64, String, bool)>,
+}
+
+/// Picks the campus SUAP marks as selected (the user's own), or the first one available.
+fn default_campus(json: &str) -> Result<String, TicketError> {
+    let reply: CampusReply = serde_json::from_str(json).map_err(|error| TicketError::Source(format!("campus list: {error}")))?;
+    let chosen = reply.campus.iter().find(|campus| campus.2).or(reply.campus.first());
+    chosen.map(|campus| campus.0.to_string()).ok_or_else(|| TicketError::Source("no campus available for this service".to_owned()))
+}
+
+/// Picks the only service center available; asks for an explicit one when there are several.
+fn default_center(json: &str) -> Result<String, TicketError> {
+    let reply: CentersReply = serde_json::from_str(json).map_err(|error| TicketError::Source(format!("center list: {error}")))?;
+    match reply.centros.as_slice() {
+        [] => Err(TicketError::Source("no service center available for this campus".to_owned())),
+        [only] => Ok(only.0.to_string()),
+        several => {
+            let options: Vec<_> = several.iter().map(|center| format!("{} ({})", center.0, center.1)).collect();
+            Err(TicketError::Source(format!("several service centers available, choose one: {}", options.join(", "))))
+        }
+    }
+}
+
+/// Interprets the page SUAP returned after submitting the "open ticket" form.
+fn parse_open_result(path: &str, body: &str) -> Result<String, TicketError> {
+    if let Some(id) = path.strip_prefix(TICKET_PATH_PREFIX) {
+        return Ok(id.trim_end_matches('/').to_owned());
+    }
+    if let Some((_, after)) = body.split_once(OPENED_MARKER) {
+        return Ok(after.trim_start().chars().take_while(char::is_ascii_digit).collect());
+    }
+    let document = Html::parse_document(body);
+    let mut seen = HashSet::new();
+    let errors: Vec<_> = document
+        .select(&selector(".errorlist li, .errornote"))
+        .map(flat_text)
+        .filter(|message| seen.insert(message.clone()))
+        .collect();
+    if errors.is_empty() {
+        return Err(TicketError::Source("could not confirm that the ticket was opened".to_owned()));
+    }
+    Err(TicketError::Source(format!("SUAP rejected the ticket: {}", errors.join("; "))))
 }
 
 /// Extracts the details of ticket `id` from its SUAP page; `None` if the page is not a ticket page.
@@ -170,7 +326,7 @@ pub fn parse_ticket_details(html: &str, base_url: &Url, id: &str) -> Option<Tick
 mod tests {
     use super::*;
     use tempfile::tempdir;
-    use wiremock::{matchers::{method, path, query_param}, Mock, MockServer, ResponseTemplate};
+    use wiremock::{matchers::{body_string_contains, method, path, query_param}, Mock, MockServer, ResponseTemplate};
 
     const LISTING: &str = r#"
         <div class="general-box danger"><div class="primary-info">
@@ -201,6 +357,167 @@ mod tests {
           <li><div class="timeline-date">06/10/2026 19:15:03</div><div class="timeline-content"><h4><a>Kelson</a><small>comentou:</small></h4><p>Build pronto.</p></div></li>
           <li><div class="timeline-date">06/10/2026 19:14:31</div></li>
         </ul></div></main>"#;
+
+    const OPEN_FORM: &str = r#"
+        <form name="busca"><input name="q" value="x"></form>
+        <form method="post">
+          <input type="hidden" name="csrfmiddlewaretoken" value="tok">
+          <textarea name="descricao"></textarea>
+          <textarea name="local_atendimento">Sala 1</textarea>
+          <input name="telefone">
+          <input type="number" name="ramal" value="12">
+          <select name="uo"></select>
+          <select name="meio_abertura"><option value="">---</option><option value="web" selected>Web</option><option value="email">Email</option></select>
+          <select name="prioridade"><option>Normal</option><option>Alta</option></select>
+          <select name="vazio"></select>
+          <input type="radio" name="centro_atendimento" value="1" checked>
+          <input type="radio" name="centro_atendimento" value="2">
+          <input type="checkbox" name="enviar_copia_email">
+          <input type="checkbox" name="aceite" checked>
+          <input type="file" name="anexo">
+          <input type="submit" value="Abrir chamado">
+          <input value="sem nome">
+        </form>"#;
+
+    fn pair(name: &str, value: &str) -> (String, String) {
+        (name.to_owned(), value.to_owned())
+    }
+
+    #[test]
+    fn parses_open_form_defaults() {
+        let fields = parse_open_form(OPEN_FORM).unwrap();
+        assert_eq!(
+            fields,
+            [
+                pair("csrfmiddlewaretoken", "tok"),
+                pair("descricao", ""),
+                pair("local_atendimento", "Sala 1"),
+                pair("telefone", ""),
+                pair("ramal", "12"),
+                pair("meio_abertura", "web"),
+                pair("prioridade", "Normal"),
+                pair("centro_atendimento", "1"),
+                pair("aceite", "on"),
+            ]
+        );
+        assert!(parse_open_form("<form><input name=\"x\"></form>").is_none());
+    }
+
+    #[test]
+    fn set_field_replaces_existing_values() {
+        let mut fields = vec![pair("a", "1"), pair("b", "2"), pair("a", "3")];
+        set_field(&mut fields, "a", "9");
+        assert_eq!(fields, [pair("b", "2"), pair("a", "9")]);
+    }
+
+    #[test]
+    fn picks_default_campus_and_center() {
+        assert_eq!(default_campus(r#"{"campus": [[1, "A", false], [2, "B", true]]}"#).unwrap(), "2");
+        assert_eq!(default_campus(r#"{"campus": [[1, "A", false], [2, "B", false]]}"#).unwrap(), "1");
+        assert!(default_campus(r#"{"campus": []}"#).unwrap_err().to_string().contains("no campus"));
+        assert!(default_campus("não é json").unwrap_err().to_string().contains("campus list"));
+
+        assert_eq!(default_center(r#"{"centros": [[5, "Local", true]]}"#).unwrap(), "5");
+        assert!(default_center(r#"{"centros": []}"#).unwrap_err().to_string().contains("no service center"));
+        let several = default_center(r#"{"centros": [[5, "Local", true], [6, "Remoto", false]]}"#).unwrap_err().to_string();
+        assert!(several.contains("5 (Local), 6 (Remoto)"));
+        assert!(default_center("não é json").unwrap_err().to_string().contains("center list"));
+    }
+
+    #[test]
+    fn interprets_open_results() {
+        assert_eq!(parse_open_result("/centralservicos/chamado/42/", "").unwrap(), "42");
+        let flash = "<li>Chamado aberto com sucesso. Número do chamado: 77 </li>";
+        assert_eq!(parse_open_result("/outra/", flash).unwrap(), "77");
+        let errors = r#"<ul class="errorlist"><li>Campo obrigatório.</li></ul><p class="errornote">Campo obrigatório.</p>"#;
+        assert_eq!(
+            parse_open_result("/abrir/", errors).unwrap_err().to_string(),
+            "ticket source error: SUAP rejected the ticket: Campo obrigatório."
+        );
+        assert!(parse_open_result("/abrir/", "<p>nada</p>").unwrap_err().to_string().contains("could not confirm"));
+    }
+
+    async fn mount_text(server: &MockServer, verb: &str, request_path: &str, body: &str) {
+        Mock::given(method(verb))
+            .and(path(request_path.to_owned()))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body.to_owned()))
+            .mount(server)
+            .await;
+    }
+
+    fn new_ticket() -> NewTicket {
+        NewTicket { service_id: 7, description: "Teste".to_owned(), ..NewTicket::default() }
+    }
+
+    #[tokio::test]
+    async fn opens_ticket_using_suap_defaults() {
+        let server = MockServer::start().await;
+        mount_text(&server, "GET", "/centralservicos/abrir_chamado/7/", OPEN_FORM).await;
+        mount_text(&server, "GET", "/centralservicos/get_campus_com_centros_atendimento/7/0/", r#"{"campus": [[3, "ZL", true]]}"#).await;
+        mount_text(&server, "GET", "/centralservicos/get_centros_atendimento_por_servico_e_campus/7/3/", r#"{"centros": [[9, "TI", true]]}"#).await;
+        Mock::given(method("POST"))
+            .and(path("/centralservicos/abrir_chamado/7/"))
+            .and(body_string_contains("descricao=Teste"))
+            .and(body_string_contains("uo=3"))
+            .and(body_string_contains("centro_atendimento=9"))
+            .and(body_string_contains("csrfmiddlewaretoken=tok"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "/centralservicos/chamado/99/"))
+            .mount(&server)
+            .await;
+        mount_text(&server, "GET", "/centralservicos/chamado/99/", "ok").await;
+        let (_dir, client) = client_for(&server).await;
+        let source = SuapTicketSource::new(&client, TicketQueue::Support);
+        assert_eq!(source.open_ticket(&new_ticket()).await.unwrap(), "99");
+    }
+
+    #[tokio::test]
+    async fn opens_ticket_with_explicit_values() {
+        let server = MockServer::start().await;
+        mount_text(&server, "GET", "/centralservicos/abrir_chamado/7/", OPEN_FORM).await;
+        Mock::given(method("POST"))
+            .and(path("/centralservicos/abrir_chamado/7/"))
+            .and(body_string_contains("uo=4"))
+            .and(body_string_contains("centro_atendimento=8"))
+            .and(body_string_contains("interessado=55"))
+            .and(body_string_contains("telefone=9999"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("Chamado aberto com sucesso. Número do chamado:123"))
+            .mount(&server)
+            .await;
+        let (_dir, client) = client_for(&server).await;
+        let source = SuapTicketSource::new(&client, TicketQueue::Support);
+        let ticket = NewTicket {
+            campus: Some("4".to_owned()),
+            center: Some("8".to_owned()),
+            interested: Some("55".to_owned()),
+            extra_fields: vec![pair("telefone", "9999")],
+            ..new_ticket()
+        };
+        assert_eq!(source.open_ticket(&ticket).await.unwrap(), "123");
+    }
+
+    #[tokio::test]
+    async fn open_ticket_reports_failures() {
+        let server = MockServer::start().await;
+        mount_text(&server, "GET", "/centralservicos/abrir_chamado/7/", OPEN_FORM).await;
+        mount_text(&server, "GET", "/centralservicos/abrir_chamado/8/", "<p>sem formulário</p>").await;
+        mount_text(&server, "POST", "/centralservicos/abrir_chamado/7/", r#"<ul class="errorlist"><li>Descrição inválida.</li></ul>"#).await;
+        let (_dir, client) = client_for(&server).await;
+        let source = SuapTicketSource::new(&client, TicketQueue::Support);
+
+        let no_form = NewTicket { service_id: 8, ..new_ticket() };
+        assert!(source.open_ticket(&no_form).await.unwrap_err().to_string().contains("no ticket form"));
+
+        let missing_campus_list = source.open_ticket(&new_ticket()).await;
+        assert!(matches!(missing_campus_list, Err(TicketError::Suap(SuapError::Transport(_)))));
+
+        let explicit_campus = NewTicket { campus: Some("1".to_owned()), ..new_ticket() };
+        let missing_center_list = source.open_ticket(&explicit_campus).await;
+        assert!(matches!(missing_center_list, Err(TicketError::Suap(SuapError::Transport(_)))));
+
+        let explicit_all = NewTicket { center: Some("2".to_owned()), ..explicit_campus };
+        let rejected = source.open_ticket(&explicit_all).await.unwrap_err().to_string();
+        assert!(rejected.contains("Descrição inválida."));
+    }
 
     fn base() -> Url {
         Url::parse("https://suap.example/").unwrap()
