@@ -5,7 +5,8 @@
 use std::{error::Error, ffi::OsString, io::Write};
 
 use clap::{Parser, Subcommand};
-use suap_core::{load_config, save_config, AppPaths, SuapClient};
+use chamados_core::{SuapTicketSource, TicketError, TicketQueue, TicketSource};
+use suap_core::{load_config, save_config, AppPaths, SuapClient, SuapError};
 
 #[derive(Debug, Parser)]
 #[command(name = "chamados", version, about = "Cliente local para chamados do SUAP")]
@@ -32,6 +33,12 @@ enum Command {
         /// Usuário do SUAP; se omitido, usa o `username` da configuração local.
         #[arg(long)]
         username: Option<String>,
+    },
+    /// Lista os chamados do SUAP usando a sessão salva por `login`.
+    List {
+        /// Lista os "Meus chamados" ativos em vez da fila de suporte.
+        #[arg(long)]
+        meus: bool,
     },
     /// Exibe uma mensagem sobre o estado inicial do projeto.
     Status,
@@ -87,6 +94,7 @@ fn execute(
         Some(Command::ConfigShow) => show_config(paths, out),
         Some(Command::ConfigInit { base_url, username }) => init_config(paths, base_url, username, out),
         Some(Command::Login { username }) => login(paths, username, password, out),
+        Some(Command::List { meus }) => list(paths, meus, out),
         Some(Command::Status) => {
             writeln!(out, "chamados-cli: fundação inicial instalada; integração ainda não implementada.")?;
             Ok(())
@@ -134,6 +142,31 @@ fn login(
     let client = SuapClient::open(paths, &config)?;
     runtime.block_on(client.login(&username, &password))?;
     writeln!(out, "Login realizado como {username}. Sessão salva em {}", paths.session_file().display())?;
+    Ok(())
+}
+
+fn list(paths: &AppPaths, mine: bool, out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
+    let config = load_config(paths)?.unwrap_or_default();
+    let queue = if mine { TicketQueue::Mine } else { TicketQueue::Support };
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let client = SuapClient::open(paths, &config)?;
+    let source = SuapTicketSource::new(&client, queue);
+
+    let tickets = match runtime.block_on(source.list_tickets()) {
+        Err(TicketError::Suap(SuapError::NotAuthenticated)) => {
+            return Err("sessão ausente ou expirada: execute `chamados login`".into());
+        }
+        result => result?,
+    };
+
+    if tickets.is_empty() {
+        writeln!(out, "Nenhum chamado encontrado.")?;
+    }
+    for ticket in tickets {
+        let status = ticket.status.as_deref().unwrap_or("-");
+        let subject = ticket.subject.as_deref().unwrap_or("-");
+        writeln!(out, "#{}\t{status}\t{subject}", ticket.id)?;
+    }
     Ok(())
 }
 
@@ -330,6 +363,68 @@ mod tests {
         assert_eq!(code, 1);
         assert!(err.contains("authentication failed"));
         assert!(!paths.session_file().exists());
+    }
+
+    fn mount_listing(runtime: &tokio::runtime::Runtime, server: &MockServer, request_path: &str, body: ResponseTemplate) {
+        runtime.block_on(
+            Mock::given(method("GET")).and(path(request_path.to_owned())).respond_with(body).mount(server),
+        );
+    }
+
+    #[test]
+    fn list_prints_support_and_own_tickets() {
+        let (_dir, paths) = paths();
+        let (runtime, server) = mock_server(true);
+        run_args(&["config-init", "--base-url", &server.uri()], &paths);
+        let html = r#"<div class="general-box"><span class="status">Em atendimento</span>
+            <h4><a href="/centralservicos/chamado/7/">REQ #7 <strong>Assunto</strong></a></h4></div>
+            <div class="general-box"><h4><a href="/centralservicos/chamado/8/">REQ #8</a></h4></div>"#;
+        mount_listing(&runtime, &server, "/centralservicos/listar_chamados_suporte/", ResponseTemplate::new(200).set_body_string(html));
+        mount_listing(&runtime, &server, "/centralservicos/meus_chamados/", ResponseTemplate::new(200).set_body_string(html));
+
+        for args in [&["list"][..], &["list", "--meus"][..]] {
+            let (code, out, err) = run_args(args, &paths);
+            assert_eq!((code, err.as_str()), (0, ""));
+            assert_eq!(out, "#7\tEm atendimento\tAssunto\n#8\t-\t-\n");
+        }
+    }
+
+    #[test]
+    fn list_reports_empty_result() {
+        let (_dir, paths) = paths();
+        let (runtime, server) = mock_server(true);
+        run_args(&["config-init", "--base-url", &server.uri()], &paths);
+        mount_listing(&runtime, &server, "/centralservicos/listar_chamados_suporte/", ResponseTemplate::new(200));
+        let (code, out, _) = run_args(&["list"], &paths);
+        assert_eq!(code, 0);
+        assert!(out.contains("Nenhum chamado"));
+    }
+
+    #[test]
+    fn list_asks_for_login_when_session_is_missing() {
+        let (_dir, paths) = paths();
+        let (runtime, server) = mock_server(true);
+        run_args(&["config-init", "--base-url", &server.uri()], &paths);
+        mount_listing(
+            &runtime,
+            &server,
+            "/centralservicos/listar_chamados_suporte/",
+            ResponseTemplate::new(302).insert_header("location", "/accounts/login/"),
+        );
+        let (code, _, err) = run_args(&["list"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("chamados login"));
+    }
+
+    #[test]
+    fn list_reports_other_errors() {
+        let (_dir, paths) = paths();
+        let (runtime, server) = mock_server(true);
+        run_args(&["config-init", "--base-url", &server.uri()], &paths);
+        mount_listing(&runtime, &server, "/centralservicos/listar_chamados_suporte/", ResponseTemplate::new(500));
+        let (code, _, err) = run_args(&["list"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("unexpected status 500"));
     }
 
     #[test]

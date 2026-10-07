@@ -168,6 +168,19 @@ impl SuapClient {
         Ok(response.status().is_success() && response.url().path() != LOGIN_PATH)
     }
 
+    /// Fetches `path` (relative to the base URL) with the stored session and returns the body.
+    ///
+    /// Fails with [`SuapError::NotAuthenticated`] when SUAP redirects to the login page.
+    pub async fn fetch_page(&self, path: &str) -> Result<String, SuapError> {
+        let response = self.client.get(self.base_url.join(path)?).send().await?;
+        if response.url().path() == LOGIN_PATH { return Err(SuapError::NotAuthenticated); }
+        if !response.status().is_success() {
+            return Err(SuapError::Transport(format!("unexpected status {}", response.status())));
+        }
+        Ok(response.text().await?)
+    }
+
+    pub fn base_url(&self) -> &Url { &self.base_url }
     pub fn http_client(&self) -> &Client { &self.client }
     pub fn session(&self) -> &SessionStore { &self.session }
 }
@@ -406,6 +419,25 @@ mod tests {
         let (_dir, paths) = paths();
         let client = SuapClient::open(&paths, &config_for(&server)).unwrap();
         assert!(!client.is_authenticated().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn fetch_page_returns_body_and_maps_failures() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/ok/")).respond_with(ResponseTemplate::new(200).set_body_string("corpo")).mount(&server).await;
+        Mock::given(method("GET")).and(path("/erro/")).respond_with(ResponseTemplate::new(500)).mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/protegido/"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", LOGIN_PATH))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET")).and(path(LOGIN_PATH)).respond_with(ResponseTemplate::new(200)).mount(&server).await;
+        let (_dir, paths) = paths();
+        let client = SuapClient::open(&paths, &config_for(&server)).unwrap();
+        assert_eq!(client.base_url().as_str(), format!("{}/", server.uri()));
+        assert_eq!(client.fetch_page("/ok/").await.unwrap(), "corpo");
+        assert!(matches!(client.fetch_page("/erro/").await, Err(SuapError::Transport(_))));
+        assert!(matches!(client.fetch_page("/protegido/").await, Err(SuapError::NotAuthenticated)));
     }
 
     #[test]
