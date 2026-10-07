@@ -36,7 +36,17 @@ Consulte a configuração sem exibir senha:
 cargo run -p chamados-cli -- config-show
 ```
 
-A senha e os cookies ainda não são persistidos nesta etapa.
+A senha não é persistida; os cookies de sessão são salvos em `session.cookies` após o login.
+
+## Requisitos de software
+
+- **RS-01 — Cobertura de testes de 100%.** Os testes automatizados do workspace devem cobrir 100% das linhas de código. A verificação roda no CI (`ci.yml`) e o build falha se a cobertura ficar abaixo disso. O ponto de entrada `main.rs` de cada binário deve conter apenas o encadeamento mínimo e é excluído da medição; toda a lógica fica em `lib.rs`, onde é testada.
+
+Para verificar localmente (requer `cargo install cargo-llvm-cov` e o componente `llvm-tools-preview`):
+
+```bash
+cargo llvm-cov --workspace --all-targets --ignore-filename-regex 'main\.rs' --fail-under-lines 100
+```
 
 ## Desenvolvimento
 
