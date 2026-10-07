@@ -25,6 +25,25 @@ pub enum TicketError {
     Suap(#[from] SuapError),
 }
 
+/// One entry of a ticket timeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimelineEntry {
+    pub date: String,
+    pub text: String,
+}
+
+/// Full details of a ticket, as shown on its SUAP page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TicketDetails {
+    pub id: String,
+    pub title: String,
+    pub heading: Option<String>,
+    pub statuses: Vec<String>,
+    pub fields: Vec<(String, String)>,
+    pub timeline: Vec<TimelineEntry>,
+    pub details_url: String,
+}
+
 /// Which SUAP ticket listing to read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TicketQueue {
@@ -46,7 +65,7 @@ impl TicketQueue {
 #[allow(async_fn_in_trait)]
 pub trait TicketSource {
     async fn list_tickets(&self) -> Result<Vec<RemoteTicket>, TicketError>;
-    async fn get_ticket(&self, id: &str) -> Result<RemoteTicket, TicketError>;
+    async fn get_ticket(&self, id: &str) -> Result<TicketDetails, TicketError>;
 }
 
 /// Reads tickets from the SUAP web interface using an authenticated session.
@@ -67,8 +86,13 @@ impl TicketSource for SuapTicketSource<'_> {
         Ok(parse_ticket_list(&html, self.client.base_url()))
     }
 
-    async fn get_ticket(&self, _id: &str) -> Result<RemoteTicket, TicketError> {
-        Err(TicketError::NotImplemented)
+    async fn get_ticket(&self, id: &str) -> Result<TicketDetails, TicketError> {
+        if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(TicketError::Source(format!("invalid ticket id {id:?}")));
+        }
+        let html = self.client.fetch_page(&format!("{TICKET_PATH_PREFIX}{id}/")).await?;
+        parse_ticket_details(&html, self.client.base_url(), id)
+            .ok_or_else(|| TicketError::Source(format!("could not parse ticket {id}")))
     }
 }
 
@@ -98,6 +122,50 @@ fn text_of(element: ElementRef<'_>) -> String {
     element.text().collect::<String>().trim().to_owned()
 }
 
+/// Text of `element` with every run of whitespace (and element boundaries) collapsed to one space.
+fn flat_text(element: ElementRef<'_>) -> String {
+    element.text().collect::<Vec<_>>().join(" ").split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn selector(css: &str) -> Selector {
+    Selector::parse(css).expect("static selector is valid")
+}
+
+/// Extracts the details of ticket `id` from its SUAP page; `None` if the page is not a ticket page.
+pub fn parse_ticket_details(html: &str, base_url: &Url, id: &str) -> Option<TicketDetails> {
+    let document = Html::parse_document(html);
+    let title = flat_text(document.select(&selector("main#content .title-container h2")).next()?);
+    let heading = document.select(&selector("main#content .accordion-button")).next().map(flat_text);
+    let statuses = document.select(&selector("main#content .object-status .status")).map(flat_text).collect();
+
+    let (term, definition) = (selector("dt"), selector("dd"));
+    let fields = document
+        .select(&selector("main#content .accordion-body .definition-list .list-item"))
+        .filter_map(|item| Some((flat_text(item.select(&term).next()?), flat_text(item.select(&definition).next()?))))
+        .collect();
+
+    let (date, content) = (selector(".timeline-date"), selector(".timeline-content"));
+    let timeline = document
+        .select(&selector("[data-tab=linha_tempo] ul.timeline > li"))
+        .filter_map(|item| {
+            Some(TimelineEntry {
+                date: flat_text(item.select(&date).next()?),
+                text: flat_text(item.select(&content).next()?),
+            })
+        })
+        .collect();
+
+    Some(TicketDetails {
+        id: id.to_owned(),
+        title,
+        heading,
+        statuses,
+        fields,
+        timeline,
+        details_url: base_url.join(&format!("{TICKET_PATH_PREFIX}{id}/")).expect("ticket path is valid").to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,6 +183,24 @@ mod tests {
         <div class="general-box"><h4><a>sem href</a></h4></div>
         <div class="general-box"><h4><a href="http://[::1">REQ #3</a></h4></div>
     "#;
+
+    const DETAILS: &str = r#"<main id="content">
+        <div class="title-container"><h2>Chamado Interno 559298</h2>
+          <div class="object-status"><span class="status status-em-atendimento ">Em atendimento</span>
+          <span class="status status-error">Tempo previsto ultrapassado</span></div></div>
+        <div class="accordion"><button class="accordion-button">
+            1.2 Gestão | Atualização de versão
+        </button><div class="accordion-body">
+          <dl class="definition-list"><div class="list-item"><dt>Interessado</dt><dd><h4>Wagner Oliveira</h4></dd></div>
+          <div class="list-item"><dt>Sem valor</dt></div>
+          <div class="list-item"><dd>Sem rótulo</dd></div>
+          <div class="list-item"><dt>Descrição</dt><dd>Atualizar para a
+             versão 5.3.0</dd></div></dl></div></div>
+        <div data-tab="linha_tempo"><ul class="timeline">
+          <li><div class="timeline-content"><h4>Adicionar comentário:</h4></div></li>
+          <li><div class="timeline-date">06/10/2026 19:15:03</div><div class="timeline-content"><h4><a>Kelson</a><small>comentou:</small></h4><p>Build pronto.</p></div></li>
+          <li><div class="timeline-date">06/10/2026 19:14:31</div></li>
+        </ul></div></main>"#;
 
     fn base() -> Url {
         Url::parse("https://suap.example/").unwrap()
@@ -134,6 +220,40 @@ mod tests {
             }
         );
         assert_eq!((tickets[1].id.as_str(), tickets[1].subject.clone(), tickets[1].status.clone()), ("1", None, None));
+    }
+
+    #[test]
+    fn parses_ticket_details() {
+        let details = parse_ticket_details(DETAILS, &base(), "559298").unwrap();
+        assert_eq!(details.title, "Chamado Interno 559298");
+        assert_eq!(details.heading.as_deref(), Some("1.2 Gestão | Atualização de versão"));
+        assert_eq!(details.statuses, ["Em atendimento", "Tempo previsto ultrapassado"]);
+        assert_eq!(
+            details.fields,
+            [
+                ("Interessado".to_owned(), "Wagner Oliveira".to_owned()),
+                ("Descrição".to_owned(), "Atualizar para a versão 5.3.0".to_owned()),
+            ]
+        );
+        assert_eq!(
+            details.timeline,
+            [TimelineEntry { date: "06/10/2026 19:15:03".to_owned(), text: "Kelson comentou: Build pronto.".to_owned() }]
+        );
+        assert_eq!(details.details_url, "https://suap.example/centralservicos/chamado/559298/");
+        assert_eq!(details.clone(), details);
+    }
+
+    #[test]
+    fn details_of_minimal_page_have_no_optional_parts() {
+        let html = r#"<main id="content"><div class="title-container"><h2>Chamado</h2></div></main>"#;
+        let details = parse_ticket_details(html, &base(), "1").unwrap();
+        assert!(details.heading.is_none() && details.statuses.is_empty());
+        assert!(details.fields.is_empty() && details.timeline.is_empty());
+    }
+
+    #[test]
+    fn non_ticket_page_has_no_details() {
+        assert!(parse_ticket_details("<p>nada</p>", &base(), "1").is_none());
     }
 
     #[test]
@@ -191,7 +311,28 @@ mod tests {
         let (_dir, client) = client_for(&server).await;
         let source = SuapTicketSource::new(&client, TicketQueue::Mine);
         assert_eq!(source.list_tickets().await.unwrap().len(), 2);
-        assert!(matches!(source.get_ticket("1").await, Err(TicketError::NotImplemented)));
+    }
+
+    #[tokio::test]
+    async fn source_gets_ticket_details_and_validates_input() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/centralservicos/chamado/559298/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(DETAILS))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/centralservicos/chamado/7/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<p>outra coisa</p>"))
+            .mount(&server)
+            .await;
+        let (_dir, client) = client_for(&server).await;
+        let source = SuapTicketSource::new(&client, TicketQueue::Support);
+        assert_eq!(source.get_ticket("559298").await.unwrap().title, "Chamado Interno 559298");
+        assert!(matches!(source.get_ticket("7").await, Err(TicketError::Source(_))));
+        assert!(matches!(source.get_ticket("").await, Err(TicketError::Source(_))));
+        assert!(matches!(source.get_ticket("../x").await, Err(TicketError::Source(_))));
+        assert!(matches!(source.get_ticket("404").await, Err(TicketError::Suap(SuapError::Transport(_)))));
     }
 
     #[tokio::test]

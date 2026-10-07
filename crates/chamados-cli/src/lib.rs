@@ -5,7 +5,7 @@
 use std::{error::Error, ffi::OsString, io::Write};
 
 use clap::{Parser, Subcommand};
-use chamados_core::{SuapTicketSource, TicketError, TicketQueue, TicketSource};
+use chamados_core::{SuapTicketSource, TicketDetails, TicketError, TicketQueue, TicketSource};
 use suap_core::{load_config, save_config, AppPaths, SuapClient, SuapError};
 
 #[derive(Debug, Parser)]
@@ -39,6 +39,11 @@ enum Command {
         /// Lista os "Meus chamados" ativos em vez da fila de suporte.
         #[arg(long)]
         meus: bool,
+    },
+    /// Exibe os detalhes de um chamado do SUAP usando a sessão salva por `login`.
+    Show {
+        /// Número do chamado (ex.: 559298).
+        id: u64,
     },
     /// Exibe uma mensagem sobre o estado inicial do projeto.
     Status,
@@ -95,6 +100,7 @@ fn execute(
         Some(Command::ConfigInit { base_url, username }) => init_config(paths, base_url, username, out),
         Some(Command::Login { username }) => login(paths, username, password, out),
         Some(Command::List { meus }) => list(paths, meus, out),
+        Some(Command::Show { id }) => show(paths, id, out),
         Some(Command::Status) => {
             writeln!(out, "chamados-cli: fundação inicial instalada; integração ainda não implementada.")?;
             Ok(())
@@ -152,12 +158,7 @@ fn list(paths: &AppPaths, mine: bool, out: &mut dyn Write) -> Result<(), Box<dyn
     let client = SuapClient::open(paths, &config)?;
     let source = SuapTicketSource::new(&client, queue);
 
-    let tickets = match runtime.block_on(source.list_tickets()) {
-        Err(TicketError::Suap(SuapError::NotAuthenticated)) => {
-            return Err("sessão ausente ou expirada: execute `chamados login`".into());
-        }
-        result => result?,
-    };
+    let tickets = runtime.block_on(source.list_tickets()).map_err(explain)?;
 
     if tickets.is_empty() {
         writeln!(out, "Nenhum chamado encontrado.")?;
@@ -168,6 +169,39 @@ fn list(paths: &AppPaths, mine: bool, out: &mut dyn Write) -> Result<(), Box<dyn
         writeln!(out, "#{}\t{status}\t{subject}", ticket.id)?;
     }
     Ok(())
+}
+
+fn show(paths: &AppPaths, id: u64, out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
+    let config = load_config(paths)?.unwrap_or_default();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let client = SuapClient::open(paths, &config)?;
+    let source = SuapTicketSource::new(&client, TicketQueue::Support);
+    let details = runtime.block_on(source.get_ticket(&id.to_string())).map_err(explain)?;
+    print_details(&details, out)?;
+    Ok(())
+}
+
+fn print_details(details: &TicketDetails, out: &mut dyn Write) -> std::io::Result<()> {
+    writeln!(out, "{}", details.title)?;
+    writeln!(out, "Situação: {}", details.statuses.join("; "))?;
+    writeln!(out, "Serviço: {}", details.heading.as_deref().unwrap_or("-"))?;
+    writeln!(out, "URL: {}", details.details_url)?;
+    for (label, value) in &details.fields {
+        writeln!(out, "{label}: {value}")?;
+    }
+    writeln!(out, "\nLinha do tempo:")?;
+    for entry in &details.timeline {
+        writeln!(out, "  {}  {}", entry.date, entry.text)?;
+    }
+    Ok(())
+}
+
+/// Turns ticket errors into user-facing messages.
+fn explain(error: TicketError) -> Box<dyn Error> {
+    match error {
+        TicketError::Suap(SuapError::NotAuthenticated) => "sessão ausente ou expirada: execute `chamados login`".into(),
+        other => other.into(),
+    }
 }
 
 fn init_config(
@@ -387,6 +421,56 @@ mod tests {
             assert_eq!((code, err.as_str()), (0, ""));
             assert_eq!(out, "#7\tEm atendimento\tAssunto\n#8\t-\t-\n");
         }
+    }
+
+    #[test]
+    fn show_prints_ticket_details() {
+        let (_dir, paths) = paths();
+        let (runtime, server) = mock_server(true);
+        run_args(&["config-init", "--base-url", &server.uri()], &paths);
+        let html = r#"<main id="content"><div class="title-container"><h2>Chamado Interno 7</h2>
+            <div class="object-status"><span class="status">Aberto</span></div></div>
+            <div class="accordion"><button class="accordion-button">Serviço | Assunto</button>
+            <div class="accordion-body"><dl class="definition-list"><div class="list-item"><dt>Descrição</dt><dd>Texto</dd></div></dl></div></div>
+            <div data-tab="linha_tempo"><ul class="timeline"><li><div class="timeline-date">01/01/2026 10:00:00</div>
+            <div class="timeline-content">Chamado aberto</div></li></ul></div></main>"#;
+        mount_listing(&runtime, &server, "/centralservicos/chamado/7/", ResponseTemplate::new(200).set_body_string(html));
+        let (code, out, err) = run_args(&["show", "7"], &paths);
+        assert_eq!((code, err.as_str()), (0, ""));
+        assert!(out.starts_with("Chamado Interno 7\nSituação: Aberto\nServiço: Serviço | Assunto\nURL: "));
+        assert!(out.contains("Descrição: Texto\n\nLinha do tempo:\n  01/01/2026 10:00:00  Chamado aberto\n"));
+    }
+
+    #[test]
+    fn show_prints_placeholder_without_heading() {
+        let (_dir, paths) = paths();
+        let (runtime, server) = mock_server(true);
+        run_args(&["config-init", "--base-url", &server.uri()], &paths);
+        let html = r#"<main id="content"><div class="title-container"><h2>Chamado Interno 8</h2></div></main>"#;
+        mount_listing(&runtime, &server, "/centralservicos/chamado/8/", ResponseTemplate::new(200).set_body_string(html));
+        let (code, out, _) = run_args(&["show", "8"], &paths);
+        assert_eq!(code, 0);
+        assert!(out.contains("Serviço: -"));
+    }
+
+    #[test]
+    fn show_asks_for_login_and_rejects_bad_ids() {
+        let (_dir, paths) = paths();
+        let (runtime, server) = mock_server(true);
+        run_args(&["config-init", "--base-url", &server.uri()], &paths);
+        mount_listing(
+            &runtime,
+            &server,
+            "/centralservicos/chamado/9/",
+            ResponseTemplate::new(302).insert_header("location", "/accounts/login/"),
+        );
+        let (code, _, err) = run_args(&["show", "9"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("chamados login"));
+
+        let (code, _, err) = run_args(&["show", "abc"], &paths);
+        assert_eq!(code, 2);
+        assert!(!err.is_empty());
     }
 
     #[test]
