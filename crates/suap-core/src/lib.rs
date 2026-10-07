@@ -135,10 +135,10 @@ pub struct SuapClient {
 impl SuapClient {
     pub fn open(paths: &AppPaths, config: &SuapConfig) -> Result<Self, SuapError> {
         let session = SessionStore::open(paths.session_file())?;
-        let client = Client::builder()
+        let builder = Client::builder()
             .cookie_provider(session.cookie_provider())
-            .redirect(reqwest::redirect::Policy::limited(10))
-            .build()?;
+            .redirect(reqwest::redirect::Policy::limited(10));
+        let client = builder.build()?;
         Ok(Self { client, session, base_url: config.base_url.clone() })
     }
 
@@ -174,8 +174,7 @@ impl SuapClient {
 
 fn extract_csrf_token(html: &str) -> Result<String, SuapError> {
     let document = Html::parse_document(html);
-    let selector = Selector::parse("input[name=csrfmiddlewaretoken]")
-        .map_err(|error| SuapError::Parse(error.to_string()))?;
+    let selector = Selector::parse("input[name=csrfmiddlewaretoken]").expect("static selector is valid");
     document.select(&selector)
         .next()
         .and_then(|element| element.value().attr("value"))
@@ -229,6 +228,28 @@ impl From<Box<dyn std::error::Error + Send + Sync>> for SuapError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::{tempdir, TempDir};
+    use wiremock::{matchers::{method, path}, Mock, MockServer, ResponseTemplate};
+
+    const LOGIN_FORM: &str = r#"<form><input type="hidden" name="csrfmiddlewaretoken" value="tok"></form>"#;
+
+    fn paths() -> (TempDir, AppPaths) {
+        let directory = tempdir().unwrap();
+        let paths = AppPaths::from_dirs(directory.path().join("config"), directory.path().join("data"));
+        (directory, paths)
+    }
+
+    fn config_for(server: &MockServer) -> SuapConfig {
+        SuapConfig { base_url: Url::parse(&format!("{}/", server.uri())).unwrap(), username: None }
+    }
+
+    async fn mount_login_page(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path(LOGIN_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_string(LOGIN_FORM))
+            .mount(server)
+            .await;
+    }
 
     #[test]
     fn extracts_csrf_token_from_form() {
@@ -239,5 +260,164 @@ mod tests {
     #[test]
     fn reports_missing_csrf_token() {
         assert!(extract_csrf_token("<form></form>").is_err());
+    }
+
+    #[test]
+    fn discovers_and_exposes_paths() {
+        // Result depends on the host environment (HOME); only exercise the code path.
+        let _ = AppPaths::discover();
+        let (_dir, paths) = paths();
+        assert!(paths.config_dir().ends_with("config"));
+        assert!(paths.data_dir().ends_with("data"));
+        assert!(paths.config_file().ends_with("config.toml"));
+        assert!(paths.session_file().ends_with("session.cookies"));
+        paths.ensure_dirs().unwrap();
+        assert!(paths.config_dir().is_dir() && paths.data_dir().is_dir());
+    }
+
+    #[test]
+    fn config_round_trip_and_defaults() {
+        let (_dir, paths) = paths();
+        assert_eq!(load_config(&paths).unwrap(), None);
+        let config = SuapConfig { username: Some("kelson".to_owned()), ..SuapConfig::default() };
+        save_config(&paths, &config).unwrap();
+        assert_eq!(load_config(&paths).unwrap(), Some(config));
+    }
+
+    #[test]
+    fn config_rejects_invalid_scheme_and_toml() {
+        let (_dir, paths) = paths();
+        let bad = SuapConfig { base_url: Url::parse("ftp://example.org/").unwrap(), username: None };
+        assert!(matches!(save_config(&paths, &bad), Err(SuapError::InvalidConfiguration(_))));
+
+        paths.ensure_dirs().unwrap();
+        fs::write(paths.config_file(), "base_url = [").unwrap();
+        assert!(matches!(load_config(&paths), Err(SuapError::TomlDe(_))));
+
+        fs::write(paths.config_file(), "base_url = \"ftp://example.org/\"").unwrap();
+        assert!(matches!(load_config(&paths), Err(SuapError::InvalidConfiguration(_))));
+    }
+
+    #[tokio::test]
+    async fn session_store_persists_and_reloads() {
+        let (_dir, paths) = paths();
+        let store = SessionStore::open(paths.session_file()).unwrap();
+        assert_eq!(store.path(), paths.session_file());
+        let url = Url::parse("https://suap.example/").unwrap();
+        store.cookie_provider().lock().unwrap().parse("sessionid=1; Max-Age=3600", &url).unwrap();
+        store.save().await.unwrap();
+
+        let reloaded = SessionStore::open(paths.session_file()).unwrap();
+        assert!(reloaded.cookie_provider().lock().unwrap().get("suap.example", "/", "sessionid").is_some());
+    }
+
+    #[test]
+    fn session_store_rejects_corrupt_file() {
+        let (_dir, paths) = paths();
+        paths.ensure_dirs().unwrap();
+        fs::write(paths.session_file(), "not json").unwrap();
+        assert!(matches!(SessionStore::open(paths.session_file()), Err(SuapError::CookieStore(_))));
+    }
+
+    #[tokio::test]
+    async fn session_save_requires_parent_directory() {
+        let store = SessionStore::open(PathBuf::new()).unwrap();
+        assert!(matches!(store.save().await, Err(SuapError::InvalidConfiguration(_))));
+    }
+
+    #[tokio::test]
+    async fn session_save_reports_poisoned_lock() {
+        let (_dir, paths) = paths();
+        let store = SessionStore::open(paths.session_file()).unwrap();
+        let provider = store.cookie_provider();
+        let _ = std::thread::spawn(move || {
+            let _guard = provider.lock().unwrap();
+            panic!("poison the cookie store");
+        })
+        .join();
+        assert!(matches!(store.save().await, Err(SuapError::CookieStore(_))));
+    }
+
+    #[tokio::test]
+    async fn login_fails_when_login_page_is_unavailable() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).respond_with(ResponseTemplate::new(500)).mount(&server).await;
+        let (_dir, paths) = paths();
+        let client = SuapClient::open(&paths, &config_for(&server)).unwrap();
+        assert!(matches!(client.login("u", "p").await, Err(SuapError::AuthenticationFailed)));
+        let _ = (client.http_client(), client.session());
+    }
+
+    #[tokio::test]
+    async fn login_fails_on_unauthorized_and_server_error() {
+        for status in [401, 500] {
+            let server = MockServer::start().await;
+            mount_login_page(&server).await;
+            Mock::given(method("POST")).respond_with(ResponseTemplate::new(status)).mount(&server).await;
+            let (_dir, paths) = paths();
+            let client = SuapClient::open(&paths, &config_for(&server)).unwrap();
+            assert!(matches!(client.login("u", "p").await, Err(SuapError::AuthenticationFailed)));
+        }
+    }
+
+    #[tokio::test]
+    async fn login_succeeds_and_persists_session() {
+        let server = MockServer::start().await;
+        mount_login_page(&server).await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "/"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET")).and(path("/")).respond_with(ResponseTemplate::new(200)).mount(&server).await;
+        let (_dir, paths) = paths();
+        let client = SuapClient::open(&paths, &config_for(&server)).unwrap();
+        client.login("u", "p").await.unwrap();
+        assert!(paths.session_file().exists());
+        assert!(client.is_authenticated().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn login_fails_when_redirect_target_errors() {
+        let server = MockServer::start().await;
+        mount_login_page(&server).await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "/"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET")).and(path("/")).respond_with(ResponseTemplate::new(500)).mount(&server).await;
+        let (_dir, paths) = paths();
+        let client = SuapClient::open(&paths, &config_for(&server)).unwrap();
+        assert!(matches!(client.login("u", "p").await, Err(SuapError::AuthenticationFailed)));
+    }
+
+    #[tokio::test]
+    async fn login_fails_without_csrf_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).respond_with(ResponseTemplate::new(200).set_body_string("<form></form>")).mount(&server).await;
+        let (_dir, paths) = paths();
+        let client = SuapClient::open(&paths, &config_for(&server)).unwrap();
+        assert!(matches!(client.login("u", "p").await, Err(SuapError::Parse(_))));
+    }
+
+    #[tokio::test]
+    async fn is_authenticated_reflects_response_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/")).respond_with(ResponseTemplate::new(403)).mount(&server).await;
+        let (_dir, paths) = paths();
+        let client = SuapClient::open(&paths, &config_for(&server)).unwrap();
+        assert!(!client.is_authenticated().await.unwrap());
+    }
+
+    #[test]
+    fn errors_convert_and_display() {
+        let boxed: Box<dyn std::error::Error + Send + Sync> = "boom".into();
+        assert_eq!(SuapError::from(boxed).to_string(), "cookie store error: boom");
+        for error in [
+            SuapError::DirectoriesUnavailable,
+            SuapError::NotAuthenticated,
+            SuapError::Transport("t".to_owned()),
+        ] {
+            assert!(!error.to_string().is_empty());
+        }
     }
 }
