@@ -58,9 +58,9 @@ enum Command {
         /// Centro de atendimento (id); por padrão, o único disponível para o campus.
         #[arg(long)]
         center: Option<String>,
-        /// Interessado (id do vínculo); por padrão, o usuário autenticado.
+        /// Interessado (id do vínculo no SUAP); o formulário do SUAP exige este campo.
         #[arg(long)]
-        interested: Option<String>,
+        interested: String,
         /// Campo extra do formulário no formato NOME=VALOR (repetível), ex.: --field patrimonio=123.
         #[arg(long = "field", value_parser = parse_field)]
         fields: Vec<(String, String)>,
@@ -129,7 +129,7 @@ fn execute(
         Some(Command::List { meus }) => list(paths, meus, out),
         Some(Command::Show { id }) => show(paths, id, out),
         Some(Command::Open { service, description, campus, center, interested, fields }) => {
-            let ticket = NewTicket { service_id: service, description, campus, center, interested, extra_fields: fields };
+            let ticket = NewTicket { service_id: service, description, campus, center, interested: Some(interested), extra_fields: fields };
             open(paths, &ticket, out)
         }
         Some(Command::Status) => {
@@ -538,7 +538,7 @@ mod tests {
         mount_text(&runtime, &server, "GET", "/centralservicos/get_centros_atendimento_por_servico_e_campus/7/3/", ResponseTemplate::new(200).set_body_string(r#"{"centros": [[9, "TI", true]]}"#));
         mount_text(&runtime, &server, "POST", "/centralservicos/abrir_chamado/7/", ResponseTemplate::new(302).insert_header("location", "/centralservicos/chamado/99/"));
         mount_text(&runtime, &server, "GET", "/centralservicos/chamado/99/", ResponseTemplate::new(200));
-        let (code, out, err) = run_args(&["open", "7", "--description", "Teste", "--field", "telefone=1=2"], &paths);
+        let (code, out, err) = run_args(&["open", "7", "--description", "Teste", "--interested", "1", "--field", "telefone=1=2"], &paths);
         assert_eq!((code, err.as_str()), (0, ""));
         assert_eq!(out, format!("Chamado #99 aberto: {}/centralservicos/chamado/99/\n", server.uri()));
     }
@@ -556,7 +556,7 @@ mod tests {
         assert!(err.contains("could not confirm"));
 
         for bad in ["semigual", "=semnome"] {
-            let (code, _, err) = run_args(&["open", "7", "-d", "x", "--field", bad], &paths);
+            let (code, _, err) = run_args(&["open", "7", "-d", "x", "--interested", "1", "--field", bad], &paths);
             assert_eq!(code, 2);
             assert!(err.contains("NOME=VALOR"));
         }
