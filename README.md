@@ -14,7 +14,9 @@ A separação permite reutilizar o núcleo Rust no Android sem colocar regras de
 
 ## Configuração local
 
-A aplicação usa `ProjectDirs` para obter diretórios apropriados para cada sistema operacional. O arquivo de configuração é `config.toml`; o arquivo reservado para a sessão fica no diretório de dados como `session.cookies`.
+O arquivo de configuração é `~/.config/suap/config.toml` em todos os sistemas (no Windows, `%USERPROFILE%\.config\suap\config.toml`). A sessão (`session.cookies`) fica no diretório de dados do sistema, obtido via `ProjectDirs`.
+
+> A partir da v0.5.0 a configuração deixou de ficar no diretório de configuração do sistema (ex.: `%APPDATA%` no Windows). Se você já tinha um `config.toml` lá, copie-o para `~/.config/suap/` ou rode `config-init` de novo.
 
 Consulte os caminhos com:
 

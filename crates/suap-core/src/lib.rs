@@ -2,7 +2,7 @@
 
 use std::{fs, io::{BufReader, Write}, path::{Path, PathBuf}, sync::Arc};
 
-use directories::ProjectDirs;
+use directories::{BaseDirs, ProjectDirs};
 use reqwest::{Client, StatusCode, Url};
 use reqwest_cookie_store::{CookieStore, CookieStoreMutex};
 use scraper::{Html, Selector};
@@ -14,6 +14,7 @@ const ORGANIZATION: &str = "suap-companion";
 const APPLICATION: &str = "chamados";
 const CONFIG_FILE: &str = "config.toml";
 const SESSION_FILE: &str = "session.cookies";
+const CONFIG_DIR_IN_HOME: [&str; 2] = [".config", "suap"];
 const LOGIN_PATH: &str = "/accounts/login/";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,13 +24,12 @@ pub struct AppPaths {
 }
 
 impl AppPaths {
+    /// Configuration lives in `~/.config/suap` on every platform; session data uses the OS data directory.
     pub fn discover() -> Result<Self, SuapError> {
+        let home = BaseDirs::new().ok_or(SuapError::DirectoriesUnavailable)?;
         let project = ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
             .ok_or(SuapError::DirectoriesUnavailable)?;
-        Ok(Self {
-            config_dir: project.config_dir().to_path_buf(),
-            data_dir: project.data_dir().to_path_buf(),
-        })
+        Ok(Self::from_dirs(config_dir_in(home.home_dir()), project.data_dir().to_path_buf()))
     }
 
     pub fn from_dirs(config_dir: PathBuf, data_dir: PathBuf) -> Self {
@@ -46,6 +46,11 @@ impl AppPaths {
         fs::create_dir_all(&self.data_dir)?;
         Ok(())
     }
+}
+
+/// Directory holding `config.toml` for a given home directory (`<home>/.config/suap`).
+fn config_dir_in(home: &Path) -> PathBuf {
+    CONFIG_DIR_IN_HOME.iter().fold(home.to_path_buf(), |path, part| path.join(part))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -286,6 +291,14 @@ mod tests {
         assert!(paths.session_file().ends_with("session.cookies"));
         paths.ensure_dirs().unwrap();
         assert!(paths.config_dir().is_dir() && paths.data_dir().is_dir());
+    }
+
+    #[test]
+    fn config_dir_is_dot_config_suap_under_home() {
+        let home = Path::new("home").join("kelson");
+        assert_eq!(config_dir_in(&home), home.join(".config").join("suap"));
+        let paths = AppPaths::discover().expect("home directory is available");
+        assert!(paths.config_dir().ends_with(Path::new(".config").join("suap")));
     }
 
     #[test]
