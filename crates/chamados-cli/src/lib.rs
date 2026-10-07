@@ -5,7 +5,7 @@
 use std::{error::Error, ffi::OsString, io::Write};
 
 use clap::{Parser, Subcommand};
-use chamados_core::{SuapTicketSource, TicketDetails, TicketError, TicketQueue, TicketSource};
+use chamados_core::{NewTicket, SuapTicketSource, TicketDetails, TicketError, TicketQueue, TicketSource};
 use suap_core::{load_config, save_config, AppPaths, SuapClient, SuapError};
 
 #[derive(Debug, Parser)]
@@ -45,8 +45,35 @@ enum Command {
         /// Número do chamado (ex.: 559298).
         id: u64,
     },
+    /// Abre um novo chamado no SUAP usando a sessão salva por `login`.
+    Open {
+        /// Número do serviço no SUAP (o mesmo de /centralservicos/abrir_chamado/<serviço>/).
+        service: u64,
+        /// Descrição do chamado.
+        #[arg(long, short)]
+        description: String,
+        /// Campus (id da unidade organizacional); por padrão, o do usuário.
+        #[arg(long)]
+        campus: Option<String>,
+        /// Centro de atendimento (id); por padrão, o único disponível para o campus.
+        #[arg(long)]
+        center: Option<String>,
+        /// Interessado (id do vínculo); por padrão, o usuário autenticado.
+        #[arg(long)]
+        interested: Option<String>,
+        /// Campo extra do formulário no formato NOME=VALOR (repetível), ex.: --field patrimonio=123.
+        #[arg(long = "field", value_parser = parse_field)]
+        fields: Vec<(String, String)>,
+    },
     /// Exibe uma mensagem sobre o estado inicial do projeto.
     Status,
+}
+
+fn parse_field(raw: &str) -> Result<(String, String), String> {
+    match raw.split_once('=') {
+        Some((name, value)) if !name.is_empty() => Ok((name.to_owned(), value.to_owned())),
+        _ => Err(format!("campo inválido {raw:?}: use NOME=VALOR")),
+    }
 }
 
 /// Name of the environment variable that holds the SUAP password.
@@ -101,6 +128,10 @@ fn execute(
         Some(Command::Login { username }) => login(paths, username, password, out),
         Some(Command::List { meus }) => list(paths, meus, out),
         Some(Command::Show { id }) => show(paths, id, out),
+        Some(Command::Open { service, description, campus, center, interested, fields }) => {
+            let ticket = NewTicket { service_id: service, description, campus, center, interested, extra_fields: fields };
+            open(paths, &ticket, out)
+        }
         Some(Command::Status) => {
             writeln!(out, "chamados-cli: fundação inicial instalada; integração ainda não implementada.")?;
             Ok(())
@@ -178,6 +209,16 @@ fn show(paths: &AppPaths, id: u64, out: &mut dyn Write) -> Result<(), Box<dyn Er
     let source = SuapTicketSource::new(&client, TicketQueue::Support);
     let details = runtime.block_on(source.get_ticket(&id.to_string())).map_err(explain)?;
     print_details(&details, out)?;
+    Ok(())
+}
+
+fn open(paths: &AppPaths, ticket: &NewTicket, out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
+    let config = load_config(paths)?.unwrap_or_default();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let client = SuapClient::open(paths, &config)?;
+    let source = SuapTicketSource::new(&client, TicketQueue::Support);
+    let id = runtime.block_on(source.open_ticket(ticket)).map_err(explain)?;
+    writeln!(out, "Chamado #{id} aberto: {}", client.base_url().join(&format!("centralservicos/chamado/{id}/"))?)?;
     Ok(())
 }
 
@@ -471,6 +512,54 @@ mod tests {
         let (code, _, err) = run_args(&["show", "abc"], &paths);
         assert_eq!(code, 2);
         assert!(!err.is_empty());
+    }
+
+    fn bare_server() -> (tokio::runtime::Runtime, MockServer) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let server = runtime.block_on(MockServer::start());
+        (runtime, server)
+    }
+
+    fn mount_text(runtime: &tokio::runtime::Runtime, server: &MockServer, verb: &str, request_path: &str, body: ResponseTemplate) {
+        runtime.block_on(
+            Mock::given(method(verb)).and(path(request_path.to_owned())).respond_with(body).mount(server),
+        );
+    }
+
+    #[test]
+    fn open_creates_ticket_with_suap_defaults() {
+        let (_dir, paths) = paths();
+        let (runtime, server) = bare_server();
+        run_args(&["config-init", "--base-url", &server.uri()], &paths);
+        let form = r#"<form method="post"><input type="hidden" name="csrfmiddlewaretoken" value="tok">
+            <textarea name="descricao"></textarea></form>"#;
+        mount_text(&runtime, &server, "GET", "/centralservicos/abrir_chamado/7/", ResponseTemplate::new(200).set_body_string(form));
+        mount_text(&runtime, &server, "GET", "/centralservicos/get_campus_com_centros_atendimento/7/0/", ResponseTemplate::new(200).set_body_string(r#"{"campus": [[3, "ZL", true]]}"#));
+        mount_text(&runtime, &server, "GET", "/centralservicos/get_centros_atendimento_por_servico_e_campus/7/3/", ResponseTemplate::new(200).set_body_string(r#"{"centros": [[9, "TI", true]]}"#));
+        mount_text(&runtime, &server, "POST", "/centralservicos/abrir_chamado/7/", ResponseTemplate::new(302).insert_header("location", "/centralservicos/chamado/99/"));
+        mount_text(&runtime, &server, "GET", "/centralservicos/chamado/99/", ResponseTemplate::new(200));
+        let (code, out, err) = run_args(&["open", "7", "--description", "Teste", "--field", "telefone=1=2"], &paths);
+        assert_eq!((code, err.as_str()), (0, ""));
+        assert_eq!(out, format!("Chamado #99 aberto: {}/centralservicos/chamado/99/\n", server.uri()));
+    }
+
+    #[test]
+    fn open_reports_rejection_and_invalid_fields() {
+        let (_dir, paths) = paths();
+        let (runtime, server) = bare_server();
+        run_args(&["config-init", "--base-url", &server.uri()], &paths);
+        let form = r#"<form method="post"><textarea name="descricao"></textarea></form>"#;
+        mount_text(&runtime, &server, "GET", "/centralservicos/abrir_chamado/7/", ResponseTemplate::new(200).set_body_string(form));
+        mount_text(&runtime, &server, "POST", "/centralservicos/abrir_chamado/7/", ResponseTemplate::new(200).set_body_string("<p>sem retorno</p>"));
+        let (code, _, err) = run_args(&["open", "7", "-d", "Teste", "--campus", "1", "--center", "2", "--interested", "3"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("could not confirm"));
+
+        for bad in ["semigual", "=semnome"] {
+            let (code, _, err) = run_args(&["open", "7", "-d", "x", "--field", bad], &paths);
+            assert_eq!(code, 2);
+            assert!(err.contains("NOME=VALOR"));
+        }
     }
 
     #[test]

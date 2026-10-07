@@ -60,6 +60,14 @@ cargo run -p chamados-cli -- list --meus    # "Meus chamados" ativos
 
 Se a sessão estiver ausente ou expirada, o comando orienta a executar `chamados login`.
 
+### Abrir um chamado
+
+```bash
+cargo run -p chamados-cli -- open 53 --description "Não consigo acessar as bibliotecas virtuais"
+```
+
+`53` é o número do serviço no SUAP (o mesmo de `/centralservicos/abrir_chamado/53/`). O campus padrão é o do usuário e o centro de atendimento padrão é o único disponível para o campus; se houver vários, o comando lista as opções e pede `--center`. Outros campos do formulário podem ser enviados com `--field NOME=VALOR` (ex.: `--field patrimonio=123`), e `--campus`, `--center` e `--interested` sobrescrevem os padrões.
+
 ### Ver detalhes de um chamado
 
 ```bash
