@@ -36,7 +36,16 @@ Consulte a configuração sem exibir senha:
 cargo run -p chamados-cli -- config-show
 ```
 
-A senha não é persistida; os cookies de sessão são salvos em `session.cookies` após o login.
+### Login
+
+A senha nunca é persistida nem passada por argumento: o comando `login` a lê da variável de ambiente `SUAP_PASSWORD`. O usuário vem de `--username` ou, se omitido, do `username` da configuração local.
+
+```bash
+export SUAP_PASSWORD='sua_senha'   # PowerShell: $env:SUAP_PASSWORD = 'sua_senha'
+cargo run -p chamados-cli -- login --username seu_usuario
+```
+
+Após o login, apenas os cookies de sessão são salvos em `session.cookies`.
 
 ## Requisitos de software
 

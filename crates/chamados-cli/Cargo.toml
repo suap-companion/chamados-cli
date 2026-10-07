@@ -11,6 +11,8 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 suap-core = { path = "../suap-core" }
+tokio = { version = "1", features = ["rt"] }
 
 [dev-dependencies]
 tempfile = "3"
+wiremock = "0.6"
