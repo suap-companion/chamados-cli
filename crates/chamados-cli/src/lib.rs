@@ -5,7 +5,7 @@
 use std::{error::Error, ffi::OsString, io::Write};
 
 use clap::{Parser, Subcommand};
-use suap_core::{load_config, save_config, AppPaths};
+use suap_core::{load_config, save_config, AppPaths, SuapClient};
 
 #[derive(Debug, Parser)]
 #[command(name = "chamados", version, about = "Cliente local para chamados do SUAP")]
@@ -27,12 +27,29 @@ enum Command {
         #[arg(long)]
         username: Option<String>,
     },
+    /// Autentica no SUAP usando a senha da variável de ambiente `SUAP_PASSWORD`.
+    Login {
+        /// Usuário do SUAP; se omitido, usa o `username` da configuração local.
+        #[arg(long)]
+        username: Option<String>,
+    },
     /// Exibe uma mensagem sobre o estado inicial do projeto.
     Status,
 }
 
+/// Name of the environment variable that holds the SUAP password.
+pub const PASSWORD_ENV: &str = "SUAP_PASSWORD";
+
 /// Runs the CLI with `args`, writing to `out`/`err`, and returns the process exit code.
-pub fn run<I, T>(args: I, paths: &AppPaths, out: &mut dyn Write, err: &mut dyn Write) -> i32
+///
+/// `password` is the value of [`PASSWORD_ENV`], read by the caller so it can be injected in tests.
+pub fn run<I, T>(
+    args: I,
+    paths: &AppPaths,
+    password: Option<String>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
@@ -50,7 +67,7 @@ where
         }
     };
 
-    match execute(cli, paths, out) {
+    match execute(cli, paths, password, out) {
         Ok(()) => 0,
         Err(error) => {
             let _ = writeln!(err, "erro: {error}");
@@ -59,11 +76,17 @@ where
     }
 }
 
-fn execute(cli: Cli, paths: &AppPaths, out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
+fn execute(
+    cli: Cli,
+    paths: &AppPaths,
+    password: Option<String>,
+    out: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
     match cli.command {
         Some(Command::Paths) => show_paths(paths, out),
         Some(Command::ConfigShow) => show_config(paths, out),
         Some(Command::ConfigInit { base_url, username }) => init_config(paths, base_url, username, out),
+        Some(Command::Login { username }) => login(paths, username, password, out),
         Some(Command::Status) => {
             writeln!(out, "chamados-cli: fundação inicial instalada; integração ainda não implementada.")?;
             Ok(())
@@ -95,6 +118,25 @@ fn show_config(paths: &AppPaths, out: &mut dyn Write) -> Result<(), Box<dyn Erro
     Ok(())
 }
 
+fn login(
+    paths: &AppPaths,
+    username: Option<String>,
+    password: Option<String>,
+    out: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    let config = load_config(paths)?.unwrap_or_default();
+    let username = username
+        .or_else(|| config.username.clone())
+        .ok_or("usuário não informado: use --username ou `config-init --username`")?;
+    let password = password.ok_or_else(|| format!("senha não informada: defina a variável de ambiente {PASSWORD_ENV}"))?;
+
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let client = SuapClient::open(paths, &config)?;
+    runtime.block_on(client.login(&username, &password))?;
+    writeln!(out, "Login realizado como {username}. Sessão salva em {}", paths.session_file().display())?;
+    Ok(())
+}
+
 fn init_config(
     paths: &AppPaths,
     base_url: Option<String>,
@@ -119,6 +161,7 @@ fn init_config(
 mod tests {
     use super::*;
     use tempfile::{tempdir, TempDir};
+    use wiremock::{matchers::{method, path}, Mock, MockServer, ResponseTemplate};
 
     fn paths() -> (TempDir, AppPaths) {
         let directory = tempdir().unwrap();
@@ -128,7 +171,7 @@ mod tests {
 
     fn run_args(args: &[&str], paths: &AppPaths) -> (i32, String, String) {
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = run(std::iter::once("chamados").chain(args.iter().copied()), paths, &mut out, &mut err);
+        let code = run(std::iter::once("chamados").chain(args.iter().copied()), paths, None, &mut out, &mut err);
         (code, String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
     }
 
@@ -222,6 +265,89 @@ mod tests {
         assert!(err.starts_with("erro:"));
     }
 
+    fn run_login(args: &[&str], paths: &AppPaths, password: Option<&str>) -> (i32, String, String) {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run(
+            std::iter::once("chamados").chain(args.iter().copied()),
+            paths,
+            password.map(str::to_owned),
+            &mut out,
+            &mut err,
+        );
+        (code, String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
+    }
+
+    fn mock_server(login_succeeds: bool) -> (tokio::runtime::Runtime, MockServer) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let server = runtime.block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/accounts/login/"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    r#"<form><input type="hidden" name="csrfmiddlewaretoken" value="tok"></form>"#,
+                ))
+                .mount(&server)
+                .await;
+            let post = if login_succeeds {
+                ResponseTemplate::new(302).insert_header("location", "/")
+            } else {
+                ResponseTemplate::new(401)
+            };
+            Mock::given(method("POST")).respond_with(post).mount(&server).await;
+            Mock::given(method("GET")).and(path("/")).respond_with(ResponseTemplate::new(200)).mount(&server).await;
+            server
+        });
+        (runtime, server)
+    }
+
+    #[test]
+    fn login_uses_flag_username_and_saves_session() {
+        let (_dir, paths) = paths();
+        let (_runtime, server) = mock_server(true);
+        run_args(&["config-init", "--base-url", &server.uri()], &paths);
+        let (code, out, err) = run_login(&["login", "--username", "kelson"], &paths, Some("segredo"));
+        assert_eq!((code, err.as_str()), (0, ""));
+        assert!(out.contains("Login realizado como kelson") && !out.contains("segredo"));
+        assert!(paths.session_file().exists());
+    }
+
+    #[test]
+    fn login_falls_back_to_configured_username() {
+        let (_dir, paths) = paths();
+        let (_runtime, server) = mock_server(true);
+        run_args(&["config-init", "--base-url", &server.uri(), "--username", "cfg"], &paths);
+        let (code, out, _) = run_login(&["login"], &paths, Some("segredo"));
+        assert_eq!(code, 0);
+        assert!(out.contains("como cfg"));
+    }
+
+    #[test]
+    fn login_reports_rejected_credentials() {
+        let (_dir, paths) = paths();
+        let (_runtime, server) = mock_server(false);
+        run_args(&["config-init", "--base-url", &server.uri()], &paths);
+        let (code, _, err) = run_login(&["login", "--username", "kelson"], &paths, Some("errada"));
+        assert_eq!(code, 1);
+        assert!(err.contains("authentication failed"));
+        assert!(!paths.session_file().exists());
+    }
+
+    #[test]
+    fn login_requires_username() {
+        let (_dir, paths) = paths();
+        let (code, _, err) = run_login(&["login"], &paths, Some("segredo"));
+        assert_eq!(code, 1);
+        assert!(err.contains("--username"));
+    }
+
+    #[test]
+    fn login_requires_password_env() {
+        let (_dir, paths) = paths();
+        let (code, _, err) = run_login(&["login", "--username", "kelson"], &paths, None);
+        assert_eq!(code, 1);
+        assert!(err.contains(PASSWORD_ENV));
+    }
+
     struct FailingWriter;
 
     impl Write for FailingWriter {
@@ -237,7 +363,7 @@ mod tests {
     fn output_failure_is_reported_as_error() {
         let (_dir, paths) = paths();
         let mut err = Vec::new();
-        let code = run(["chamados", "status"], &paths, &mut FailingWriter, &mut err);
+        let code = run(["chamados", "status"], &paths, None, &mut FailingWriter, &mut err);
         assert_eq!(code, 1);
         assert!(String::from_utf8(err).unwrap().contains("closed"));
         FailingWriter.flush().unwrap();
