@@ -58,6 +58,14 @@ cargo run -p chamados-cli -- list --meus    # "Meus chamados" ativos
 
 Se a sessão estiver ausente ou expirada, o comando orienta a executar `chamados login`.
 
+### Ver detalhes de um chamado
+
+```bash
+cargo run -p chamados-cli -- show 559298
+```
+
+Exibe título, situação, serviço, URL, dados do interessado, descrição e a linha do tempo completa do chamado. Também exige a sessão salva por `login`.
+
 ## Requisitos de software
 
 - **RS-01 — Cobertura de testes de 100%.** Os testes automatizados do workspace devem cobrir 100% das linhas de código. A verificação roda no CI (`ci.yml`) e o build falha se a cobertura ficar abaixo disso. O ponto de entrada `main.rs` de cada binário deve conter apenas o encadeamento mínimo e é excluído da medição; toda a lógica fica em `lib.rs`, onde é testada.
