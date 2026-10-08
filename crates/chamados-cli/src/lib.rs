@@ -15,7 +15,8 @@ use chamados_core::{
 };
 use clap::{Args, Parser, Subcommand};
 use suap_core::{
-    load_config, save_config, AppPaths, SuapClient, SuapConfig, SuapError, DEFAULT_PROFILE,
+    list_profiles, load_config, remove_config, save_config, AppPaths, SuapClient, SuapConfig,
+    SuapError, DEFAULT_PROFILE,
 };
 
 #[derive(Debug, Parser)]
@@ -36,10 +37,13 @@ struct Cli {
 enum Command {
     /// Exibe os diretórios usados pela aplicação.
     Paths,
-    /// Exibe a configuração local sem dados sensíveis.
-    ConfigShow,
-    /// Cria uma configuração local inicial.
-    ConfigInit(ConfigInitArgs),
+    /// Gerencia perfis (ambientes): cada um tem configuração e sessão próprias.
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCommand,
+    },
+    /// Informa se a sessão salva do perfil ainda é válida.
+    SessionStatus,
     /// Autentica no SUAP usando a senha da variável de ambiente `SUAP_PASSWORD`.
     Login {
         /// Usuário do SUAP; se omitido, usa o `username` da configuração local.
@@ -70,8 +74,33 @@ fn parse_field(raw: &str) -> Result<(String, String), String> {
     }
 }
 
+#[derive(Debug, Subcommand)]
+enum ProfileCommand {
+    /// Cria um perfil (sem nome, usa o perfil selecionado por --profile, `default` por padrão).
+    Init(ProfileArgs),
+    /// Altera campos de um perfil existente.
+    Update(ProfileArgs),
+    /// Apaga um perfil e a sessão dele.
+    Remove {
+        /// Nome do perfil.
+        name: String,
+        /// Confirma a remoção (apaga a configuração e a sessão do perfil).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Exibe a configuração de um perfil, sem dados sensíveis.
+    Show {
+        /// Nome do perfil; por padrão, o selecionado por --profile.
+        name: Option<String>,
+    },
+    /// Lista os perfis configurados.
+    List,
+}
+
 #[derive(Debug, Args)]
-struct ConfigInitArgs {
+struct ProfileArgs {
+    /// Nome do perfil; por padrão, o selecionado por --profile (`default`).
+    name: Option<String>,
     #[arg(long)]
     base_url: Option<String>,
     #[arg(long)]
@@ -123,6 +152,8 @@ struct OpenArgs {
     fields: Vec<(String, String)>,
 }
 
+const UNSAVED_DEFAULT_NOTE: &str = "(perfil padrão ainda não gravado; valores padrão abaixo)";
+const NO_PROFILES_HINT: &str = "Nenhum perfil configurado. Crie um com `chamados profile init`.";
 const HELP_HINT: &str = "Use `chamados --help` para consultar os comandos disponíveis.";
 
 /// Name of the environment variable that holds the SUAP password.
@@ -183,8 +214,14 @@ fn execute(
 ) -> Result<(), Box<dyn Error>> {
     match cli.command {
         Some(Command::Paths) => show_paths(paths, out),
-        Some(Command::ConfigShow) => show_config(paths, out),
-        Some(Command::ConfigInit(args)) => init_config(paths, args, out),
+        Some(Command::Profile { command }) => match command {
+            ProfileCommand::Init(args) => profile_init(paths, args, out),
+            ProfileCommand::Update(args) => profile_update(paths, args, out),
+            ProfileCommand::Remove { name, yes } => profile_remove(paths, &name, yes, out),
+            ProfileCommand::Show { name } => profile_show(paths, name.as_deref(), out),
+            ProfileCommand::List => profile_list(paths, out),
+        },
+        Some(Command::SessionStatus) => session_status(paths, out),
         Some(Command::Login { username }) => login(paths, username, password, out),
         Some(Command::List { meus }) => list(paths, meus, out),
         Some(Command::Show { id }) => show(paths, id, out),
@@ -209,7 +246,7 @@ fn profile_config(paths: &AppPaths) -> Result<SuapConfig, Box<dyn Error>> {
         Some(config) => Ok(config),
         None if paths.profile() == DEFAULT_PROFILE => Ok(SuapConfig::default()),
         None => Err(format!(
-            "perfil {0:?} não configurado: execute `chamados config-init --profile {0}`",
+            "perfil {0:?} não configurado: execute `chamados profile init {0}`",
             paths.profile()
         )
         .into()),
@@ -225,37 +262,195 @@ fn show_paths(paths: &AppPaths, out: &mut dyn Write) -> Result<(), Box<dyn Error
     Ok(())
 }
 
-fn show_config(paths: &AppPaths, out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
-    match load_config(paths)? {
-        Some(config) => {
-            writeln!(out, "profile: {}", paths.profile())?;
-            writeln!(out, "base_url: {}", config.base_url)?;
-            let username = config.username.as_deref().unwrap_or("<não configurado>");
-            writeln!(out, "username: {username}")?;
-            let open = &config.open;
-            let defaults = [
-                ("service", open.service.map(|service| service.to_string())),
-                ("interested", open.interested.clone()),
-                ("campus", open.campus.clone()),
-                ("center", open.center.clone()),
-            ];
-            for (name, value) in defaults
-                .iter()
-                .filter_map(|(name, value)| Some((name, value.as_ref()?)))
-            {
-                writeln!(out, "open.{name}: {value}")?;
-            }
-            writeln!(out, "file: {}", paths.config_file().display())?;
-        }
-        None => {
-            let (profile, file) = (paths.profile(), paths.config_file());
-            let message = format!(
-                "Nenhuma configuração encontrada para o perfil {profile} em {}",
-                file.display()
-            );
-            writeln!(out, "{message}")?;
-        }
+/// Paths for the profile named in a `profile` subcommand, or the one selected by `--profile`.
+fn paths_for(paths: &AppPaths, name: Option<&str>) -> Result<AppPaths, Box<dyn Error>> {
+    match name {
+        Some(name) => Ok(paths.clone().with_profile(name)?),
+        None => Ok(paths.clone()),
     }
+}
+
+fn print_profile(
+    paths: &AppPaths,
+    config: &SuapConfig,
+    out: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    writeln!(out, "profile: {}", paths.profile())?;
+    writeln!(out, "base_url: {}", config.base_url)?;
+    let username = config.username.as_deref().unwrap_or("<não configurado>");
+    writeln!(out, "username: {username}")?;
+    let open = &config.open;
+    let defaults = [
+        ("service", open.service.map(|service| service.to_string())),
+        ("interested", open.interested.clone()),
+        ("campus", open.campus.clone()),
+        ("center", open.center.clone()),
+    ];
+    for (name, value) in defaults
+        .iter()
+        .filter_map(|(name, value)| Some((name, value.as_ref()?)))
+    {
+        writeln!(out, "open.{name}: {value}")?;
+    }
+    let session = if paths.session_file().exists() {
+        "salva"
+    } else {
+        "ausente"
+    };
+    writeln!(out, "session: {session}")?;
+    writeln!(out, "file: {}", paths.config_file().display())?;
+    Ok(())
+}
+
+fn profile_show(
+    paths: &AppPaths,
+    name: Option<&str>,
+    out: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    let paths = paths_for(paths, name)?;
+    match load_config(&paths)? {
+        Some(config) => print_profile(&paths, &config, out),
+        None if paths.profile() == DEFAULT_PROFILE => {
+            writeln!(out, "{UNSAVED_DEFAULT_NOTE}")?;
+            print_profile(&paths, &SuapConfig::default(), out)
+        }
+        None => Err(missing_profile(paths.profile())),
+    }
+}
+
+fn missing_profile(name: &str) -> Box<dyn Error> {
+    format!("o perfil {name:?} não existe: crie-o com `chamados profile init {name}`").into()
+}
+
+fn profile_list(paths: &AppPaths, out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
+    let profiles = list_profiles(paths)?;
+    if profiles.is_empty() {
+        writeln!(out, "{NO_PROFILES_HINT}")?;
+    }
+    for (name, config) in profiles {
+        let marker = if name == DEFAULT_PROFILE {
+            "\t(padrão)"
+        } else {
+            ""
+        };
+        let username = config.username.as_deref().unwrap_or("-");
+        writeln!(out, "{name}\t{}\t{username}{marker}", config.base_url)?;
+    }
+    Ok(())
+}
+
+fn apply_profile_args(config: &mut SuapConfig, args: ProfileArgs) -> Result<(), Box<dyn Error>> {
+    if let Some(base_url) = args.base_url {
+        config.base_url = base_url.parse()?;
+    }
+    if args.username.is_some() {
+        config.username = args.username;
+    }
+    let open = &mut config.open;
+    open.service = args.service.or(open.service);
+    open.interested = args.interested.or(open.interested.take());
+    open.campus = args.campus.or(open.campus.take());
+    open.center = args.center.or(open.center.take());
+    Ok(())
+}
+
+fn profile_init(
+    paths: &AppPaths,
+    args: ProfileArgs,
+    out: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    let paths = paths_for(paths, args.name.as_deref())?;
+    let name = paths.profile();
+    if load_config(&paths)?.is_some() {
+        return Err(format!(
+            "o perfil {name:?} já existe: altere-o com `chamados profile update {name}`"
+        )
+        .into());
+    }
+    let mut config = SuapConfig::default();
+    apply_profile_args(&mut config, args)?;
+    save_config(&paths, &config)?;
+    let file = paths.config_file();
+    writeln!(out, "Perfil {name} criado em {}", file.display())?;
+    Ok(())
+}
+
+fn profile_update(
+    paths: &AppPaths,
+    args: ProfileArgs,
+    out: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    let paths = paths_for(paths, args.name.as_deref())?;
+    let name = paths.profile();
+    let Some(mut config) = load_config(&paths)? else {
+        return Err(missing_profile(name));
+    };
+    let unchanged = [
+        &args.base_url,
+        &args.username,
+        &args.interested,
+        &args.campus,
+        &args.center,
+    ]
+    .iter()
+    .all(|option| option.is_none())
+        && args.service.is_none();
+    if unchanged {
+        return Err("nada a alterar: informe ao menos uma opção (ex.: --base-url)".into());
+    }
+    apply_profile_args(&mut config, args)?;
+    save_config(&paths, &config)?;
+    let file = paths.config_file();
+    writeln!(out, "Perfil {name} atualizado em {}", file.display())?;
+    Ok(())
+}
+
+fn profile_remove(
+    paths: &AppPaths,
+    name: &str,
+    yes: bool,
+    out: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    let paths = paths_for(paths, Some(name))?;
+    if load_config(&paths)?.is_none() {
+        return Err(missing_profile(name));
+    }
+    if !yes {
+        return Err(format!(
+            "a remoção apaga a configuração e a sessão do perfil {name:?}: confirme com --yes"
+        )
+        .into());
+    }
+    remove_config(&paths)?;
+    let session = paths.session_file();
+    if session.exists() {
+        fs::remove_file(&session)?;
+    }
+    writeln!(out, "Perfil {name} removido (configuração e sessão).")?;
+    Ok(())
+}
+
+fn session_status(paths: &AppPaths, out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
+    let config = profile_config(paths)?;
+    let profile = paths.profile();
+    if !paths.session_file().exists() {
+        return Err(format!(
+            "nenhuma sessão salva para o perfil {profile:?}: execute `chamados login`"
+        )
+        .into());
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let client = SuapClient::open(paths, &config)?;
+    if !runtime.block_on(client.is_authenticated())? {
+        return Err(format!(
+            "a sessão do perfil {profile:?} expirou: execute `chamados login` (a sessão salva não foi apagada)"
+        )
+        .into());
+    }
+    let url = &config.base_url;
+    writeln!(out, "Sessão válida (perfil {profile}, {url}).")?;
     Ok(())
 }
 
@@ -268,7 +463,7 @@ fn login(
     let config = profile_config(paths)?;
     let username = username
         .or_else(|| config.username.clone())
-        .ok_or("usuário não informado: use --username ou `config-init --username`")?;
+        .ok_or("usuário não informado: use --username ou `profile update --username`")?;
     let password = password.ok_or_else(|| {
         format!("senha não informada: defina a variável de ambiente {PASSWORD_ENV}")
     })?;
@@ -380,10 +575,10 @@ fn open(
 ) -> Result<(), Box<dyn Error>> {
     let config = profile_config(paths)?;
     let defaults = &config.open;
-    let service_id = args.service.or(defaults.service).ok_or("serviço não informado: passe o número ou defina o padrão do perfil (config-init --service)")?;
+    let service_id = args.service.or(defaults.service).ok_or("serviço não informado: passe o número ou defina o padrão do perfil (profile update --service)")?;
     let interested = args.interested.or_else(|| defaults.interested.clone());
     if interested.is_none() {
-        return Err("interessado não informado: use --interested ou defina o padrão do perfil (config-init --interested)".into());
+        return Err("interessado não informado: use --interested ou defina o padrão do perfil (profile update --interested)".into());
     }
     let ticket = NewTicket {
         service_id,
@@ -456,35 +651,6 @@ fn explain(error: TicketError) -> Box<dyn Error> {
     }
 }
 
-fn init_config(
-    paths: &AppPaths,
-    args: ConfigInitArgs,
-    out: &mut dyn Write,
-) -> Result<(), Box<dyn Error>> {
-    let mut config = load_config(paths)?.unwrap_or_default();
-
-    if let Some(base_url) = args.base_url {
-        config.base_url = base_url.parse()?;
-    }
-    if args.username.is_some() {
-        config.username = args.username;
-    }
-    let open = &mut config.open;
-    open.service = args.service.or(open.service);
-    open.interested = args.interested.or(open.interested.take());
-    open.campus = args.campus.or(open.campus.take());
-    open.center = args.center.or(open.center.take());
-
-    save_config(paths, &config)?;
-    let message = format!(
-        "Configuração salva em {} (perfil {})",
-        paths.config_file().display(),
-        paths.profile()
-    );
-    writeln!(out, "{message}")?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -549,7 +715,7 @@ mod tests {
         let (_dir, paths) = paths();
         let (code, out, err) = run_args(&["--help"], &paths);
         assert_eq!(code, 0);
-        assert!(out.contains("config-init") && err.is_empty());
+        assert!(out.contains("profile") && err.is_empty());
     }
 
     #[test]
@@ -561,30 +727,190 @@ mod tests {
     }
 
     #[test]
-    fn config_show_without_file() {
+    fn profile_show_without_file_describes_the_default_profile() {
         let (_dir, paths) = paths();
-        let (code, out, _) = run_args(&["config-show"], &paths);
+        let (code, out, _) = run_args(&["profile", "show"], &paths);
         assert_eq!(code, 0);
-        assert!(out.contains("Nenhuma configuração"));
+        assert!(out.contains("perfil padrão ainda não gravado"));
+        assert!(
+            out.contains("base_url: https://suap.ifrn.edu.br/") && out.contains("session: ausente")
+        );
     }
 
     #[test]
-    fn config_init_then_show() {
+    fn profile_init_update_and_show() {
         let (_dir, paths) = paths();
         let (code, out, _) = run_args(
-            &["config-init", "--base-url", "https://example.org/"],
+            &["profile", "init", "--base-url", "https://example.org/"],
             &paths,
         );
         assert_eq!(code, 0);
-        assert!(out.contains("Configuração salva"));
+        assert!(out.contains("Perfil default criado em"));
 
-        let (_, out, _) = run_args(&["config-show"], &paths);
+        let (_, out, _) = run_args(&["profile", "show"], &paths);
         assert!(out.contains("https://example.org/") && out.contains("<não configurado>"));
 
-        let (code, _, _) = run_args(&["config-init", "--username", "kelson"], &paths);
+        let (code, out, _) = run_args(&["profile", "update", "--username", "kelson"], &paths);
         assert_eq!(code, 0);
-        let (_, out, _) = run_args(&["config-show"], &paths);
+        assert!(out.contains("Perfil default atualizado em"));
+        let (_, out, _) = run_args(&["profile", "show", "default"], &paths);
         assert!(out.contains("https://example.org/") && out.contains("username: kelson"));
+    }
+
+    #[test]
+    fn profile_init_refuses_existing_and_update_refuses_missing_or_empty() {
+        let (_dir, paths) = paths();
+        run_args(&["profile", "init", "local"], &paths);
+        let (code, _, err) = run_args(&["profile", "init", "local"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("já existe") && err.contains("profile update local"));
+
+        let (code, _, err) = run_args(&["profile", "update", "outro", "--username", "x"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("não existe") && err.contains("profile init outro"));
+
+        let (code, _, err) = run_args(&["profile", "update", "local"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("nada a alterar"));
+
+        let (code, _, err) = run_args(&["profile", "show", "outro"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("não existe"));
+    }
+
+    #[test]
+    fn profile_update_changes_each_option_and_keeps_the_others() {
+        let (_dir, paths) = paths();
+        run_args(
+            &["profile", "init", "--service", "1", "--interested", "2"],
+            &paths,
+        );
+        for args in [
+            ["--base-url", "http://h/"],
+            ["--username", "u"],
+            ["--service", "9"],
+            ["--interested", "8"],
+            ["--campus", "7"],
+            ["--center", "6"],
+        ] {
+            let mut full = vec!["profile", "update"];
+            full.extend(args);
+            assert_eq!(run_args(&full, &paths).0, 0, "{args:?}");
+        }
+        let (_, out, _) = run_args(&["profile", "show"], &paths);
+        for expected in [
+            "base_url: http://h/",
+            "username: u",
+            "open.service: 9",
+            "open.interested: 8",
+            "open.campus: 7",
+            "open.center: 6",
+        ] {
+            assert!(out.contains(expected), "{expected}");
+        }
+    }
+
+    #[test]
+    fn profile_list_marks_the_default_profile() {
+        let (_dir, paths) = paths();
+        let (_, out, _) = run_args(&["profile", "list"], &paths);
+        assert!(out.contains("Nenhum perfil configurado"));
+
+        run_args(
+            &[
+                "profile",
+                "init",
+                "local",
+                "--base-url",
+                "http://localhost:8000",
+            ],
+            &paths,
+        );
+        run_args(&["profile", "init", "--username", "kelson"], &paths);
+        let (code, out, _) = run_args(&["profile", "list"], &paths);
+        assert_eq!(code, 0);
+        let lines: Vec<_> = out.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0],
+            "default\thttps://suap.ifrn.edu.br/\tkelson\t(padrão)"
+        );
+        assert_eq!(lines[1], "local\thttp://localhost:8000/\t-");
+    }
+
+    #[test]
+    fn profile_remove_deletes_configuration_and_session() {
+        let (_dir, paths) = paths();
+        run_args(&["profile", "init", "local"], &paths);
+        run_args(&["profile", "init"], &paths);
+        let local = paths.clone().with_profile("local").unwrap();
+        local.ensure_dirs().unwrap();
+        std::fs::write(local.session_file(), "x").unwrap();
+
+        let (_, out, _) = run_args(&["profile", "show", "local"], &paths);
+        assert!(out.contains("session: salva"));
+
+        let (code, _, err) = run_args(&["profile", "remove", "local"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("--yes") && local.session_file().exists());
+
+        let (code, out, _) = run_args(&["profile", "remove", "local", "--yes"], &paths);
+        assert_eq!(code, 0);
+        assert!(out.contains("Perfil local removido"));
+        assert!(!local.session_file().exists());
+        let (_, out, _) = run_args(&["profile", "list"], &paths);
+        assert!(out.starts_with("default"));
+
+        let (code, _, err) = run_args(&["profile", "remove", "local", "--yes"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("não existe"));
+        // A profile without a saved session is removed too.
+        assert_eq!(
+            run_args(&["profile", "remove", "default", "--yes"], &paths).0,
+            0
+        );
+    }
+
+    #[test]
+    fn session_status_reports_missing_valid_and_expired_sessions() {
+        let (_dir, paths) = paths();
+        let (runtime, server) = bare_server();
+        run_args(&["profile", "init", "--base-url", &server.uri()], &paths);
+        let (code, _, err) = run_args(&["session-status"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("nenhuma sessão salva") && err.contains("chamados login"));
+
+        paths.ensure_dirs().unwrap();
+        std::fs::write(paths.session_file(), "").unwrap();
+        mount_text(
+            &runtime,
+            &server,
+            "GET",
+            "/",
+            ResponseTemplate::new(302).insert_header("location", "/accounts/login/"),
+        );
+        mount_text(
+            &runtime,
+            &server,
+            "GET",
+            "/accounts/login/",
+            ResponseTemplate::new(200),
+        );
+        let (code, _, err) = run_args(&["session-status"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("expirou") && paths.session_file().exists());
+    }
+
+    #[test]
+    fn session_status_accepts_a_valid_session() {
+        let (_dir, paths) = paths();
+        let (_runtime, server) = mock_server(true);
+        run_args(&["profile", "init", "--base-url", &server.uri()], &paths);
+        let (code, _, _) = run_login(&["login", "--username", "u"], &paths, Some("p"));
+        assert_eq!(code, 0);
+        let (code, out, err) = run_args(&["session-status"], &paths);
+        assert_eq!((code, err.as_str()), (0, ""));
+        assert!(out.starts_with("Sessão válida (perfil default, "));
     }
 
     #[test]
@@ -593,7 +919,8 @@ mod tests {
         let (_runtime, server) = mock_server(true);
         let (code, out, _) = run_args(
             &[
-                "config-init",
+                "profile",
+                "init",
                 "--profile",
                 "local",
                 "--base-url",
@@ -601,11 +928,11 @@ mod tests {
             ],
             &paths,
         );
-        assert!(code == 0 && out.contains("(perfil local)"));
+        assert!(code == 0 && out.contains("Perfil local criado"));
 
-        let (_, out, _) = run_args(&["config-show"], &paths);
-        assert!(out.contains("Nenhuma configuração encontrada para o perfil default"));
-        let (_, out, _) = run_args(&["--profile", "local", "config-show"], &paths);
+        let (_, out, _) = run_args(&["profile", "show"], &paths);
+        assert!(out.contains("perfil padrão ainda não gravado"));
+        let (_, out, _) = run_args(&["--profile", "local", "profile", "show"], &paths);
         assert!(out.contains("profile: local") && out.contains(&server.uri()));
         let (_, out, _) = run_args(&["paths", "--profile", "local"], &paths);
         assert!(out.contains("profile: local") && out.contains("session-local.cookies"));
@@ -631,7 +958,7 @@ mod tests {
         let (_dir, paths) = paths();
         let (code, _, err) = run_args(&["list", "--profile", "local"], &paths);
         assert_eq!(code, 1);
-        assert!(err.contains("config-init --profile local"));
+        assert!(err.contains("profile init local"));
         assert!(profile_config(&paths).unwrap().username.is_none());
     }
 
@@ -646,7 +973,7 @@ mod tests {
     #[test]
     fn config_init_rejects_invalid_url() {
         let (_dir, paths) = paths();
-        let (code, _, err) = run_args(&["config-init", "--base-url", "não é url"], &paths);
+        let (code, _, err) = run_args(&["profile", "init", "--base-url", "não é url"], &paths);
         assert_eq!(code, 1);
         assert!(err.starts_with("erro:"));
     }
@@ -654,7 +981,10 @@ mod tests {
     #[test]
     fn config_init_rejects_non_http_scheme() {
         let (_dir, paths) = paths();
-        let (code, _, err) = run_args(&["config-init", "--base-url", "ftp://example.org/"], &paths);
+        let (code, _, err) = run_args(
+            &["profile", "init", "--base-url", "ftp://example.org/"],
+            &paths,
+        );
         assert_eq!(code, 1);
         assert!(err.contains("HTTP or HTTPS"));
     }
@@ -664,7 +994,7 @@ mod tests {
         let (_dir, paths) = paths();
         paths.ensure_dirs().unwrap();
         std::fs::write(paths.config_file(), "base_url = [").unwrap();
-        let (code, _, err) = run_args(&["config-show"], &paths);
+        let (code, _, err) = run_args(&["profile", "show"], &paths);
         assert_eq!(code, 1);
         assert!(err.starts_with("erro:"));
     }
@@ -723,7 +1053,7 @@ mod tests {
     fn login_uses_flag_username_and_saves_session() {
         let (_dir, paths) = paths();
         let (_runtime, server) = mock_server(true);
-        run_args(&["config-init", "--base-url", &server.uri()], &paths);
+        run_args(&["profile", "init", "--base-url", &server.uri()], &paths);
         let (code, out, err) =
             run_login(&["login", "--username", "kelson"], &paths, Some("segredo"));
         assert_eq!((code, err.as_str()), (0, ""));
@@ -737,7 +1067,8 @@ mod tests {
         let (_runtime, server) = mock_server(true);
         run_args(
             &[
-                "config-init",
+                "profile",
+                "init",
                 "--base-url",
                 &server.uri(),
                 "--username",
@@ -754,7 +1085,7 @@ mod tests {
     fn login_reports_rejected_credentials() {
         let (_dir, paths) = paths();
         let (_runtime, server) = mock_server(false);
-        run_args(&["config-init", "--base-url", &server.uri()], &paths);
+        run_args(&["profile", "init", "--base-url", &server.uri()], &paths);
         let (code, _, err) = run_login(&["login", "--username", "kelson"], &paths, Some("errada"));
         assert_eq!(code, 1);
         assert!(err.contains("authentication failed"));
@@ -779,7 +1110,7 @@ mod tests {
     fn list_prints_support_and_own_tickets() {
         let (_dir, paths) = paths();
         let (runtime, server) = mock_server(true);
-        run_args(&["config-init", "--base-url", &server.uri()], &paths);
+        run_args(&["profile", "init", "--base-url", &server.uri()], &paths);
         let html = r#"<div class="general-box"><span class="status">Em atendimento</span>
             <h4><a href="/centralservicos/chamado/7/">REQ #7 <strong>Assunto</strong></a></h4></div>
             <div class="general-box"><h4><a href="/centralservicos/chamado/8/">REQ #8</a></h4></div>"#;
@@ -807,7 +1138,7 @@ mod tests {
     fn show_prints_ticket_details() {
         let (_dir, paths) = paths();
         let (runtime, server) = mock_server(true);
-        run_args(&["config-init", "--base-url", &server.uri()], &paths);
+        run_args(&["profile", "init", "--base-url", &server.uri()], &paths);
         let html = r#"<main id="content"><div class="title-container"><h2>Chamado Interno 7</h2>
             <div class="object-status"><span class="status">Aberto</span></div></div>
             <div class="accordion"><button class="accordion-button">Serviço | Assunto</button>
@@ -833,7 +1164,7 @@ mod tests {
     fn show_keeps_line_breaks_of_multiline_text() {
         let (_dir, paths) = paths();
         let (runtime, server) = bare_server();
-        run_args(&["config-init", "--base-url", &server.uri()], &paths);
+        run_args(&["profile", "init", "--base-url", &server.uri()], &paths);
         let html = r#"<main id="content"><div class="title-container"><h2>Chamado Interno 9</h2></div>
             <div class="accordion"><div class="accordion-body"><dl class="definition-list"><div class="list-item">
             <dt>Descrição</dt><dd>linha 1<br>linha 2</dd></div></dl></div></div>
@@ -855,7 +1186,7 @@ mod tests {
     fn show_prints_placeholder_without_heading() {
         let (_dir, paths) = paths();
         let (runtime, server) = mock_server(true);
-        run_args(&["config-init", "--base-url", &server.uri()], &paths);
+        run_args(&["profile", "init", "--base-url", &server.uri()], &paths);
         let html = r#"<main id="content"><div class="title-container"><h2>Chamado Interno 8</h2></div></main>"#;
         mount_listing(
             &runtime,
@@ -872,7 +1203,7 @@ mod tests {
     fn show_asks_for_login_and_rejects_bad_ids() {
         let (_dir, paths) = paths();
         let (runtime, server) = mock_server(true);
-        run_args(&["config-init", "--base-url", &server.uri()], &paths);
+        run_args(&["profile", "init", "--base-url", &server.uri()], &paths);
         mount_listing(
             &runtime,
             &server,
@@ -914,7 +1245,8 @@ mod tests {
         let (runtime, server) = bare_server();
         let uri = server.uri();
         let init = [
-            "config-init",
+            "profile",
+            "init",
             "--base-url",
             &uri,
             "--service",
@@ -997,7 +1329,7 @@ mod tests {
     fn open_requires_service_and_interested_from_options_or_profile() {
         let (_dir, paths) = paths();
         let (_runtime, server) = bare_server();
-        run_args(&["config-init", "--base-url", &server.uri()], &paths);
+        run_args(&["profile", "init", "--base-url", &server.uri()], &paths);
         let (code, _, err) = run_args(&["open", "-d", "x", "--interested", "1"], &paths);
         assert_eq!(code, 1);
         assert!(err.contains("serviço não informado"));
@@ -1098,9 +1430,9 @@ mod tests {
     }
 
     #[test]
-    fn config_show_lists_open_defaults() {
+    fn profile_show_lists_open_defaults() {
         let (_dir, paths, _runtime, _server) = open_setup();
-        let (_, out, _) = run_args(&["config-show"], &paths);
+        let (_, out, _) = run_args(&["profile", "show"], &paths);
         for expected in [
             "open.service: 7",
             "open.interested: 1",
@@ -1109,8 +1441,8 @@ mod tests {
         ] {
             assert!(out.contains(expected), "{expected}");
         }
-        run_args(&["config-init", "--username", "mantem"], &paths);
-        let (_, out, _) = run_args(&["config-show"], &paths);
+        run_args(&["profile", "update", "--username", "mantem"], &paths);
+        let (_, out, _) = run_args(&["profile", "show"], &paths);
         assert!(out.contains("open.service: 7") && out.contains("username: mantem"));
     }
 
@@ -1142,7 +1474,7 @@ mod tests {
     fn open_creates_ticket_with_suap_defaults() {
         let (_dir, paths) = paths();
         let (runtime, server) = bare_server();
-        run_args(&["config-init", "--base-url", &server.uri()], &paths);
+        run_args(&["profile", "init", "--base-url", &server.uri()], &paths);
         let form = r#"<form method="post"><input type="hidden" name="csrfmiddlewaretoken" value="tok">
             <textarea name="descricao"></textarea></form>"#;
         mount_text(
@@ -1207,7 +1539,7 @@ mod tests {
     fn open_reports_rejection_and_invalid_fields() {
         let (_dir, paths) = paths();
         let (runtime, server) = bare_server();
-        run_args(&["config-init", "--base-url", &server.uri()], &paths);
+        run_args(&["profile", "init", "--base-url", &server.uri()], &paths);
         let form = r#"<form method="post"><textarea name="descricao"></textarea></form>"#;
         mount_text(
             &runtime,
@@ -1255,7 +1587,7 @@ mod tests {
     fn list_reports_empty_result() {
         let (_dir, paths) = paths();
         let (runtime, server) = mock_server(true);
-        run_args(&["config-init", "--base-url", &server.uri()], &paths);
+        run_args(&["profile", "init", "--base-url", &server.uri()], &paths);
         mount_listing(
             &runtime,
             &server,
@@ -1271,7 +1603,7 @@ mod tests {
     fn list_asks_for_login_when_session_is_missing() {
         let (_dir, paths) = paths();
         let (runtime, server) = mock_server(true);
-        run_args(&["config-init", "--base-url", &server.uri()], &paths);
+        run_args(&["profile", "init", "--base-url", &server.uri()], &paths);
         mount_listing(
             &runtime,
             &server,
@@ -1287,7 +1619,7 @@ mod tests {
     fn list_reports_other_errors() {
         let (_dir, paths) = paths();
         let (runtime, server) = mock_server(true);
-        run_args(&["config-init", "--base-url", &server.uri()], &paths);
+        run_args(&["profile", "init", "--base-url", &server.uri()], &paths);
         mount_listing(
             &runtime,
             &server,
