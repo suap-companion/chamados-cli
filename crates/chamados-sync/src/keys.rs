@@ -94,11 +94,20 @@ pub fn store_key(source: &KeySource, key: &Key, overwrite: bool) -> Result<(), S
 }
 
 fn keyring_entry() -> Result<keyring_core::Entry, SyncError> {
+    keyring_entry_named(KEYRING_USER)
+}
+
+/// The keyring entry called `user` of this program's service, installing the native store if needed.
+pub(crate) fn keyring_entry_named(user: &str) -> Result<keyring_core::Entry, SyncError> {
     if keyring_core::get_default_store().is_none() {
         install_native_store()?;
     }
-    Ok(keyring_core::Entry::new(KEYRING_SERVICE, KEYRING_USER)?)
+    Ok(keyring_core::Entry::new(KEYRING_SERVICE, user)?)
 }
+
+/// Serializes the tests that replace the process-wide default keyring store.
+#[cfg(test)]
+pub(crate) static KEYRING_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Selects the platform's native secret store as the keyring default.
 pub fn install_native_store() -> Result<(), SyncError> {
@@ -273,6 +282,7 @@ mod tests {
     /// One test on purpose: both parts change the process-wide default keyring store.
     #[test]
     fn keyring_source_round_trips_with_a_mock_store() {
+        let _guard = KEYRING_TEST_LOCK.lock().unwrap();
         use_mock_keyring();
         let source = KeySource::Keyring;
         assert_eq!(load_key(&source).unwrap(), None);

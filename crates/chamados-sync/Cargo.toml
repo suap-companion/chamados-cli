@@ -8,10 +8,15 @@ license.workspace = true
 # Authenticated encryption (XChaCha20-Poly1305) of the synced document: the cloud only sees ciphertext.
 chacha20poly1305 = "0.11"
 chamados-core = { path = "../chamados-core" }
+# SHA-256 and HMAC for the SigV4 request signature of the S3-compatible backend (no hand-rolled crypto).
+hmac = "0.13"
 # Secret storage for the encryption key (Windows Credential Manager, macOS Keychain, Linux Secret Service).
 keyring-core = "1"
+# HTTPS client of the S3-compatible backend.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.11"
 suap-core = { path = "../suap-core" }
 thiserror = "2"
 url = "2"
@@ -27,4 +32,5 @@ zbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] 
 
 [dev-dependencies]
 tempfile = "3"
+wiremock = "0.6"
 tokio = { version = "1", features = ["macros", "rt"] }

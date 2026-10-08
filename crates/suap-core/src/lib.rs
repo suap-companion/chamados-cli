@@ -169,6 +169,21 @@ pub struct SyncSettings {
     /// Key file of the `file` key source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_file: Option<String>,
+    /// Endpoint of the `s3` backend (e.g. `https://<account>.r2.cloudflarestorage.com`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// Region of the `s3` backend (`auto` for Cloudflare R2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    /// Bucket of the `s3` backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
+    /// Key prefix inside the bucket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    /// Whether the storage honors conditional writes (`If-Match`); assumed true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditional_writes: Option<bool>,
 }
 
 /// Per-profile defaults used when opening tickets; every explicit option overrides them.
@@ -751,6 +766,11 @@ mod tests {
             path: Some("/nuvem".to_owned()),
             key_source: Some("file".to_owned()),
             key_file: Some("/chave".to_owned()),
+            endpoint: Some("https://conta.r2.cloudflarestorage.com".to_owned()),
+            region: Some("auto".to_owned()),
+            bucket: Some("meu-bucket".to_owned()),
+            prefix: Some("chamados".to_owned()),
+            conditional_writes: Some(false),
         };
         save_sync_settings(&paths, &settings).unwrap();
         assert_eq!(load_config(&paths).unwrap(), Some(config.clone()));

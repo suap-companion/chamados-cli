@@ -16,8 +16,8 @@ use chamados_core::{
     TicketError, TicketQueue, TicketSource, TitleStore,
 };
 use chamados_sync::{
-    backend_from, key_source_from, load_key, store_key, sync_once, Key, KeySource, SyncBackend,
-    SyncLock, SyncOptions, DIRECTORY_BACKEND,
+    backend_from, key_source_from, load_key, store_key, sync_once, validate_settings, Key,
+    KeySource, S3Credentials, SyncBackend, SyncLock, SyncOptions, DIRECTORY_BACKEND, S3_BACKEND,
 };
 use clap::{Args, Parser, Subcommand};
 use suap_core::{
@@ -171,22 +171,51 @@ struct SyncArgs {
 #[derive(Debug, Subcommand)]
 enum SyncAction {
     /// Configura onde e como sincronizar (configuração global, fica só nesta máquina).
-    Setup(SyncSetupArgs),
+    Setup(Box<SyncSetupArgs>),
     /// Gerencia a chave de criptografia.
     Key {
         #[command(subcommand)]
         command: KeyCommand,
     },
+    /// Gerencia as credenciais do backend `s3` (guardadas no chaveiro do sistema).
+    Credentials {
+        #[command(subcommand)]
+        command: CredentialsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CredentialsCommand {
+    /// Guarda no chaveiro as credenciais lidas da entrada padrão: a primeira linha é o Access Key ID
+    /// e a segunda, o Secret Access Key. Nunca passe segredos como argumento.
+    Set,
+    /// Informa se há credenciais (variáveis de ambiente ou chaveiro), sem mostrá-las.
+    Status,
 }
 
 #[derive(Debug, Args)]
 struct SyncSetupArgs {
-    /// Backend de armazenamento: por ora, `directory` (uma pasta).
+    /// Backend de armazenamento: `directory` (uma pasta) ou `s3` (S3-compatível, como o Cloudflare R2).
     #[arg(long, default_value = DIRECTORY_BACKEND)]
     backend: String,
     /// Pasta do backend `directory` (ex.: uma pasta sincronizada ou um disco de rede).
     #[arg(long)]
     path: Option<PathBuf>,
+    /// Endpoint do backend `s3` (https), ex.: https://<ACCOUNT_ID>.r2.cloudflarestorage.com.
+    #[arg(long)]
+    endpoint: Option<String>,
+    /// Bucket do backend `s3` (privado).
+    #[arg(long)]
+    bucket: Option<String>,
+    /// Região do backend `s3` (padrão: `auto`, do Cloudflare R2).
+    #[arg(long)]
+    region: Option<String>,
+    /// Prefixo das chaves dentro do bucket.
+    #[arg(long)]
+    prefix: Option<String>,
+    /// Se o armazenamento aceita escrita condicional (`If-Match`); `false` usa a leitura de conferência.
+    #[arg(long)]
+    conditional_writes: Option<bool>,
     /// Onde fica a chave: `keyring` (padrão), `file` ou `env`.
     #[arg(long)]
     key_source: Option<String>,
@@ -755,8 +784,9 @@ fn sync(
     out: &mut dyn Write,
 ) -> Result<(), Box<dyn Error>> {
     match args.action {
-        Some(SyncAction::Setup(setup)) => sync_setup(paths, setup, out),
+        Some(SyncAction::Setup(setup)) => sync_setup(paths, *setup, out),
         Some(SyncAction::Key { command }) => sync_key(paths, command, input, out),
+        Some(SyncAction::Credentials { command }) => sync_credentials(command, input, out),
         None => sync_run(paths, &args, out),
     }
 }
@@ -777,12 +807,41 @@ fn sync_setup(
         .key_file
         .map(|file| file.display().to_string())
         .or(settings.key_file.take());
+    settings.endpoint = args.endpoint.or(settings.endpoint.take());
+    settings.bucket = args.bucket.or(settings.bucket.take());
+    settings.region = args.region.or(settings.region.take());
+    settings.prefix = args.prefix.or(settings.prefix.take());
+    settings.conditional_writes = args.conditional_writes.or(settings.conditional_writes);
     // Validate before saving, so a bad setup never replaces a working one.
-    backend_from(&settings)?;
+    validate_settings(&settings)?;
     key_source_from(&settings, paths)?;
     save_sync_settings(paths, &settings)?;
     let file = paths.config_file();
     writeln!(out, "Sincronização configurada em {}.", file.display())?;
+    Ok(())
+}
+
+fn sync_credentials(
+    command: CredentialsCommand,
+    input: &mut dyn Read,
+    out: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    match command {
+        CredentialsCommand::Set => {
+            let mut text = String::new();
+            input.read_to_string(&mut text)?;
+            S3Credentials::parse(&text)?.store()?;
+            writeln!(out, "Credenciais guardadas no chaveiro.")?;
+        }
+        CredentialsCommand::Status => {
+            let present = if S3Credentials::load()?.is_some() {
+                "sim"
+            } else {
+                "não"
+            };
+            writeln!(out, "credenciais presentes: {present}")?;
+        }
+    }
     Ok(())
 }
 
@@ -820,6 +879,7 @@ fn sync_key(
     Ok(())
 }
 
+const CONDITIONAL_MISMATCH_NOTE: &str = "aviso: o resultado difere da configuração; ajuste com `chamados sync setup --conditional-writes true|false`";
 const LOCK_HELD_NOTE: &str = "Outra sincronização já está em andamento; nada a fazer.";
 
 fn support_text(supported: bool) -> &'static str {
@@ -843,7 +903,12 @@ fn sync_run(paths: &AppPaths, args: &SyncArgs, out: &mut dyn Write) -> Result<()
     if settings.backend.is_none() {
         return Err("sincronização não configurada: execute `chamados sync setup`".into());
     }
-    let backend = backend_from(&settings)?;
+    let credentials = if settings.backend.as_deref() == Some(S3_BACKEND) {
+        S3Credentials::load()?
+    } else {
+        None
+    };
+    let backend = backend_from(&settings, credentials)?;
     let key = load_key(&source)?.ok_or_else(|| no_key(&source))?;
     let Some(_lock) = SyncLock::acquire(&paths.sync_lock_file())? else {
         if !args.quiet {
@@ -851,17 +916,20 @@ fn sync_run(paths: &AppPaths, args: &SyncArgs, out: &mut dyn Write) -> Result<()
         }
         return Ok(());
     };
-    if args.check {
-        let conditional = support_text(backend.supports_conditional_writes());
-        let name = settings.backend.as_deref().unwrap_or_default();
-        writeln!(out, "backend: {name}")?;
-        writeln!(out, "escrita condicional: {conditional}")?;
-        writeln!(out, "chave: {} (presente)", source.name())?;
-        return Ok(());
-    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
+    if args.check {
+        let probed = runtime.block_on(backend.probe_conditional_writes())?;
+        let name = settings.backend.as_deref().unwrap_or_default();
+        writeln!(out, "backend: {name}")?;
+        writeln!(out, "escrita condicional: {}", support_text(probed))?;
+        if probed != backend.supports_conditional_writes() {
+            writeln!(out, "{CONDITIONAL_MISMATCH_NOTE}")?;
+        }
+        writeln!(out, "chave: {} (presente)", source.name())?;
+        return Ok(());
+    }
     let options = SyncOptions {
         only: args.only.as_deref(),
         dry_run: args.dry_run,
@@ -2093,7 +2161,7 @@ mod tests {
         assert!(err.contains("sincronização não configurada"));
 
         let bad = [
-            (vec!["--backend", "s3", "--path", "/x"], "unknown backend"),
+            (vec!["--backend", "ftp", "--path", "/x"], "unknown backend"),
             (vec![], "needs a path"),
             (
                 vec!["--path", "/x", "--key-source", "nuvem"],
@@ -2158,9 +2226,28 @@ mod tests {
         assert!(out.starts_with("fonte: env"));
     }
 
+    trait OwnedStrings {
+        fn concat_owned(self) -> Vec<String>;
+    }
+
+    impl OwnedStrings for Vec<&str> {
+        fn concat_owned(self) -> Vec<String> {
+            self.into_iter().map(str::to_owned).collect()
+        }
+    }
+
+    /// Serializes the tests that replace the process-wide default keyring store.
+    static KEYRING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn use_mock_keyring() -> std::sync::MutexGuard<'static, ()> {
+        let guard = KEYRING.lock().unwrap();
+        keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
+        guard
+    }
+
     #[test]
     fn the_key_can_live_in_the_system_keyring() {
-        keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
+        let _guard = use_mock_keyring();
         let root = tempdir().unwrap();
         let (_dir, paths) = paths();
         let args = ["sync", "setup", "--path", root.path().to_str().unwrap()];
@@ -2175,6 +2262,280 @@ mod tests {
         assert_eq!(
             run_with_input(&["sync", "key", "import", "--force"], &paths, &key).0,
             0
+        );
+    }
+
+    fn s3_setup_args<'a>(endpoint: &'a str, key_file: &'a str) -> Vec<&'a str> {
+        vec![
+            "sync",
+            "setup",
+            "--backend",
+            "s3",
+            "--endpoint",
+            endpoint,
+            "--bucket",
+            "cofre",
+            "--prefix",
+            "dados",
+            "--key-source",
+            "file",
+            "--key-file",
+            key_file,
+        ]
+    }
+
+    #[test]
+    fn s3_credentials_are_stored_in_the_keyring_and_never_shown() {
+        let _guard = use_mock_keyring();
+        let (_dir, paths) = paths();
+        let (_, out, _) = run_args(&["sync", "credentials", "status"], &paths);
+        assert_eq!(out, "credenciais presentes: não\n");
+        for bad in ["", "so-uma-linha", "a\nb\nc"] {
+            let (code, _, err) = run_with_input(&["sync", "credentials", "set"], &paths, bad);
+            assert_eq!(code, 1, "{bad:?}");
+            assert!(err.contains("expected two lines"), "{err}");
+        }
+        let (code, out, err) = run_with_input(
+            &["sync", "credentials", "set"],
+            &paths,
+            "AKIAEXEMPLO\nsegredo-que-nao-aparece\n",
+        );
+        assert_eq!((code, err.as_str()), (0, ""));
+        assert_eq!(out, "Credenciais guardadas no chaveiro.\n");
+        assert!(!out.contains("segredo") && !out.contains("AKIA"));
+        let (_, out, _) = run_args(&["sync", "credentials", "status"], &paths);
+        assert_eq!(out, "credenciais presentes: sim\n");
+    }
+
+    #[test]
+    fn s3_setup_is_validated_before_it_is_saved() {
+        let (_dir, paths) = paths();
+        let cases = [
+            (
+                vec!["--backend", "s3", "--bucket", "b"],
+                "needs an endpoint",
+            ),
+            (
+                vec!["--backend", "s3", "--endpoint", "https://x.example"],
+                "needs a bucket",
+            ),
+            (
+                vec![
+                    "--backend",
+                    "s3",
+                    "--endpoint",
+                    "http://x.example",
+                    "--bucket",
+                    "b",
+                ],
+                "must use https",
+            ),
+            (
+                vec![
+                    "--backend",
+                    "s3",
+                    "--endpoint",
+                    "https://x.example",
+                    "--bucket",
+                    "b",
+                    "--prefix",
+                    "../x",
+                ],
+                "invalid prefix",
+            ),
+        ];
+        for (extra, expected) in cases {
+            let mut args = vec!["sync", "setup"];
+            args.extend(extra);
+            args.extend(["--key-source", "env"]);
+            let (code, _, err) = run_args(&args, &paths);
+            assert_eq!(code, 1, "{expected}");
+            assert!(err.contains(expected), "{expected}: {err}");
+        }
+        assert!(!paths.config_file().exists());
+        let good = [
+            "sync",
+            "setup",
+            "--backend",
+            "s3",
+            "--endpoint",
+            "https://conta.r2.cloudflarestorage.com",
+            "--bucket",
+            "cofre",
+            "--region",
+            "auto",
+            "--conditional-writes",
+            "true",
+            "--key-source",
+            "env",
+        ];
+        assert_eq!(run_args(&good, &paths).0, 0);
+        let saved = std::fs::read_to_string(paths.config_file()).unwrap();
+        assert!(saved.contains("backend = \"s3\"") && saved.contains("bucket = \"cofre\""));
+        assert!(saved.contains("endpoint = \"https://conta.r2.cloudflarestorage.com\""));
+        // Credentials and keys never reach the configuration file.
+        assert!(!saved.to_lowercase().contains("secret") && !saved.contains("AKIA"));
+    }
+
+    #[test]
+    fn sync_through_an_s3_bucket_sends_only_signed_encrypted_requests() {
+        let _guard = use_mock_keyring();
+        let root = tempdir().unwrap();
+        let (_dir, paths) = paths();
+        let (runtime, server) = bare_server();
+        let key_file = root.path().join("k");
+        let args = s3_setup_args(&server.uri(), key_file.to_str().unwrap()).concat_owned();
+        assert_eq!(
+            run_args(&args.iter().map(String::as_str).collect::<Vec<_>>(), &paths).0,
+            0
+        );
+        run_with_input(
+            &["sync", "credentials", "set"],
+            &paths,
+            "AKIAEXEMPLO\nsegredo-que-nao-aparece\n",
+        );
+        run_args(&["sync", "key", "generate"], &paths);
+        run_args(
+            &[
+                "profile",
+                "init",
+                "--sync",
+                "true",
+                "--username",
+                "ana-secreta",
+            ],
+            &paths,
+        );
+        run_args(&["title", "5", "Titulo secreto do chamado"], &paths);
+
+        mount_text(
+            &runtime,
+            &server,
+            "GET",
+            "/cofre/dados/chamados-sync-v1.bin",
+            ResponseTemplate::new(404),
+        );
+        mount_text(
+            &runtime,
+            &server,
+            "PUT",
+            "/cofre/dados/chamados-sync-v1.bin",
+            ResponseTemplate::new(200),
+        );
+        let (code, out, err) = run_args(&["sync"], &paths);
+        assert_eq!((code, err.as_str()), (0, ""));
+        assert!(out.contains("nuvem atualizada"), "{out}");
+
+        let requests = runtime.block_on(server.received_requests()).unwrap();
+        let put = requests
+            .iter()
+            .find(|request| request.method == wiremock::http::Method::PUT)
+            .unwrap();
+        assert!(put.headers["authorization"]
+            .to_str()
+            .unwrap()
+            .starts_with("AWS4-HMAC-SHA256 Credential=AKIAEXEMPLO/"));
+        assert!(
+            put.headers.contains_key("if-none-match"),
+            "a new object is created conditionally"
+        );
+        let sent = String::from_utf8_lossy(&put.body).into_owned();
+        assert!(sent.starts_with("CSYN1"));
+        for secret in ["Titulo secreto", "ana-secreta", "segredo-que-nao-aparece"] {
+            assert!(
+                !sent.contains(secret) && !format!("{:?}", put.headers).contains(secret),
+                "{secret}"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_check_probes_the_bucket_for_conditional_writes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let _guard = use_mock_keyring();
+        let root = tempdir().unwrap();
+        let key_file = root.path().join("k");
+        for honors in [true, false] {
+            let (_dir, paths) = paths();
+            let (runtime, server) = bare_server();
+            let args = s3_setup_args(&server.uri(), key_file.to_str().unwrap()).concat_owned();
+            run_args(&args.iter().map(String::as_str).collect::<Vec<_>>(), &paths);
+            run_with_input(
+                &["sync", "credentials", "set"],
+                &paths,
+                "AKIAEXEMPLO\nsegredo\n",
+            );
+            run_args(&["sync", "key", "generate", "--force"], &paths);
+            // A bucket that refuses the second `If-None-Match: *` write, or one that accepts everything.
+            let puts = std::sync::Arc::new(AtomicUsize::new(0));
+            let counter = puts.clone();
+            runtime.block_on(
+                Mock::given(method("PUT"))
+                    .respond_with(move |_: &wiremock::Request| {
+                        let n = counter.fetch_add(1, Ordering::SeqCst);
+                        ResponseTemplate::new(if honors && n > 0 { 412 } else { 200 })
+                    })
+                    .mount(&server),
+            );
+            mount_text(
+                &runtime,
+                &server,
+                "DELETE",
+                "/cofre/dados/",
+                ResponseTemplate::new(204),
+            );
+            runtime.block_on(
+                Mock::given(method("DELETE"))
+                    .respond_with(ResponseTemplate::new(204))
+                    .mount(&server),
+            );
+            let (code, out, err) = run_args(&["sync", "--check"], &paths);
+            assert_eq!((code, err.as_str()), (0, ""), "{honors}");
+            assert!(out.contains("backend: s3"));
+            if honors {
+                assert!(
+                    out.contains("escrita condicional: suportada") && !out.contains("aviso"),
+                    "{out}"
+                );
+            } else {
+                assert!(
+                    out.contains("escrita condicional: não suportada")
+                        && out.contains("--conditional-writes"),
+                    "{out}"
+                );
+            }
+            assert_eq!(puts.load(Ordering::SeqCst), 2, "the probe writes twice");
+        }
+    }
+
+    #[test]
+    fn nothing_is_sent_without_a_key_or_credentials() {
+        let _guard = use_mock_keyring();
+        let root = tempdir().unwrap();
+        let (_dir, paths) = paths();
+        let (runtime, server) = bare_server();
+        let key_file = root.path().join("k");
+        let args = s3_setup_args(&server.uri(), key_file.to_str().unwrap()).concat_owned();
+        run_args(&args.iter().map(String::as_str).collect::<Vec<_>>(), &paths);
+        run_args(&["profile", "init", "--sync", "true"], &paths);
+
+        let (code, _, err) = run_args(&["sync"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("no S3 credentials"), "{err}");
+        run_with_input(
+            &["sync", "credentials", "set"],
+            &paths,
+            "AKIAEXEMPLO\nsegredo\n",
+        );
+        let (code, _, err) = run_args(&["sync"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("nenhuma chave de criptografia"), "{err}");
+        assert!(
+            runtime
+                .block_on(server.received_requests())
+                .unwrap()
+                .is_empty(),
+            "RS-03: no key, no request"
         );
     }
 

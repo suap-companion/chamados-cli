@@ -412,6 +412,100 @@ mod tests {
         profile
     }
 
+    fn field_names(value: &impl Serialize) -> Vec<String> {
+        let json = serde_json::to_value(value).unwrap();
+        let mut names: Vec<String> = json.as_object().unwrap().keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    fn sorted(names: &[&str]) -> Vec<String> {
+        let mut names: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
+        names.sort();
+        names
+    }
+
+    /// RS-03 guard: every setting must be classified as synced or local-only. Adding a field to a
+    /// profile or to the sync settings breaks this test until somebody decides where it belongs.
+    #[test]
+    fn rs03_every_setting_is_classified_as_synced_or_local_only() {
+        // Profile settings.
+        const SYNCED: [&str; 4] = ["base_url", "open", "updated_at", "username"];
+        const LOCAL_ONLY: [&str; 1] = ["sync"];
+        let config = SuapConfig {
+            username: Some("u".to_owned()),
+            sync: true,
+            updated_at: 1,
+            open: OpenDefaults {
+                service: Some(1),
+                interested: Some("2".to_owned()),
+                campus: Some("3".to_owned()),
+                center: Some("4".to_owned()),
+            },
+            ..SuapConfig::default()
+        };
+        let mut classified = SYNCED.to_vec();
+        classified.extend(LOCAL_ONLY);
+        assert_eq!(
+            field_names(&config),
+            sorted(&classified),
+            "classify the new profile setting for RS-03"
+        );
+        assert_eq!(
+            field_names(&SettingsEntry::from_config(&config)),
+            sorted(&SYNCED)
+        );
+        assert_eq!(
+            field_names(&config.open),
+            sorted(&["campus", "center", "interested", "service"])
+        );
+
+        // The global [sync] settings (endpoint, bucket, key location...) never travel.
+        let sync_settings = suap_core::SyncSettings {
+            backend: Some("s3".to_owned()),
+            path: Some("p".to_owned()),
+            key_source: Some("file".to_owned()),
+            key_file: Some("k".to_owned()),
+            endpoint: Some("e".to_owned()),
+            region: Some("r".to_owned()),
+            bucket: Some("b".to_owned()),
+            prefix: Some("x".to_owned()),
+            conditional_writes: Some(true),
+        };
+        let local_only = field_names(&sync_settings);
+        assert_eq!(
+            local_only.len(),
+            9,
+            "classify the new sync setting for RS-03"
+        );
+        let document = document(&[(
+            "p",
+            profile(
+                Some(SettingsEntry::from_config(&config)),
+                &[("1", entry(Some("t"), 1))],
+            ),
+        )]);
+        let json = serde_json::to_value(&document).unwrap();
+        let mut travelling = Vec::new();
+        collect_keys(&json, &mut travelling);
+        for name in &local_only {
+            assert!(
+                !travelling.contains(name),
+                "{name} must not be part of the synced document"
+            );
+        }
+        assert!(!travelling.contains(&"sync".to_owned()));
+    }
+
+    fn collect_keys(value: &serde_json::Value, into: &mut Vec<String>) {
+        if let Some(object) = value.as_object() {
+            for (name, inner) in object {
+                into.push(name.clone());
+                collect_keys(inner, into);
+            }
+        }
+    }
+
     #[test]
     fn collects_only_profiles_that_sync_and_never_sessions() {
         let (_dir, paths) = paths();
