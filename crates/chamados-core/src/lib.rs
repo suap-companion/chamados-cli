@@ -19,6 +19,8 @@ const CENTERS_PATH_PREFIX: &str = "/centralservicos/get_centros_atendimento_por_
 const OPENED_MARKER: &str = "Número do chamado:";
 const ASSUME_PATH_PREFIX: &str = "/centralservicos/auto_atribuir_chamado/";
 const START_PATH_PREFIX: &str = "/centralservicos/colocar_em_atendimento/";
+const SUSPEND_PATH_PREFIX: &str = "/centralservicos/suspender_chamado/";
+const RESOLVE_PATH_PREFIX: &str = "/centralservicos/resolver_chamado/";
 
 /// File types SUAP accepts as ticket attachments (it rejects any other).
 pub const ALLOWED_ATTACHMENT_EXTENSIONS: [&str; 9] = [
@@ -117,6 +119,20 @@ impl Message {
     }
 }
 
+/// How to resolve a ticket.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Resolution {
+    /// The resolution message (multi-line text).
+    pub text: String,
+    /// Related knowledge-base articles. SUAP requires at least one when it offers any; when empty,
+    /// the first article offered is used.
+    pub articles: Vec<String>,
+    /// Ids of other tickets to resolve together.
+    pub also: Vec<String>,
+    /// Id of a standard reply to use.
+    pub standard_reply: Option<String>,
+}
+
 /// Which SUAP ticket listing to read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TicketQueue {
@@ -143,6 +159,10 @@ pub trait TicketSource {
     async fn open_ticket(&self, ticket: &NewTicket) -> Result<String, TicketError>;
     /// Adds a comment or an internal note (multi-line text) to the ticket.
     async fn add_message(&self, id: &str, kind: Message, text: &str) -> Result<(), TicketError>;
+    /// Moves the ticket to "Suspenso", with the suspension message (multi-line text).
+    async fn suspend_ticket(&self, id: &str, text: &str) -> Result<(), TicketError>;
+    /// Moves the ticket to "Resolvido".
+    async fn resolve_ticket(&self, id: &str, resolution: &Resolution) -> Result<(), TicketError>;
     /// Assigns the ticket to the logged user ("assumir").
     async fn assume_ticket(&self, id: &str) -> Result<(), TicketError>;
     /// Moves the ticket to "Em atendimento" (the user must have assumed it first).
@@ -160,6 +180,55 @@ impl<'a> SuapTicketSource<'a> {
         Self { client, queue }
     }
 
+    /// Loads the SUAP form behind a status change (the one containing `field`); returns its path,
+    /// the page and the form defaults.
+    async fn open_status_form(
+        &self,
+        prefix: &str,
+        id: &str,
+        what: &str,
+        field: &str,
+    ) -> Result<(String, String, Vec<(String, String)>), TicketError> {
+        check_ticket_id(id)?;
+        let path = format!("{prefix}{id}/");
+        let html = match self.client.fetch_page(&path).await {
+            Err(SuapError::Transport(status)) => {
+                return Err(TicketError::Source(format!(
+                    "ticket {id} cannot be {what} ({status}): check its situation and your permissions"
+                )));
+            }
+            other => other?,
+        };
+        let fields = parse_form_with_field(&html, field)
+            .ok_or_else(|| TicketError::Source(format!("ticket {id} has no {what} form")))?;
+        Ok((path, html, fields))
+    }
+
+    /// Posts a status-change form back to its own URL and reports what SUAP rejected, if anything.
+    async fn send_status_form(
+        &self,
+        path: &str,
+        fields: &[(String, String)],
+        what: &str,
+    ) -> Result<(), TicketError> {
+        let response = match self.client.submit_form(path, fields).await {
+            Err(SuapError::Transport(status)) => {
+                return Err(TicketError::Source(format!(
+                    "SUAP refused {what} ({status}): the ticket may already be in that situation, or you lack permission"
+                )));
+            }
+            other => other?,
+        };
+        let errors = page_errors(&response.body);
+        if errors.is_empty() {
+            return Ok(());
+        }
+        Err(TicketError::Source(format!(
+            "SUAP rejected {what}: {}",
+            errors.join("; ")
+        )))
+    }
+
     /// Calls a SUAP ticket action (a GET) and surfaces the error flash message, if any.
     async fn run_action(&self, prefix: &str, id: &str) -> Result<(), TicketError> {
         check_ticket_id(id)?;
@@ -173,6 +242,15 @@ impl<'a> SuapTicketSource<'a> {
             errors.join("; ")
         )))
     }
+}
+
+/// The message without its trailing line break; an error if nothing is left.
+fn non_empty_text<'a>(text: &'a str, what: &str) -> Result<&'a str, TicketError> {
+    let text = text.trim_end_matches(['\r', '\n']);
+    if text.trim().is_empty() {
+        return Err(TicketError::Source(format!("the {what} text is empty")));
+    }
+    Ok(text)
 }
 
 pub(crate) fn check_ticket_id(id: &str) -> Result<(), TicketError> {
@@ -271,6 +349,55 @@ impl TicketSource for SuapTicketSource<'_> {
             kind.label(),
             errors.join("; ")
         )))
+    }
+
+    async fn suspend_ticket(&self, id: &str, text: &str) -> Result<(), TicketError> {
+        let text = non_empty_text(text, "suspension")?;
+        let (path, _, mut fields) = self
+            .open_status_form(SUSPEND_PATH_PREFIX, id, "suspended", "observacao")
+            .await?;
+        set_field(&mut fields, "observacao", text);
+        self.send_status_form(&path, &fields, "the suspension")
+            .await
+    }
+
+    async fn resolve_ticket(&self, id: &str, resolution: &Resolution) -> Result<(), TicketError> {
+        let text = non_empty_text(&resolution.text, "resolution")?;
+        let (path, html, mut fields) = self
+            .open_status_form(RESOLVE_PATH_PREFIX, id, "resolved", "comentario")
+            .await?;
+        let offered = form_choices(&html, "comentario", "bases_conhecimento");
+        let articles = match (offered.first(), resolution.articles.is_empty()) {
+            (None, true) => Vec::new(),
+            (None, false) => {
+                return Err(TicketError::Source(
+                    "the resolve form offers no articles to relate".to_owned(),
+                ));
+            }
+            (Some(first), true) => vec![first.clone()],
+            (Some(_), false) => resolution.articles.clone(),
+        };
+        if let Some(unknown) = articles.iter().find(|article| !offered.contains(article)) {
+            return Err(TicketError::Source(format!(
+                "article {unknown} is not offered; available: {}",
+                offered.join(", ")
+            )));
+        }
+        fields.retain(|(name, _)| {
+            name != "bases_conhecimento" && name != "outros_chamados_a_resolver"
+        });
+        for article in articles {
+            fields.push(("bases_conhecimento".to_owned(), article));
+        }
+        for other in &resolution.also {
+            fields.push(("outros_chamados_a_resolver".to_owned(), other.clone()));
+        }
+        if let Some(reply) = &resolution.standard_reply {
+            set_field(&mut fields, "resposta_padrao", reply);
+        }
+        set_field(&mut fields, "comentario", text);
+        self.send_status_form(&path, &fields, "the resolution")
+            .await
     }
 
     async fn assume_ticket(&self, id: &str) -> Result<(), TicketError> {
@@ -434,12 +561,36 @@ fn set_field(fields: &mut Vec<(String, String)>, name: &str, value: &str) {
 ///
 /// Returns `None` if the page has no form with a `descricao` field.
 pub fn parse_open_form(html: &str) -> Option<Vec<(String, String)>> {
+    parse_form_with_field(html, "descricao")
+}
+
+/// Collects the default values of the form that has a control named `field`.
+///
+/// Returns `None` if the page has no such form.
+pub fn parse_form_with_field(html: &str, field: &str) -> Option<Vec<(String, String)>> {
     let document = Html::parse_document(html);
-    let (forms, description) = (selector("form"), selector("[name=descricao]"));
-    let form = document
-        .select(&forms)
-        .find(|form| form.select(&description).next().is_some())?;
+    let form = form_with_field(&document, field)?;
     Some(collect_fields(form))
+}
+
+fn form_with_field<'a>(document: &'a Html, field: &str) -> Option<ElementRef<'a>> {
+    let (forms, anchor) = (selector("form"), selector(&format!("[name={field}]")));
+    document
+        .select(&forms)
+        .find(|form| form.select(&anchor).next().is_some())
+}
+
+/// Values the form containing `anchor` offers for the control called `name` (checkboxes, radios or options).
+fn form_choices(html: &str, anchor: &str, name: &str) -> Vec<String> {
+    let document = Html::parse_document(html);
+    let Some(form) = form_with_field(&document, anchor) else {
+        return Vec::new();
+    };
+    let choices = selector(&format!("input[name={name}], select[name={name}] option"));
+    form.select(&choices)
+        .filter_map(|choice| choice.value().attr("value"))
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Collects the default values of the form whose `action` is exactly `action`.
@@ -860,6 +1011,302 @@ mod tests {
             parse_form_by_action(THREAD_PAGE, "/centralservicos/adicionar_comentario/6/").is_none()
         );
         assert!(parse_form_by_action("<form><input name=\"x\"></form>", "/a/").is_none());
+    }
+
+    const SUSPEND_FORM: &str = r#"<form action="" method="POST">
+        <input type="hidden" name="csrfmiddlewaretoken" value="tok">
+        <textarea name="observacao"></textarea>
+        <input type="submit" name="alterarstatuschamado_form"></form>"#;
+
+    const RESOLVE_FORM: &str = r#"<form action="" method="POST">
+        <input type="hidden" name="csrfmiddlewaretoken" value="tok">
+        <input type="checkbox" name="bases_conhecimento" value="11">
+        <input type="checkbox" name="bases_conhecimento" value="12">
+        <input type="checkbox" name="outros_chamados_a_resolver" value="7">
+        <select name="resposta_padrao"><option value="">---</option><option value="3">Padrão</option></select>
+        <textarea name="comentario"></textarea></form>"#;
+
+    const RESOLVE_FORM_WITHOUT_ARTICLES: &str = r#"<form action="" method="POST">
+        <input type="hidden" name="csrfmiddlewaretoken" value="tok">
+        <textarea name="comentario"></textarea></form>"#;
+
+    #[test]
+    fn finds_forms_and_choices_by_field() {
+        let fields = parse_form_with_field(RESOLVE_FORM, "comentario").unwrap();
+        assert_eq!(fields[0], pair("csrfmiddlewaretoken", "tok"));
+        assert!(parse_form_with_field(RESOLVE_FORM, "observacao").is_none());
+        assert_eq!(
+            form_choices(RESOLVE_FORM, "comentario", "bases_conhecimento"),
+            ["11", "12"]
+        );
+        assert_eq!(
+            form_choices(RESOLVE_FORM, "comentario", "resposta_padrao"),
+            ["", "3"]
+        );
+        assert!(form_choices(RESOLVE_FORM, "nada", "bases_conhecimento").is_empty());
+        assert!(form_choices(
+            RESOLVE_FORM_WITHOUT_ARTICLES,
+            "comentario",
+            "bases_conhecimento"
+        )
+        .is_empty());
+    }
+
+    #[tokio::test]
+    async fn suspends_a_ticket_with_a_multiline_message() {
+        let server = MockServer::start().await;
+        mount_text(
+            &server,
+            "GET",
+            "/centralservicos/suspender_chamado/5/",
+            SUSPEND_FORM,
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/centralservicos/suspender_chamado/5/"))
+            .and(body_string_contains("csrfmiddlewaretoken=tok"))
+            .and(body_string_contains("observacao=aguardando%0Aresposta"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&server)
+            .await;
+        let (_dir, client) = client_for(&server).await;
+        let source = SuapTicketSource::new(&client, TicketQueue::Support);
+        source
+            .suspend_ticket("5", "aguardando\nresposta\n")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn suspend_reports_failures() {
+        let server = MockServer::start().await;
+        mount_text(
+            &server,
+            "GET",
+            "/centralservicos/suspender_chamado/5/",
+            SUSPEND_FORM,
+        )
+        .await;
+        mount_text(
+            &server,
+            "GET",
+            "/centralservicos/suspender_chamado/6/",
+            "<p>sem formulário</p>",
+        )
+        .await;
+        mount_text(
+            &server,
+            "POST",
+            "/centralservicos/suspender_chamado/5/",
+            "<p class='alert-error'>Não pode suspender</p>",
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path("/centralservicos/suspender_chamado/7/"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let (_dir, client) = client_for(&server).await;
+        let source = SuapTicketSource::new(&client, TicketQueue::Support);
+        let rejected = source
+            .suspend_ticket("5", "x")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(rejected.contains("SUAP rejected the suspension: Não pode suspender"));
+        let no_form = source
+            .suspend_ticket("6", "x")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(no_form.contains("ticket 6 has no suspended form"));
+        let forbidden = source
+            .suspend_ticket("7", "x")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            forbidden.contains("ticket 7 cannot be suspended (unexpected status 403 Forbidden)")
+        );
+        assert!(source
+            .suspend_ticket("5", "  ")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("suspension text is empty"));
+        assert!(source.suspend_ticket("x", "x").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn status_change_refused_with_an_http_error_is_explained() {
+        let server = MockServer::start().await;
+        mount_text(
+            &server,
+            "GET",
+            "/centralservicos/resolver_chamado/5/",
+            RESOLVE_FORM_WITHOUT_ARTICLES,
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/centralservicos/resolver_chamado/5/"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let (_dir, client) = client_for(&server).await;
+        let source = SuapTicketSource::new(&client, TicketQueue::Support);
+        let resolution = Resolution {
+            text: "ok".to_owned(),
+            ..Resolution::default()
+        };
+        let error = source
+            .resolve_ticket("5", &resolution)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("SUAP refused the resolution (unexpected status 403 Forbidden)"));
+    }
+
+    #[tokio::test]
+    async fn resolves_with_the_first_article_by_default() {
+        let server = MockServer::start().await;
+        mount_text(
+            &server,
+            "GET",
+            "/centralservicos/resolver_chamado/5/",
+            RESOLVE_FORM,
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/centralservicos/resolver_chamado/5/"))
+            .and(body_string_contains("bases_conhecimento=11"))
+            .and(body_string_contains("comentario=resolvido%0Acom+sucesso"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&server)
+            .await;
+        let (_dir, client) = client_for(&server).await;
+        let source = SuapTicketSource::new(&client, TicketQueue::Support);
+        let resolution = Resolution {
+            text: "resolvido\ncom sucesso".to_owned(),
+            ..Resolution::default()
+        };
+        source.resolve_ticket("5", &resolution).await.unwrap();
+        let received = server.received_requests().await.unwrap();
+        let body = String::from_utf8_lossy(&received.last().unwrap().body).into_owned();
+        assert!(!body.contains("bases_conhecimento=12"));
+    }
+
+    #[tokio::test]
+    async fn resolves_with_chosen_articles_other_tickets_and_standard_reply() {
+        let server = MockServer::start().await;
+        mount_text(
+            &server,
+            "GET",
+            "/centralservicos/resolver_chamado/5/",
+            RESOLVE_FORM,
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/centralservicos/resolver_chamado/5/"))
+            .and(body_string_contains("bases_conhecimento=12"))
+            .and(body_string_contains("outros_chamados_a_resolver=7"))
+            .and(body_string_contains("resposta_padrao=3"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&server)
+            .await;
+        let (_dir, client) = client_for(&server).await;
+        let source = SuapTicketSource::new(&client, TicketQueue::Support);
+        let resolution = Resolution {
+            text: "ok".to_owned(),
+            articles: vec!["12".to_owned()],
+            also: vec!["7".to_owned()],
+            standard_reply: Some("3".to_owned()),
+        };
+        source.resolve_ticket("5", &resolution).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resolves_forms_that_offer_no_articles() {
+        let server = MockServer::start().await;
+        mount_text(
+            &server,
+            "GET",
+            "/centralservicos/resolver_chamado/5/",
+            RESOLVE_FORM_WITHOUT_ARTICLES,
+        )
+        .await;
+        mount_text(
+            &server,
+            "POST",
+            "/centralservicos/resolver_chamado/5/",
+            "ok",
+        )
+        .await;
+        let (_dir, client) = client_for(&server).await;
+        let source = SuapTicketSource::new(&client, TicketQueue::Support);
+        let resolution = Resolution {
+            text: "ok".to_owned(),
+            ..Resolution::default()
+        };
+        source.resolve_ticket("5", &resolution).await.unwrap();
+        let with_article = Resolution {
+            articles: vec!["1".to_owned()],
+            ..resolution
+        };
+        let error = source
+            .resolve_ticket("5", &with_article)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("offers no articles"));
+    }
+
+    #[tokio::test]
+    async fn resolve_reports_failures() {
+        let server = MockServer::start().await;
+        mount_text(
+            &server,
+            "GET",
+            "/centralservicos/resolver_chamado/5/",
+            RESOLVE_FORM,
+        )
+        .await;
+        mount_text(
+            &server,
+            "POST",
+            "/centralservicos/resolver_chamado/5/",
+            r#"<ul class="errorlist"><li>Comentário inválido.</li></ul>"#,
+        )
+        .await;
+        let (_dir, client) = client_for(&server).await;
+        let source = SuapTicketSource::new(&client, TicketQueue::Support);
+        let unknown = Resolution {
+            text: "ok".to_owned(),
+            articles: vec!["99".to_owned()],
+            ..Resolution::default()
+        };
+        let error = source
+            .resolve_ticket("5", &unknown)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("article 99 is not offered; available: 11, 12"));
+        let rejected = Resolution {
+            text: "ok".to_owned(),
+            ..Resolution::default()
+        };
+        let error = source
+            .resolve_ticket("5", &rejected)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("SUAP rejected the resolution: Comentário inválido."));
+        let empty = Resolution::default();
+        assert!(source
+            .resolve_ticket("5", &empty)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("resolution text is empty"));
     }
 
     #[test]

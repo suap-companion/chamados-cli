@@ -12,8 +12,8 @@ use std::{
 };
 
 use chamados_core::{
-    validate_title, Attachment, Message, NewTicket, SuapTicketSource, TicketDetails, TicketError,
-    TicketQueue, TicketSource, TitleStore,
+    validate_title, Attachment, Message, NewTicket, Resolution, SuapTicketSource, TicketDetails,
+    TicketError, TicketQueue, TicketSource, TitleStore,
 };
 use clap::{Args, Parser, Subcommand};
 use suap_core::{
@@ -69,6 +69,10 @@ enum Command {
     Comment(MessageArgs),
     /// Adiciona uma nota interna (visível só à equipe de atendimento) a um chamado.
     Note(MessageArgs),
+    /// Suspende um chamado (situação "Suspenso"), com a mensagem de suspensão.
+    Suspend(MessageArgs),
+    /// Resolve um chamado (situação "Resolvido"), com a mensagem de resolução.
+    Resolve(ResolveArgs),
     /// Define, exibe ou remove o título local de um chamado (o SUAP não tem título; fica só nesta máquina).
     Title {
         /// Número do chamado.
@@ -143,6 +147,21 @@ struct MessageArgs {
     /// Texto (pode ter várias linhas). Com `-` ou omitido, é lido da entrada padrão.
     #[arg(long, short = 'm')]
     message: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ResolveArgs {
+    #[command(flatten)]
+    message: MessageArgs,
+    /// Artigo relacionado da base de conhecimento (id; repetível). Sem esta opção, usa o primeiro que o SUAP oferecer.
+    #[arg(long)]
+    article: Vec<String>,
+    /// Resolve também este outro chamado (repetível).
+    #[arg(long)]
+    also: Vec<u64>,
+    /// Resposta padrão a usar (id).
+    #[arg(long)]
+    standard_reply: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -257,6 +276,8 @@ fn execute(
         Some(Command::Open(args)) => open(paths, args, input, out),
         Some(Command::Comment(args)) => send_message(paths, args, Message::Comment, input, out),
         Some(Command::Note(args)) => send_message(paths, args, Message::InternalNote, input, out),
+        Some(Command::Suspend(args)) => suspend(paths, args, input, out),
+        Some(Command::Resolve(args)) => resolve(paths, args, input, out),
         Some(Command::Title { id, text, remove }) => title(paths, id, text, remove, out),
         Some(Command::Status) => {
             writeln!(
@@ -578,6 +599,61 @@ fn send_message(
     let message = match kind {
         Message::Comment => format!("Comentário adicionado ao chamado #{id}."),
         Message::InternalNote => format!("Nota interna adicionada ao chamado #{id}."),
+    };
+    writeln!(out, "{message}")?;
+    Ok(())
+}
+
+/// Runtime and client for the selected profile.
+fn connect(paths: &AppPaths) -> Result<(tokio::runtime::Runtime, SuapClient), Box<dyn Error>> {
+    let config = profile_config(paths)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    Ok((runtime, SuapClient::open(paths, &config)?))
+}
+
+fn suspend(
+    paths: &AppPaths,
+    args: MessageArgs,
+    input: &mut dyn Read,
+    out: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    let text = read_text(args.message, input)?;
+    let (runtime, client) = connect(paths)?;
+    let source = SuapTicketSource::new(&client, TicketQueue::Support);
+    let id = args.id.to_string();
+    runtime
+        .block_on(source.suspend_ticket(&id, &text))
+        .map_err(explain)?;
+    writeln!(out, "Chamado #{id} suspenso.")?;
+    Ok(())
+}
+
+fn resolve(
+    paths: &AppPaths,
+    args: ResolveArgs,
+    input: &mut dyn Read,
+    out: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    let resolution = Resolution {
+        text: read_text(args.message.message, input)?,
+        articles: args.article,
+        also: args.also.iter().map(u64::to_string).collect(),
+        standard_reply: args.standard_reply,
+    };
+    let (runtime, client) = connect(paths)?;
+    let source = SuapTicketSource::new(&client, TicketQueue::Support);
+    let id = args.message.id.to_string();
+    runtime
+        .block_on(source.resolve_ticket(&id, &resolution))
+        .map_err(explain)?;
+    let others = resolution.also.iter().map(|other| format!("#{other}"));
+    let together = others.collect::<Vec<_>>().join(", ");
+    let message = if together.is_empty() {
+        format!("Chamado #{id} resolvido.")
+    } else {
+        format!("Chamado #{id} resolvido, junto com {together}.")
     };
     writeln!(out, "{message}")?;
     Ok(())
@@ -1411,6 +1487,121 @@ mod tests {
         let (code, _, err) = run_args(&["note", "9", "-m", "x"], &paths);
         assert_eq!(code, 1);
         assert!(err.contains("unexpected status 404"));
+    }
+
+    #[test]
+    fn suspend_sends_a_multiline_message_from_the_option_or_standard_input() {
+        let (_dir, paths) = paths();
+        let (runtime, server) = bare_server();
+        run_args(&["profile", "init", "--base-url", &server.uri()], &paths);
+        let form = r#"<form action="" method="POST"><input type="hidden" name="csrfmiddlewaretoken" value="tok">
+            <textarea name="observacao"></textarea></form>"#;
+        mount_text(
+            &runtime,
+            &server,
+            "GET",
+            "/centralservicos/suspender_chamado/5/",
+            ResponseTemplate::new(200).set_body_string(form),
+        );
+        mount_text(
+            &runtime,
+            &server,
+            "POST",
+            "/centralservicos/suspender_chamado/5/",
+            ResponseTemplate::new(200),
+        );
+
+        let (code, out, err) = run_args(&["suspend", "5", "-m", "aguardando\nretorno"], &paths);
+        assert_eq!(
+            (code, err.as_str(), out.as_str()),
+            (0, "", "Chamado #5 suspenso.\n")
+        );
+        let (code, _, _) = run_with_input(&["suspend", "5"], &paths, "pelo stdin\n");
+        assert_eq!(code, 0);
+        let requests = runtime.block_on(server.received_requests()).unwrap();
+        let bodies: Vec<String> = requests
+            .iter()
+            .filter(|request| request.method == wiremock::http::Method::POST)
+            .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+            .collect();
+        assert!(bodies[0].contains("observacao=aguardando%0Aretorno"));
+        assert!(bodies[1].contains("observacao=pelo+stdin"));
+
+        let (code, _, err) = run_with_input(&["suspend", "5"], &paths, "\n");
+        assert_eq!(code, 1);
+        assert!(err.contains("texto não informado"));
+        let (code, _, err) = run_args(&["suspend", "9", "-m", "x"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("ticket 9 cannot be suspended"));
+    }
+
+    #[test]
+    fn resolve_sends_the_message_articles_and_other_tickets() {
+        let (_dir, paths) = paths();
+        let (runtime, server) = bare_server();
+        run_args(&["profile", "init", "--base-url", &server.uri()], &paths);
+        let form = r#"<form action="" method="POST"><input type="hidden" name="csrfmiddlewaretoken" value="tok">
+            <input type="checkbox" name="bases_conhecimento" value="11">
+            <input type="checkbox" name="bases_conhecimento" value="12">
+            <input type="checkbox" name="outros_chamados_a_resolver" value="7">
+            <textarea name="comentario"></textarea></form>"#;
+        mount_text(
+            &runtime,
+            &server,
+            "GET",
+            "/centralservicos/resolver_chamado/5/",
+            ResponseTemplate::new(200).set_body_string(form),
+        );
+        mount_text(
+            &runtime,
+            &server,
+            "POST",
+            "/centralservicos/resolver_chamado/5/",
+            ResponseTemplate::new(200),
+        );
+
+        let (code, out, err) = run_args(&["resolve", "5", "-m", "feito"], &paths);
+        assert_eq!(
+            (code, err.as_str(), out.as_str()),
+            (0, "", "Chamado #5 resolvido.\n")
+        );
+        let args = [
+            "resolve",
+            "5",
+            "-m",
+            "feito\nok",
+            "--article",
+            "12",
+            "--also",
+            "7",
+            "--standard-reply",
+            "3",
+        ];
+        let (code, out, _) = run_args(&args, &paths);
+        assert_eq!(code, 0);
+        assert_eq!(out, "Chamado #5 resolvido, junto com #7.\n");
+
+        let requests = runtime.block_on(server.received_requests()).unwrap();
+        let bodies: Vec<String> = requests
+            .iter()
+            .filter(|request| request.method == wiremock::http::Method::POST)
+            .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+            .collect();
+        assert!(
+            bodies[0].contains("bases_conhecimento=11")
+                && !bodies[0].contains("bases_conhecimento=12")
+        );
+        assert!(
+            bodies[1].contains("bases_conhecimento=12")
+                && bodies[1].contains("outros_chamados_a_resolver=7")
+        );
+        assert!(
+            bodies[1].contains("comentario=feito%0Aok") && bodies[1].contains("resposta_padrao=3")
+        );
+
+        let (code, _, err) = run_args(&["resolve", "5", "-m", "x", "--article", "99"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("article 99 is not offered"));
     }
 
     #[test]

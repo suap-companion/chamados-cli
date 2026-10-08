@@ -135,6 +135,23 @@ cat comentario.txt | chamados comment 559298                # texto pela entrada
 
 O texto pode ter várias linhas e vem de `-m`, de `-m -` ou, se `-m` for omitido, da entrada padrão (nunca se espera digitação no terminal). O comando abre a página do chamado, usa o formulário que o SUAP oferece (com o token CSRF) e envia o texto; se o SUAP recusar (sem permissão, chamado fechado, texto inválido), mostra a mensagem dele. Confira o resultado com `chamados show <id>`.
 
+### Suspender e resolver um chamado
+
+```bash
+chamados suspend 559298 -m "Aguardando retorno do fornecedor."
+chamados resolve 559298 -m "Atualizado para a versão 5.3.0.
+Plugins validados."
+cat resolucao.txt | chamados resolve 559298 --also 559300 --also 559301
+```
+
+A mensagem segue o mesmo padrão dos demais textos (várias linhas; `-m`, `-m -` ou entrada padrão) e vira um comentário na linha do tempo. O comando carrega o formulário que o SUAP oferece (`suspender_chamado`/`resolver_chamado`) e o envia de volta; se o SUAP recusar (situação inválida, sem permissão), mostra a mensagem dele.
+
+No `resolve`:
+
+- `--article <id>` (repetível) escolhe os artigos relacionados da base de conhecimento. O SUAP exige ao menos um **quando oferece algum**; sem a opção, o comando usa o **primeiro** da lista oferecida. Um id que o SUAP não ofereceu é recusado, com a lista de opções.
+- `--also <id>` (repetível) resolve outros chamados junto com este.
+- `--standard-reply <id>` usa uma resposta padrão.
+
 ### Ver detalhes de um chamado
 
 ```bash
