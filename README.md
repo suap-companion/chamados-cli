@@ -195,6 +195,33 @@ chamados sync
 
 Em outro dispositivo, repita o `setup` e **leve a chave por um canal seu** (nunca pela nuvem): `chamados sync key export` imprime a chave em hexadecimal e `chamados sync key import` a lê da entrada padrão (`chamados sync key export | ssh outro chamados sync key import`). `chamados sync key status` informa onde a chave está e se existe.
 
+### Cloudflare R2 (ou outro S3-compatível)
+
+Em vez de uma pasta, o `sync` pode usar um bucket S3-compatível (Cloudflare R2, AWS S3, MinIO, Backblaze B2...) por HTTPS, com requisições assinadas (SigV4). O provedor é escolha sua; nada no código o fixa. O `chamados` só faz `GET`, `PUT` e `DELETE` de um objeto: não usa ACLs, links pré-assinados nem listagens, então não há como tornar o objeto público.
+
+No Cloudflare R2:
+
+1. Crie um bucket **privado** (deixe desligados o acesso público `r2.dev` e qualquer domínio público).
+2. Crie um token de API do R2 com permissão **Object Read & Write** restrita a esse bucket e anote o **Access Key ID** e o **Secret Access Key**.
+3. O endpoint é `https://<ACCOUNT_ID>.r2.cloudflarestorage.com` (o `ACCOUNT_ID` aparece no painel do R2).
+
+```bash
+chamados sync setup --backend s3 \
+  --endpoint https://<ACCOUNT_ID>.r2.cloudflarestorage.com \
+  --bucket meu-bucket --prefix chamados --key-source file     # região padrão: auto (R2)
+
+# credenciais: pela entrada padrão (nunca como argumento): linha 1 = Access Key ID, linha 2 = Secret
+printf '%s\n%s\n' "$ACCESS_KEY_ID" "$SECRET_ACCESS_KEY" | chamados sync credentials set
+
+chamados sync key generate
+chamados sync --check      # confere o acesso e se o bucket aceita escrita condicional
+chamados sync
+```
+
+As credenciais ficam no **chaveiro do sistema** ou, para automação, nas variáveis `CHAMADOS_S3_ACCESS_KEY_ID` e `CHAMADOS_S3_SECRET_ACCESS_KEY` (o `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` também valem); **nunca** vão para o `config.toml` nem para a nuvem. `chamados sync credentials status` informa se existem, sem mostrá-las. O endpoint precisa ser `https` (`http` só é aceito em `localhost`, para testar contra um servidor local).
+
+`sync --check` faz duas escritas `If-None-Match: *` de um objeto temporário (que depois apaga) para descobrir se o bucket honra **escrita condicional**. Se não honrar (como alguns servidores), ajuste `chamados sync setup --conditional-writes false`: o `sync` passa a reler o que gravou para confirmar que ninguém gravou ao mesmo tempo.
+
 ### Onde fica a chave
 
 | `--key-source` | Onde | Quando usar |
@@ -218,7 +245,7 @@ Duas execuções ao mesmo tempo não se atrapalham: a segunda vê o bloqueio (`s
 
 Cada título e cada bloco de configurações carrega o instante da última alteração (em milissegundos) e **o mais novo vence**, entrada por entrada; em empate de instante, vence o conteúdo maior (sempre o mesmo resultado, em qualquer ordem). Remover um título deixa uma marca de remoção, para a remoção também chegar aos outros dispositivos. Se alguém gravar na nuvem durante a sua rodada, ela recomeça do download (até 5 tentativas). Backends sem escrita condicional gravam e **releem para confirmar**.
 
-Limites desta versão: remover um perfil (`profile remove`) **não** o remove da nuvem, e um perfil que existe na nuvem é recriado no próximo `sync`; a pasta (`directory`) é o único backend, e o S3-compatível (Cloudflare R2) vem na sequência (#42).
+Limite desta versão: remover um perfil (`profile remove`) **não** o remove da nuvem, e um perfil que existe na nuvem é recriado no próximo `sync`.
 
 ### Automatizar (a cada 5 minutos)
 
@@ -250,6 +277,8 @@ Com `cron`: `*/5 * * * * flock -n ~/.cache/chamados-sync.lock chamados sync --qu
 - **RS-01 — Cobertura de testes de 100%.** Os testes automatizados do workspace devem cobrir 100% das linhas de código. A verificação roda no CI (`ci.yml`) e o build falha se a cobertura ficar abaixo disso. O ponto de entrada `main.rs` de cada binário deve conter apenas o encadeamento mínimo e é excluído da medição; toda a lógica fica em `lib.rs`, onde é testada.
 
 - **RS-02 — Entradas de texto aceitam várias linhas e a entrada padrão.** Toda entrada de texto livre do `chamados` (descrição, comentário, nota interna e mensagens de resolvido e de suspenso, e qualquer campo de texto livre futuro) aceita **várias linhas** e pode ser lida da **entrada padrão**: a opção do comando (`-d`/`-m`) recebe o texto, `-` lê o texto do stdin, e omitir a opção também lê o stdin. Só a quebra de linha final é removida, texto vazio é recusado antes de qualquer envio e um terminal interativo nunca é aguardado. A exceção é o título local (`chamados title`), que tem uma única linha por decisão de projeto. O requisito é verificado por teste para cada comando de texto (`rs02_every_text_input_accepts_multiple_lines_and_standard_input`), e outro teste obriga a classificar cada comando novo como "com texto" ou "sem texto".
+
+- **RS-03 — Os dados do usuário são só do usuário.** Os títulos e as configurações dos perfis que saem da máquina (sincronização em nuvem) **não podem ser compartilhados de forma alguma**: (1) tudo que sai vai **cifrado**, com uma chave que nunca sai dos dispositivos do usuário; (2) sessões e cookies, a senha (`SUAP_PASSWORD`), as credenciais da nuvem e a própria chave **nunca** entram no conjunto sincronizado; (3) o `chamados` não usa recurso de compartilhamento do provedor (ACLs, links públicos ou pré-assinados, colaboradores) e exige `https` para o endpoint; (4) sem chave (ou sem credenciais), o `sync` recusa operar e **não envia nenhuma requisição**; (5) mensagens de erro nunca repetem credenciais. O requisito é verificado por testes: o conteúdo enviado ao bucket é varrido atrás de títulos, nome de usuário, cookies, a chave e o segredo da nuvem; as requisições são conferidas (sem ACL, sem query, sempre assinadas); e um teste-guarda obriga a classificar cada configuração nova como "sincroniza" ou "só local" (`rs03_every_setting_is_classified_as_synced_or_local_only`).
 
 Para verificar a cobertura localmente (requer `cargo install cargo-llvm-cov` e o componente `llvm-tools-preview`):
 

@@ -13,20 +13,29 @@
 use thiserror::Error;
 
 pub mod backend;
+pub mod credentials;
 pub mod crypto;
 pub mod document;
 pub mod engine;
+#[cfg(test)]
+mod fake_s3;
 pub mod keys;
+pub mod s3;
 pub mod setup;
+pub mod sigv4;
 
 pub use backend::{Condition, DirectoryBackend, Object, PutOutcome, SyncBackend};
+pub use credentials::S3Credentials;
 pub use crypto::Key;
 pub use document::{
     apply_merged, collect_local, merge, ApplyReport, ProfileDoc, SettingsEntry, SyncDocument,
 };
 pub use engine::{sync_once, SyncLock, SyncOptions, SyncReport, OBJECT_NAME};
 pub use keys::{load_key, store_key, KeySource, KEY_ENV};
-pub use setup::{backend_from, key_source_from, DIRECTORY_BACKEND};
+pub use s3::{S3Backend, S3Settings};
+pub use setup::{
+    backend_from, key_source_from, validate_settings, AnyBackend, DIRECTORY_BACKEND, S3_BACKEND,
+};
 
 /// Everything that can go wrong while synchronizing.
 #[derive(Debug, Error)]
@@ -41,6 +50,8 @@ pub enum SyncError {
     Crypto(String),
     #[error("keyring: {0}")]
     Keyring(#[from] keyring_core::Error),
+    #[error("HTTP error: {0}")]
+    Http(#[from] reqwest::Error),
     #[error("backend: {0}")]
     Backend(String),
     #[error("could not agree with the remote copy after several attempts")]

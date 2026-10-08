@@ -157,11 +157,18 @@ fn is_stale(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::DirectoryBackend;
+    use crate::{
+        backend::DirectoryBackend,
+        credentials::S3Credentials,
+        fake_s3::FakeS3,
+        setup::{backend_from, AnyBackend},
+    };
     use chamados_core::TitleStore;
     use std::cell::RefCell;
+    use suap_core::SyncSettings;
     use suap_core::{load_config, save_config, SuapConfig};
     use tempfile::{tempdir, TempDir};
+    use wiremock::MockServer;
 
     /// A machine: its own configuration and data directories.
     fn machine(root: &Path, name: &str) -> AppPaths {
@@ -337,7 +344,7 @@ mod tests {
 
     /// A backend that loses the race a few times, or that cannot do conditional writes.
     struct Scripted {
-        inner: DirectoryBackend,
+        inner: AnyBackend,
         conditional: bool,
         fail_puts: RefCell<usize>,
         /// After the first write, reads return this object (another writer got in right after us).
@@ -383,7 +390,7 @@ mod tests {
         stale: Option<Vec<u8>>,
     ) -> Scripted {
         Scripted {
-            inner: DirectoryBackend::new(root.join("nuvem")),
+            inner: AnyBackend::Directory(DirectoryBackend::new(root.join("nuvem"))),
             conditional,
             fail_puts: RefCell::new(fail_puts),
             stale,
@@ -427,6 +434,159 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("could not agree"));
+    }
+
+    const S3_ID: &str = "AKIATESTID123";
+    const S3_SECRET: &str = "segredo/de-teste+valor";
+
+    /// A `Scripted` backend over an S3-compatible bucket served by `fake`.
+    fn scripted_s3(server: &MockServer, conditional: bool) -> Scripted {
+        let settings = SyncSettings {
+            backend: Some("s3".to_owned()),
+            endpoint: Some(server.uri()),
+            bucket: Some("cofre".to_owned()),
+            prefix: Some("dados".to_owned()),
+            conditional_writes: Some(conditional),
+            ..SyncSettings::default()
+        };
+        let credentials = S3Credentials {
+            access_key_id: S3_ID.to_owned(),
+            secret_access_key: S3_SECRET.to_owned(),
+        };
+        Scripted {
+            inner: backend_from(&settings, Some(credentials)).unwrap(),
+            conditional,
+            fail_puts: RefCell::new(0),
+            stale: None,
+            writes: RefCell::new(0),
+        }
+    }
+
+    #[tokio::test]
+    async fn two_machines_converge_through_an_s3_bucket_and_nothing_secret_leaves() {
+        let fake = FakeS3::new(S3_ID, S3_SECRET);
+        let server = fake.start().await;
+        let backend = scripted_s3(&server, true);
+        let root = tempdir().unwrap();
+        let (a, b) = (machine(root.path(), "a"), machine(root.path(), "b"));
+        let key = Key::generate();
+        let options = SyncOptions::default();
+
+        let a_profile = enable_sync(&a, "default", 1);
+        set_title(&a_profile, "5", "Titulo secreto do chamado", 10);
+        // Things that must never be uploaded: a session cookie and (below) the key and the S3 secret.
+        std::fs::write(a_profile.session_file(), "COOKIE-SECRETO-123").unwrap();
+        let mut config = load_config(&a_profile).unwrap().unwrap();
+        config.username = Some("ana-secreta".to_owned());
+        save_config(&a_profile, &config).unwrap();
+
+        assert!(
+            sync_once(&a, &backend, &key, &options)
+                .await
+                .unwrap()
+                .uploaded
+        );
+        let report = sync_once(&b, &backend, &key, &options).await.unwrap();
+        assert_eq!((report.local_changes, report.uploaded), (2, false));
+        let b_profile = b.clone().with_profile("default").unwrap();
+        assert_eq!(
+            TitleStore::open(b_profile.titles_file()).unwrap().get("5"),
+            Some("Titulo secreto do chamado")
+        );
+        set_title(&b_profile, "5", "Editado em B", 20);
+        assert!(
+            sync_once(&b, &backend, &key, &options)
+                .await
+                .unwrap()
+                .uploaded
+        );
+        assert_eq!(
+            sync_once(&a, &backend, &key, &options)
+                .await
+                .unwrap()
+                .local_changes,
+            1
+        );
+
+        // RS-03: nothing readable leaves the machine, and the bucket is used without sharing features.
+        let log = fake.log();
+        assert!(log.len() >= 6);
+        let stored = fake.object("/cofre/dados/chamados-sync-v1.bin").unwrap();
+        assert!(
+            stored.starts_with(b"CSYN1"),
+            "the object is an encrypted envelope"
+        );
+        let forbidden: Vec<Vec<u8>> = [
+            "Titulo secreto do chamado",
+            "Editado em B",
+            "ana-secreta",
+            "COOKIE-SECRETO",
+            S3_SECRET,
+            "SUAP_PASSWORD",
+        ]
+        .iter()
+        .map(|text| text.as_bytes().to_vec())
+        .chain([key.to_hex().into_bytes(), key.as_bytes().to_vec()])
+        .collect();
+        for request in &log {
+            let mut everything =
+                format!("{} {} {:?}", request.method, request.path, request.query).into_bytes();
+            everything.extend(
+                request
+                    .headers
+                    .iter()
+                    .flat_map(|(n, v)| format!("{n}={v};").into_bytes()),
+            );
+            everything.extend(&request.body);
+            for secret in &forbidden {
+                let leaked = everything
+                    .windows(secret.len())
+                    .any(|window| window == secret.as_slice());
+                let context = format!(
+                    "{:?} in a {} request",
+                    String::from_utf8_lossy(secret),
+                    request.method
+                );
+                assert!(!leaked, "{context}");
+            }
+            assert!(
+                request.query.is_none(),
+                "no presigned URLs or query parameters"
+            );
+            assert!(!request.headers.contains_key("x-amz-acl"), "no ACLs");
+            assert!(request.headers["authorization"].starts_with("AWS4-HMAC-SHA256 "));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_s3_bucket_without_conditional_writes_still_converges() {
+        let mut fake = FakeS3::new(S3_ID, S3_SECRET);
+        fake.honor_conditions = false;
+        let server = fake.start().await;
+        let backend = scripted_s3(&server, false);
+        let root = tempdir().unwrap();
+        let (a, b) = (machine(root.path(), "a"), machine(root.path(), "b"));
+        let key = Key::generate();
+        let a_profile = enable_sync(&a, "default", 1);
+        set_title(&a_profile, "1", "um", 5);
+        sync_once(&a, &backend, &key, &SyncOptions::default())
+            .await
+            .unwrap();
+        sync_once(&b, &backend, &key, &SyncOptions::default())
+            .await
+            .unwrap();
+        let b_profile = b.clone().with_profile("default").unwrap();
+        assert_eq!(
+            TitleStore::open(b_profile.titles_file()).unwrap().get("1"),
+            Some("um")
+        );
+        // Without conditional writes the engine reads the upload back to confirm it.
+        let reads = fake
+            .log()
+            .iter()
+            .filter(|request| request.method == "GET")
+            .count();
+        assert!(reads >= 3, "{reads}");
     }
 
     #[test]
