@@ -6,11 +6,14 @@ use std::{error::Error, ffi::OsString, io::Write};
 
 use clap::{Parser, Subcommand};
 use chamados_core::{NewTicket, SuapTicketSource, TicketDetails, TicketError, TicketQueue, TicketSource};
-use suap_core::{load_config, save_config, AppPaths, SuapClient, SuapError};
+use suap_core::{load_config, save_config, AppPaths, SuapClient, SuapConfig, SuapError, DEFAULT_PROFILE};
 
 #[derive(Debug, Parser)]
 #[command(name = "chamados", version, about = "Cliente local para chamados do SUAP")]
 struct Cli {
+    /// Perfil (ambiente) a usar; cada perfil tem sua configuração e sua sessão.
+    #[arg(long, global = true, default_value = DEFAULT_PROFILE)]
+    profile: String,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -106,7 +109,15 @@ where
         }
     };
 
-    match execute(cli, paths, password, out) {
+    let paths = match paths.clone().with_profile(&cli.profile) {
+        Ok(paths) => paths,
+        Err(error) => {
+            let _ = writeln!(err, "erro: {error}");
+            return 1;
+        }
+    };
+
+    match execute(cli, &paths, password, out) {
         Ok(()) => 0,
         Err(error) => {
             let _ = writeln!(err, "erro: {error}");
@@ -143,7 +154,21 @@ fn execute(
     }
 }
 
+/// Configuration of the selected profile; only `default` falls back to the built-in defaults.
+fn profile_config(paths: &AppPaths) -> Result<SuapConfig, Box<dyn Error>> {
+    match load_config(paths)? {
+        Some(config) => Ok(config),
+        None if paths.profile() == DEFAULT_PROFILE => Ok(SuapConfig::default()),
+        None => Err(format!(
+            "perfil {0:?} não configurado: execute `chamados config-init --profile {0}`",
+            paths.profile()
+        )
+        .into()),
+    }
+}
+
 fn show_paths(paths: &AppPaths, out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
+    writeln!(out, "profile: {}", paths.profile())?;
     writeln!(out, "config_dir: {}", paths.config_dir().display())?;
     writeln!(out, "config_file: {}", paths.config_file().display())?;
     writeln!(out, "data_dir: {}", paths.data_dir().display())?;
@@ -154,11 +179,15 @@ fn show_paths(paths: &AppPaths, out: &mut dyn Write) -> Result<(), Box<dyn Error
 fn show_config(paths: &AppPaths, out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
     match load_config(paths)? {
         Some(config) => {
+            writeln!(out, "profile: {}", paths.profile())?;
             writeln!(out, "base_url: {}", config.base_url)?;
             writeln!(out, "username: {}", config.username.as_deref().unwrap_or("<não configurado>"))?;
             writeln!(out, "file: {}", paths.config_file().display())?;
         }
-        None => writeln!(out, "Nenhuma configuração encontrada em {}", paths.config_file().display())?,
+        None => {
+            let (profile, file) = (paths.profile(), paths.config_file());
+            writeln!(out, "Nenhuma configuração encontrada para o perfil {profile} em {}", file.display())?;
+        }
     }
     Ok(())
 }
@@ -169,7 +198,7 @@ fn login(
     password: Option<String>,
     out: &mut dyn Write,
 ) -> Result<(), Box<dyn Error>> {
-    let config = load_config(paths)?.unwrap_or_default();
+    let config = profile_config(paths)?;
     let username = username
         .or_else(|| config.username.clone())
         .ok_or("usuário não informado: use --username ou `config-init --username`")?;
@@ -178,12 +207,13 @@ fn login(
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let client = SuapClient::open(paths, &config)?;
     runtime.block_on(client.login(&username, &password))?;
-    writeln!(out, "Login realizado como {username}. Sessão salva em {}", paths.session_file().display())?;
+    let (profile, session) = (paths.profile(), paths.session_file());
+    writeln!(out, "Login realizado como {username} (perfil {profile}). Sessão salva em {}", session.display())?;
     Ok(())
 }
 
 fn list(paths: &AppPaths, mine: bool, out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
-    let config = load_config(paths)?.unwrap_or_default();
+    let config = profile_config(paths)?;
     let queue = if mine { TicketQueue::Mine } else { TicketQueue::Support };
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let client = SuapClient::open(paths, &config)?;
@@ -203,7 +233,7 @@ fn list(paths: &AppPaths, mine: bool, out: &mut dyn Write) -> Result<(), Box<dyn
 }
 
 fn show(paths: &AppPaths, id: u64, out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
-    let config = load_config(paths)?.unwrap_or_default();
+    let config = profile_config(paths)?;
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let client = SuapClient::open(paths, &config)?;
     let source = SuapTicketSource::new(&client, TicketQueue::Support);
@@ -213,7 +243,7 @@ fn show(paths: &AppPaths, id: u64, out: &mut dyn Write) -> Result<(), Box<dyn Er
 }
 
 fn open(paths: &AppPaths, ticket: &NewTicket, out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
-    let config = load_config(paths)?.unwrap_or_default();
+    let config = profile_config(paths)?;
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let client = SuapClient::open(paths, &config)?;
     let source = SuapTicketSource::new(&client, TicketQueue::Support);
@@ -261,7 +291,7 @@ fn init_config(
     }
 
     save_config(paths, &config)?;
-    writeln!(out, "Configuração salva em {}", paths.config_file().display())?;
+    writeln!(out, "Configuração salva em {} (perfil {})", paths.config_file().display(), paths.profile())?;
     Ok(())
 }
 
@@ -345,6 +375,44 @@ mod tests {
         assert_eq!(code, 0);
         let (_, out, _) = run_args(&["config-show"], &paths);
         assert!(out.contains("https://example.org/") && out.contains("username: kelson"));
+    }
+
+    #[test]
+    fn profiles_isolate_configuration_and_session() {
+        let (_dir, paths) = paths();
+        let (_runtime, server) = mock_server(true);
+        let (code, out, _) = run_args(&["config-init", "--profile", "local", "--base-url", &server.uri()], &paths);
+        assert!(code == 0 && out.contains("(perfil local)"));
+
+        let (_, out, _) = run_args(&["config-show"], &paths);
+        assert!(out.contains("Nenhuma configuração encontrada para o perfil default"));
+        let (_, out, _) = run_args(&["--profile", "local", "config-show"], &paths);
+        assert!(out.contains("profile: local") && out.contains(&server.uri()));
+        let (_, out, _) = run_args(&["paths", "--profile", "local"], &paths);
+        assert!(out.contains("profile: local") && out.contains("session-local.cookies"));
+
+        let (code, out, err) = run_login(&["login", "--profile", "local", "--username", "dev"], &paths, Some("segredo"));
+        assert_eq!((code, err.as_str()), (0, ""));
+        assert!(out.contains("(perfil local)"));
+        assert!(paths.clone().with_profile("local").unwrap().session_file().exists());
+        assert!(!paths.session_file().exists());
+    }
+
+    #[test]
+    fn unconfigured_profile_is_an_error_but_default_has_defaults() {
+        let (_dir, paths) = paths();
+        let (code, _, err) = run_args(&["list", "--profile", "local"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("config-init --profile local"));
+        assert!(profile_config(&paths).unwrap().username.is_none());
+    }
+
+    #[test]
+    fn invalid_profile_name_is_rejected() {
+        let (_dir, paths) = paths();
+        let (code, _, err) = run_args(&["--profile", "../x", "paths"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("invalid profile name"));
     }
 
     #[test]

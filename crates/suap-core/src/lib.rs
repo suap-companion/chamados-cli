@@ -1,6 +1,6 @@
 //! Shared SUAP configuration, authentication and persistent session primitives.
 
-use std::{fs, io::{BufReader, Write}, path::{Path, PathBuf}, sync::Arc};
+use std::{collections::BTreeMap, fs, io::{BufReader, Write}, path::{Path, PathBuf}, sync::Arc};
 
 use directories::{BaseDirs, ProjectDirs};
 use reqwest::{Client, StatusCode, Url};
@@ -17,10 +17,15 @@ const SESSION_FILE: &str = "session.cookies";
 const CONFIG_DIR_IN_HOME: [&str; 2] = [".config", "suap"];
 const LOGIN_PATH: &str = "/accounts/login/";
 
+/// Profile used when none is requested.
+pub const DEFAULT_PROFILE: &str = "default";
+const MAX_PROFILE_LEN: usize = 64;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppPaths {
     config_dir: PathBuf,
     data_dir: PathBuf,
+    profile: String,
 }
 
 impl AppPaths {
@@ -33,19 +38,45 @@ impl AppPaths {
     }
 
     pub fn from_dirs(config_dir: PathBuf, data_dir: PathBuf) -> Self {
-        Self { config_dir, data_dir }
+        Self { config_dir, data_dir, profile: DEFAULT_PROFILE.to_owned() }
     }
+
+    /// Selects the profile whose configuration and session these paths refer to.
+    pub fn with_profile(mut self, profile: &str) -> Result<Self, SuapError> {
+        validate_profile(profile)?;
+        self.profile = profile.to_owned();
+        Ok(self)
+    }
+
+    pub fn profile(&self) -> &str { &self.profile }
 
     pub fn config_dir(&self) -> &Path { &self.config_dir }
     pub fn data_dir(&self) -> &Path { &self.data_dir }
     pub fn config_file(&self) -> PathBuf { self.config_dir.join(CONFIG_FILE) }
-    pub fn session_file(&self) -> PathBuf { self.data_dir.join(SESSION_FILE) }
+
+    /// Session cookies of the selected profile (`session.cookies` for `default`, else `session-<profile>.cookies`).
+    pub fn session_file(&self) -> PathBuf {
+        if self.profile == DEFAULT_PROFILE {
+            return self.data_dir.join(SESSION_FILE);
+        }
+        self.data_dir.join(format!("session-{}.cookies", self.profile))
+    }
 
     pub fn ensure_dirs(&self) -> Result<(), SuapError> {
         fs::create_dir_all(&self.config_dir)?;
         fs::create_dir_all(&self.data_dir)?;
         Ok(())
     }
+}
+
+fn validate_profile(profile: &str) -> Result<(), SuapError> {
+    let allowed = |character: char| character.is_ascii_alphanumeric() || character == '-' || character == '_';
+    if !profile.is_empty() && profile.len() <= MAX_PROFILE_LEN && profile.chars().all(allowed) {
+        return Ok(());
+    }
+    Err(SuapError::InvalidConfiguration(format!(
+        "invalid profile name {profile:?}: use letters, digits, '-' or '_' (max {MAX_PROFILE_LEN})"
+    )))
 }
 
 /// Directory holding `config.toml` for a given home directory (`<home>/.config/suap`).
@@ -68,20 +99,53 @@ impl Default for SuapConfig {
     }
 }
 
-pub fn load_config(paths: &AppPaths) -> Result<Option<SuapConfig>, SuapError> {
-    let path = paths.config_file();
-    if !path.exists() { return Ok(None); }
-    let content = fs::read_to_string(path)?;
-    let config = toml::from_str(&content)?;
-    validate_config(&config)?;
-    Ok(Some(config))
+/// On-disk layout of `config.toml`: one `[profiles.<name>]` table per profile.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ConfigFile {
+    // Pre-profiles layout: top-level keys belong to the `default` profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base_url: Option<Url>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+    #[serde(default)]
+    profiles: BTreeMap<String, SuapConfig>,
 }
 
+impl ConfigFile {
+    fn read(paths: &AppPaths) -> Result<Self, SuapError> {
+        let path = paths.config_file();
+        if !path.exists() { return Ok(Self::default()); }
+        Ok(toml::from_str(&fs::read_to_string(path)?)?)
+    }
+
+    /// Moves the pre-profiles top-level keys into the `default` profile (unless it already exists).
+    fn migrate_legacy(&mut self) {
+        let (base_url, username) = (self.base_url.take(), self.username.take());
+        if (base_url.is_some() || username.is_some()) && !self.profiles.contains_key(DEFAULT_PROFILE) {
+            let base_url = base_url.unwrap_or_else(|| SuapConfig::default().base_url);
+            self.profiles.insert(DEFAULT_PROFILE.to_owned(), SuapConfig { base_url, username });
+        }
+    }
+}
+
+/// Loads the configuration of the profile selected in `paths`; `None` if it was never configured.
+pub fn load_config(paths: &AppPaths) -> Result<Option<SuapConfig>, SuapError> {
+    let mut file = ConfigFile::read(paths)?;
+    file.migrate_legacy();
+    let config = file.profiles.remove(paths.profile());
+    if let Some(config) = &config { validate_config(config)?; }
+    Ok(config)
+}
+
+/// Saves the configuration of the profile selected in `paths`, keeping the other profiles.
 pub fn save_config(paths: &AppPaths, config: &SuapConfig) -> Result<(), SuapError> {
     validate_config(config)?;
+    let mut file = ConfigFile::read(paths)?;
+    file.migrate_legacy();
+    file.profiles.insert(paths.profile().to_owned(), config.clone());
     paths.ensure_dirs()?;
     let temporary = paths.config_file().with_extension("toml.tmp");
-    fs::write(&temporary, toml::to_string_pretty(config)?)?;
+    fs::write(&temporary, toml::to_string_pretty(&file)?)?;
     fs::rename(temporary, paths.config_file())?;
     Ok(())
 }
@@ -329,6 +393,66 @@ mod tests {
         let config = SuapConfig { username: Some("kelson".to_owned()), ..SuapConfig::default() };
         save_config(&paths, &config).unwrap();
         assert_eq!(load_config(&paths).unwrap(), Some(config));
+    }
+
+    #[test]
+    fn profiles_have_separate_configuration_and_sessions() {
+        let (_dir, default_paths) = paths();
+        let local_paths = default_paths.clone().with_profile("local-1").unwrap();
+        assert_eq!((default_paths.profile(), local_paths.profile()), (DEFAULT_PROFILE, "local-1"));
+        assert!(default_paths.session_file().ends_with("session.cookies"));
+        assert!(local_paths.session_file().ends_with("session-local-1.cookies"));
+
+        let local = SuapConfig { base_url: Url::parse("http://localhost:8000/").unwrap(), username: Some("dev".to_owned()) };
+        save_config(&local_paths, &local).unwrap();
+        assert_eq!(load_config(&default_paths).unwrap(), None);
+        let production = SuapConfig::default();
+        save_config(&default_paths, &production).unwrap();
+        assert_eq!(load_config(&local_paths).unwrap(), Some(local));
+        assert_eq!(load_config(&default_paths).unwrap(), Some(production));
+    }
+
+    #[test]
+    fn rejects_invalid_profile_names() {
+        for name in ["", "a b", "../x", "ç", &"a".repeat(MAX_PROFILE_LEN + 1)] {
+            let (_dir, paths) = paths();
+            assert!(matches!(paths.with_profile(name), Err(SuapError::InvalidConfiguration(_))), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn legacy_flat_config_is_the_default_profile_and_is_migrated_on_save() {
+        let (_dir, paths) = paths();
+        paths.ensure_dirs().unwrap();
+        fs::write(paths.config_file(), "base_url = \"https://legacy.example/\"\nusername = \"antigo\"\n").unwrap();
+        let legacy = load_config(&paths).unwrap().unwrap();
+        assert_eq!((legacy.base_url.as_str(), legacy.username.as_deref()), ("https://legacy.example/", Some("antigo")));
+        let other = paths.clone().with_profile("other").unwrap();
+        assert_eq!(load_config(&other).unwrap(), None);
+
+        let other_config = SuapConfig { username: Some("novo".to_owned()), ..SuapConfig::default() };
+        save_config(&other, &other_config).unwrap();
+        let saved = fs::read_to_string(paths.config_file()).unwrap();
+        assert!(saved.contains("[profiles.default]") && saved.contains("[profiles.other]"));
+        assert!(!saved.starts_with("base_url"));
+        assert_eq!(load_config(&paths).unwrap().unwrap(), legacy);
+    }
+
+    #[test]
+    fn legacy_username_only_keeps_default_url_and_existing_default_wins() {
+        let (_dir, paths) = paths();
+        paths.ensure_dirs().unwrap();
+        fs::write(paths.config_file(), "username = \"so-usuario\"\n").unwrap();
+        let config = load_config(&paths).unwrap().unwrap();
+        assert_eq!((config.base_url, config.username.as_deref()), (SuapConfig::default().base_url, Some("so-usuario")));
+
+        fs::write(
+            paths.config_file(),
+            "username = \"ignorado\"\n[profiles.default]\nbase_url = \"https://novo.example/\"\n",
+        )
+        .unwrap();
+        let config = load_config(&paths).unwrap().unwrap();
+        assert_eq!((config.base_url.as_str(), config.username), ("https://novo.example/", None));
     }
 
     #[test]
