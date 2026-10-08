@@ -92,6 +92,31 @@ pub struct NewTicket {
     pub attachments: Vec<Attachment>,
 }
 
+/// A message added to a ticket's thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Message {
+    /// A comment, visible to the interested people.
+    Comment,
+    /// An internal note, visible only to the service team.
+    InternalNote,
+}
+
+impl Message {
+    fn action_prefix(self) -> &'static str {
+        match self {
+            Self::Comment => "/centralservicos/adicionar_comentario/",
+            Self::InternalNote => "/centralservicos/adicionar_nota_interna/",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Comment => "comment",
+            Self::InternalNote => "internal note",
+        }
+    }
+}
+
 /// Which SUAP ticket listing to read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TicketQueue {
@@ -116,6 +141,8 @@ pub trait TicketSource {
     async fn get_ticket(&self, id: &str) -> Result<TicketDetails, TicketError>;
     /// Opens a new ticket and returns its id.
     async fn open_ticket(&self, ticket: &NewTicket) -> Result<String, TicketError>;
+    /// Adds a comment or an internal note (multi-line text) to the ticket.
+    async fn add_message(&self, id: &str, kind: Message, text: &str) -> Result<(), TicketError>;
     /// Assigns the ticket to the logged user ("assumir").
     async fn assume_ticket(&self, id: &str) -> Result<(), TicketError>;
     /// Moves the ticket to "Em atendimento" (the user must have assumed it first).
@@ -211,6 +238,39 @@ impl TicketSource for SuapTicketSource<'_> {
             .await?;
         parse_ticket_details(&html, self.client.base_url(), id)
             .ok_or_else(|| TicketError::Source(format!("could not parse ticket {id}")))
+    }
+
+    async fn add_message(&self, id: &str, kind: Message, text: &str) -> Result<(), TicketError> {
+        check_ticket_id(id)?;
+        let text = text.trim_end_matches(['\r', '\n']);
+        if text.trim().is_empty() {
+            return Err(TicketError::Source(format!(
+                "the {} text is empty",
+                kind.label()
+            )));
+        }
+        let page = self
+            .client
+            .fetch_page(&format!("{TICKET_PATH_PREFIX}{id}/"))
+            .await?;
+        let action = format!("{}{id}/", kind.action_prefix());
+        let mut fields = parse_form_by_action(&page, &action).ok_or_else(|| {
+            TicketError::Source(format!(
+                "ticket {id} has no {} form (no permission, or the ticket is closed)",
+                kind.label()
+            ))
+        })?;
+        set_field(&mut fields, "texto", text);
+        let response = self.client.submit_form(&action, &fields).await?;
+        let errors = page_errors(&response.body);
+        if errors.is_empty() {
+            return Ok(());
+        }
+        Err(TicketError::Source(format!(
+            "SUAP rejected the {}: {}",
+            kind.label(),
+            errors.join("; ")
+        )))
     }
 
     async fn assume_ticket(&self, id: &str) -> Result<(), TicketError> {
@@ -330,9 +390,11 @@ fn flat_text(element: ElementRef<'_>) -> String {
         .join(" ")
 }
 
-/// Like [`flat_text`], but keeps the line breaks SUAP renders as `<br>` (multi-line descriptions and comments).
+/// Like [`flat_text`], but keeps the line breaks SUAP renders as `<br>` and the blank line between
+/// paragraphs (`<p>`), so multi-line descriptions and comments read as they were written.
 fn rich_text(element: ElementRef<'_>) -> String {
     let mut text = String::new();
+    let mut paragraphs = 0;
     for node in element.descendants() {
         match node.value() {
             Node::Text(chunk) => {
@@ -346,6 +408,12 @@ fn rich_text(element: ElementRef<'_>) -> String {
                 text.push_str(&words);
             }
             Node::Element(tag) if tag.name() == "br" => text.push('\n'),
+            Node::Element(tag) if tag.name() == "p" => {
+                if paragraphs > 0 {
+                    text.push_str("\n\n");
+                }
+                paragraphs += 1;
+            }
             _ => {}
         }
     }
@@ -371,7 +439,22 @@ pub fn parse_open_form(html: &str) -> Option<Vec<(String, String)>> {
     let form = document
         .select(&forms)
         .find(|form| form.select(&description).next().is_some())?;
+    Some(collect_fields(form))
+}
 
+/// Collects the default values of the form whose `action` is exactly `action`.
+///
+/// Returns `None` if the page has no such form.
+pub fn parse_form_by_action(html: &str, action: &str) -> Option<Vec<(String, String)>> {
+    let document = Html::parse_document(html);
+    let form = document
+        .select(&selector("form"))
+        .find(|form| form.value().attr("action") == Some(action))?;
+    Some(collect_fields(form))
+}
+
+/// Default values of every control of `form` (hidden fields, CSRF token, selected options...).
+fn collect_fields(form: ElementRef<'_>) -> Vec<(String, String)> {
     let (controls, options) = (selector("input, textarea, select"), selector("option"));
     let mut fields = Vec::new();
     for control in form.select(&controls) {
@@ -410,7 +493,21 @@ pub fn parse_open_form(html: &str) -> Option<Vec<(String, String)>> {
         };
         fields.push((name.to_owned(), value));
     }
-    Some(fields)
+    fields
+}
+
+/// Error messages on a page SUAP returned: flashed errors and form (field) errors, without repeats.
+fn page_errors(body: &str) -> Vec<String> {
+    let document = Html::parse_document(body);
+    let mut seen = HashSet::new();
+    let mut errors = flash_errors(body);
+    errors.extend(
+        document
+            .select(&selector(".errorlist li, .errornote"))
+            .map(flat_text),
+    );
+    errors.retain(|message| seen.insert(message.clone()));
+    errors
 }
 
 #[derive(Deserialize)]
@@ -582,7 +679,8 @@ mod tests {
         <div data-tab="linha_tempo"><ul class="timeline">
           <li><div class="timeline-content"><h4>Adicionar comentário:</h4></div></li>
           <li><div class="timeline-date">06/10/2026 19:15:03</div><div class="timeline-content"><h4><a>Kelson</a><small>comentou:</small></h4>
-            <p>Build pronto.</p></div></li>
+            <p>Build pronto.<br>Segunda linha.</p>
+            <p>Outro parágrafo.</p></div></li>
           <li><div class="timeline-date">06/10/2026 19:14:31</div></li>
         </ul></div></main>"#;
 
@@ -731,6 +829,140 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    const THREAD_PAGE: &str = r#"
+        <form method="post" action="/centralservicos/adicionar_comentario/5/">
+          <input type="hidden" name="csrfmiddlewaretoken" value="tok-comentario">
+          <textarea name="texto"></textarea>
+          <select name="usuarios_citados" multiple></select>
+        </form>
+        <form method="post" action="/centralservicos/adicionar_nota_interna/5/">
+          <input type="hidden" name="csrfmiddlewaretoken" value="tok-nota">
+          <textarea name="texto"></textarea>
+        </form>"#;
+
+    #[test]
+    fn picks_the_form_by_its_action() {
+        let comment =
+            parse_form_by_action(THREAD_PAGE, "/centralservicos/adicionar_comentario/5/").unwrap();
+        assert_eq!(
+            comment,
+            [
+                pair("csrfmiddlewaretoken", "tok-comentario"),
+                pair("texto", "")
+            ]
+        );
+        let note = parse_form_by_action(THREAD_PAGE, "/centralservicos/adicionar_nota_interna/5/")
+            .unwrap();
+        assert_eq!(note[0], pair("csrfmiddlewaretoken", "tok-nota"));
+        assert!(
+            parse_form_by_action(THREAD_PAGE, "/centralservicos/adicionar_comentario/6/").is_none()
+        );
+        assert!(parse_form_by_action("<form><input name=\"x\"></form>", "/a/").is_none());
+    }
+
+    #[test]
+    fn collects_flash_and_form_errors_without_repeats() {
+        let page = r#"<p class="alert-error">Sem permissão <button>Fechar</button></p>
+            <ul class="errorlist"><li>Campo obrigatório.</li></ul>
+            <p class="errornote">Campo obrigatório.</p>"#;
+        assert_eq!(page_errors(page), ["Sem permissão", "Campo obrigatório."]);
+        assert!(page_errors("<p>ok</p>").is_empty());
+    }
+
+    #[tokio::test]
+    async fn adds_comments_and_internal_notes() {
+        let server = MockServer::start().await;
+        mount_text(&server, "GET", "/centralservicos/chamado/5/", THREAD_PAGE).await;
+        Mock::given(method("POST"))
+            .and(path("/centralservicos/adicionar_comentario/5/"))
+            .and(body_string_contains("csrfmiddlewaretoken=tok-comentario"))
+            .and(body_string_contains("texto=linha+1%0Alinha+2"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/centralservicos/adicionar_nota_interna/5/"))
+            .and(body_string_contains("csrfmiddlewaretoken=tok-nota"))
+            .and(body_string_contains("texto=nota+interna"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&server)
+            .await;
+        let (_dir, client) = client_for(&server).await;
+        let source = SuapTicketSource::new(&client, TicketQueue::Support);
+        source
+            .add_message("5", Message::Comment, "linha 1\nlinha 2\n")
+            .await
+            .unwrap();
+        source
+            .add_message("5", Message::InternalNote, "nota interna")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn add_message_reports_failures() {
+        let server = MockServer::start().await;
+        mount_text(&server, "GET", "/centralservicos/chamado/5/", THREAD_PAGE).await;
+        mount_text(
+            &server,
+            "GET",
+            "/centralservicos/chamado/6/",
+            "<p>sem formulários</p>",
+        )
+        .await;
+        mount_text(
+            &server,
+            "POST",
+            "/centralservicos/adicionar_comentario/5/",
+            r#"<ul class="errorlist"><li>Texto inválido.</li></ul>"#,
+        )
+        .await;
+        mount_text(
+            &server,
+            "POST",
+            "/centralservicos/adicionar_nota_interna/5/",
+            "<p class='alert-error'>Sem permissão</p>",
+        )
+        .await;
+        let (_dir, client) = client_for(&server).await;
+        let source = SuapTicketSource::new(&client, TicketQueue::Support);
+
+        let rejected = source
+            .add_message("5", Message::Comment, "x")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            rejected.to_string(),
+            "ticket source error: SUAP rejected the comment: Texto inválido."
+        );
+        let refused = source
+            .add_message("5", Message::InternalNote, "x")
+            .await
+            .unwrap_err();
+        assert!(refused
+            .to_string()
+            .contains("rejected the internal note: Sem permissão"));
+        let no_form = source
+            .add_message("6", Message::Comment, "x")
+            .await
+            .unwrap_err();
+        assert!(no_form.to_string().contains("ticket 6 has no comment form"));
+        let empty = source
+            .add_message("5", Message::Comment, " \n")
+            .await
+            .unwrap_err();
+        assert!(empty.to_string().contains("the comment text is empty"));
+        assert!(source
+            .add_message("x", Message::Comment, "x")
+            .await
+            .is_err());
+        let missing = source.add_message("404", Message::Comment, "x").await;
+        assert!(matches!(
+            missing,
+            Err(TicketError::Suap(SuapError::Transport(_)))
+        ));
     }
 
     #[test]
@@ -1082,7 +1314,8 @@ mod tests {
             details.timeline,
             [TimelineEntry {
                 date: "06/10/2026 19:15:03".to_owned(),
-                text: "Kelson comentou: Build pronto.".to_owned()
+                text: "Kelson comentou: Build pronto.\nSegunda linha.\n\nOutro parágrafo."
+                    .to_owned()
             }]
         );
         assert_eq!(

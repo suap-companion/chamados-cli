@@ -124,6 +124,17 @@ chamados title 559298 --remove           # remove
 
 O título tem uma única linha, de até 120 caracteres. Fica em `titles.json` no diretório de dados (`titles-<perfil>.json` nos demais perfis), com a hora de cada alteração e as remoções registradas, para permitir sincronização futura. Esse arquivo é dado seu: se estiver corrompido, o comando informa o erro em vez de descartá-lo.
 
+### Comentar e anotar um chamado
+
+```bash
+chamados comment 559298 -m "Já fiz o build da imagem base.
+Agora estou testando os plugins."          # comentário (visível ao interessado)
+chamados note 559298 -m "Senha do servidor está no cofre"   # nota interna (só a equipe de atendimento)
+cat comentario.txt | chamados comment 559298                # texto pela entrada padrão
+```
+
+O texto pode ter várias linhas e vem de `-m`, de `-m -` ou, se `-m` for omitido, da entrada padrão (nunca se espera digitação no terminal). O comando abre a página do chamado, usa o formulário que o SUAP oferece (com o token CSRF) e envia o texto; se o SUAP recusar (sem permissão, chamado fechado, texto inválido), mostra a mensagem dele. Confira o resultado com `chamados show <id>`.
+
 ### Ver detalhes de um chamado
 
 ```bash
