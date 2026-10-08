@@ -3,7 +3,10 @@ use std::fs;
 use suap_core::{AppPaths, SuapClient, SuapConfig, SuapError};
 use tempfile::tempdir;
 use url::Url;
-use wiremock::{matchers::{body_string_contains, header_regex, method, path}, Mock, MockServer, ResponseTemplate};
+use wiremock::{
+    matchers::{body_string_contains, header_regex, method, path},
+    Mock, MockServer, ResponseTemplate,
+};
 
 fn config(server: &MockServer) -> SuapConfig {
     SuapConfig {
@@ -43,7 +46,10 @@ async fn login_sends_csrf_credentials_and_persists_session_cookie() {
         .respond_with(
             ResponseTemplate::new(302)
                 .insert_header("location", "/")
-                .insert_header("set-cookie", "sessionid=authenticated; Path=/; Max-Age=3600"),
+                .insert_header(
+                    "set-cookie",
+                    "sessionid=authenticated; Path=/; Max-Age=3600",
+                ),
         )
         .mount(&server)
         .await;
@@ -121,9 +127,7 @@ async fn authenticated_check_rejects_login_redirect() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/"))
-        .respond_with(
-            ResponseTemplate::new(302).insert_header("location", "/accounts/login/"),
-        )
+        .respond_with(ResponseTemplate::new(302).insert_header("location", "/accounts/login/"))
         .mount(&server)
         .await;
 

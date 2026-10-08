@@ -1,6 +1,12 @@
 //! Shared SUAP configuration, authentication and persistent session primitives.
 
-use std::{collections::BTreeMap, fs, io::{BufReader, Write}, path::{Path, PathBuf}, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::{BufReader, Write},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use directories::{BaseDirs, ProjectDirs};
 use reqwest::{Client, StatusCode, Url};
@@ -34,11 +40,18 @@ impl AppPaths {
         let home = BaseDirs::new().ok_or(SuapError::DirectoriesUnavailable)?;
         let project = ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
             .ok_or(SuapError::DirectoriesUnavailable)?;
-        Ok(Self::from_dirs(config_dir_in(home.home_dir()), project.data_dir().to_path_buf()))
+        Ok(Self::from_dirs(
+            config_dir_in(home.home_dir()),
+            project.data_dir().to_path_buf(),
+        ))
     }
 
     pub fn from_dirs(config_dir: PathBuf, data_dir: PathBuf) -> Self {
-        Self { config_dir, data_dir, profile: DEFAULT_PROFILE.to_owned() }
+        Self {
+            config_dir,
+            data_dir,
+            profile: DEFAULT_PROFILE.to_owned(),
+        }
     }
 
     /// Selects the profile whose configuration and session these paths refer to.
@@ -48,18 +61,27 @@ impl AppPaths {
         Ok(self)
     }
 
-    pub fn profile(&self) -> &str { &self.profile }
+    pub fn profile(&self) -> &str {
+        &self.profile
+    }
 
-    pub fn config_dir(&self) -> &Path { &self.config_dir }
-    pub fn data_dir(&self) -> &Path { &self.data_dir }
-    pub fn config_file(&self) -> PathBuf { self.config_dir.join(CONFIG_FILE) }
+    pub fn config_dir(&self) -> &Path {
+        &self.config_dir
+    }
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+    pub fn config_file(&self) -> PathBuf {
+        self.config_dir.join(CONFIG_FILE)
+    }
 
     /// Session cookies of the selected profile (`session.cookies` for `default`, else `session-<profile>.cookies`).
     pub fn session_file(&self) -> PathBuf {
         if self.profile == DEFAULT_PROFILE {
             return self.data_dir.join(SESSION_FILE);
         }
-        self.data_dir.join(format!("session-{}.cookies", self.profile))
+        self.data_dir
+            .join(format!("session-{}.cookies", self.profile))
     }
 
     pub fn ensure_dirs(&self) -> Result<(), SuapError> {
@@ -70,7 +92,8 @@ impl AppPaths {
 }
 
 fn validate_profile(profile: &str) -> Result<(), SuapError> {
-    let allowed = |character: char| character.is_ascii_alphanumeric() || character == '-' || character == '_';
+    let allowed =
+        |character: char| character.is_ascii_alphanumeric() || character == '-' || character == '_';
     if !profile.is_empty() && profile.len() <= MAX_PROFILE_LEN && profile.chars().all(allowed) {
         return Ok(());
     }
@@ -81,7 +104,9 @@ fn validate_profile(profile: &str) -> Result<(), SuapError> {
 
 /// Directory holding `config.toml` for a given home directory (`<home>/.config/suap`).
 fn config_dir_in(home: &Path) -> PathBuf {
-    CONFIG_DIR_IN_HOME.iter().fold(home.to_path_buf(), |path, part| path.join(part))
+    CONFIG_DIR_IN_HOME
+        .iter()
+        .fold(home.to_path_buf(), |path, part| path.join(part))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -141,16 +166,27 @@ struct ConfigFile {
 impl ConfigFile {
     fn read(paths: &AppPaths) -> Result<Self, SuapError> {
         let path = paths.config_file();
-        if !path.exists() { return Ok(Self::default()); }
+        if !path.exists() {
+            return Ok(Self::default());
+        }
         Ok(toml::from_str(&fs::read_to_string(path)?)?)
     }
 
     /// Moves the pre-profiles top-level keys into the `default` profile (unless it already exists).
     fn migrate_legacy(&mut self) {
         let (base_url, username) = (self.base_url.take(), self.username.take());
-        if (base_url.is_some() || username.is_some()) && !self.profiles.contains_key(DEFAULT_PROFILE) {
+        if (base_url.is_some() || username.is_some())
+            && !self.profiles.contains_key(DEFAULT_PROFILE)
+        {
             let base_url = base_url.unwrap_or_else(|| SuapConfig::default().base_url);
-            self.profiles.insert(DEFAULT_PROFILE.to_owned(), SuapConfig { base_url, username, ..SuapConfig::default() });
+            self.profiles.insert(
+                DEFAULT_PROFILE.to_owned(),
+                SuapConfig {
+                    base_url,
+                    username,
+                    ..SuapConfig::default()
+                },
+            );
         }
     }
 }
@@ -160,7 +196,9 @@ pub fn load_config(paths: &AppPaths) -> Result<Option<SuapConfig>, SuapError> {
     let mut file = ConfigFile::read(paths)?;
     file.migrate_legacy();
     let config = file.profiles.remove(paths.profile());
-    if let Some(config) = &config { validate_config(config)?; }
+    if let Some(config) = &config {
+        validate_config(config)?;
+    }
     Ok(config)
 }
 
@@ -169,7 +207,8 @@ pub fn save_config(paths: &AppPaths, config: &SuapConfig) -> Result<(), SuapErro
     validate_config(config)?;
     let mut file = ConfigFile::read(paths)?;
     file.migrate_legacy();
-    file.profiles.insert(paths.profile().to_owned(), config.clone());
+    file.profiles
+        .insert(paths.profile().to_owned(), config.clone());
     paths.ensure_dirs()?;
     let temporary = paths.config_file().with_extension("toml.tmp");
     fs::write(&temporary, toml::to_string_pretty(&file)?)?;
@@ -196,22 +235,33 @@ impl SessionStore {
     pub fn open(path: PathBuf) -> Result<Self, SuapError> {
         let cookies = if path.exists() {
             // Sessions are disposable: a file in an older or unreadable format is dropped (log in again).
-            cookie_store::serde::json::load(BufReader::new(fs::File::open(&path)?)).unwrap_or_default()
+            cookie_store::serde::json::load(BufReader::new(fs::File::open(&path)?))
+                .unwrap_or_default()
         } else {
             CookieStore::default()
         };
-        Ok(Self { path, cookies: Arc::new(CookieStoreMutex::new(cookies)) })
+        Ok(Self {
+            path,
+            cookies: Arc::new(CookieStoreMutex::new(cookies)),
+        })
     }
 
-    pub fn cookie_provider(&self) -> Arc<CookieStoreMutex> { Arc::clone(&self.cookies) }
+    pub fn cookie_provider(&self) -> Arc<CookieStoreMutex> {
+        Arc::clone(&self.cookies)
+    }
 
     pub async fn save(&self) -> Result<(), SuapError> {
-        let parent = self.path.parent().ok_or_else(|| SuapError::InvalidConfiguration("session path has no parent directory".to_owned()))?;
+        let parent = self.path.parent().ok_or_else(|| {
+            SuapError::InvalidConfiguration("session path has no parent directory".to_owned())
+        })?;
         fs::create_dir_all(parent)?;
         let temporary = self.path.with_extension("cookies.tmp");
         let file = fs::File::create(&temporary)?;
         let mut writer = std::io::BufWriter::new(file);
-        let cookies = self.cookies.lock().map_err(|_| SuapError::CookieStore("cookie store lock poisoned".to_owned()))?;
+        let cookies = self
+            .cookies
+            .lock()
+            .map_err(|_| SuapError::CookieStore("cookie store lock poisoned".to_owned()))?;
         cookie_store::serde::json::save(&cookies, &mut writer)?;
         drop(cookies);
         writer.flush()?;
@@ -220,7 +270,9 @@ impl SessionStore {
         Ok(())
     }
 
-    pub fn path(&self) -> &Path { &self.path }
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 /// Result of submitting a form: the path reached after redirects and the page body.
@@ -239,12 +291,20 @@ pub struct FormFile {
 }
 
 async fn form_response(response: reqwest::Response) -> Result<FormResponse, SuapError> {
-    if response.url().path() == LOGIN_PATH { return Err(SuapError::NotAuthenticated); }
+    if response.url().path() == LOGIN_PATH {
+        return Err(SuapError::NotAuthenticated);
+    }
     if !response.status().is_success() {
-        return Err(SuapError::Transport(format!("unexpected status {}", response.status())));
+        return Err(SuapError::Transport(format!(
+            "unexpected status {}",
+            response.status()
+        )));
     }
     let final_path = response.url().path().to_owned();
-    Ok(FormResponse { path: final_path, body: response.text().await? })
+    Ok(FormResponse {
+        path: final_path,
+        body: response.text().await?,
+    })
 }
 
 pub struct SuapClient {
@@ -260,21 +320,33 @@ impl SuapClient {
             .cookie_provider(session.cookie_provider())
             .redirect(reqwest::redirect::Policy::limited(10));
         let client = builder.build()?;
-        Ok(Self { client, session, base_url: config.base_url.clone() })
+        Ok(Self {
+            client,
+            session,
+            base_url: config.base_url.clone(),
+        })
     }
 
     pub async fn login(&self, username: &str, password: &str) -> Result<(), SuapError> {
         let login_url = self.base_url.join(LOGIN_PATH)?;
         let page = self.client.get(login_url.clone()).send().await?;
-        if !page.status().is_success() { return Err(SuapError::AuthenticationFailed); }
+        if !page.status().is_success() {
+            return Err(SuapError::AuthenticationFailed);
+        }
         let html = page.text().await?;
         let csrf = extract_csrf_token(&html)?;
-        let response = self.client.post(login_url).form(&[
-            ("username", username),
-            ("password", password),
-            ("csrfmiddlewaretoken", csrf.as_str()),
-            ("next", "/"),
-        ]).header("Referer", self.base_url.as_str()).send().await?;
+        let response = self
+            .client
+            .post(login_url)
+            .form(&[
+                ("username", username),
+                ("password", password),
+                ("csrfmiddlewaretoken", csrf.as_str()),
+                ("next", "/"),
+            ])
+            .header("Referer", self.base_url.as_str())
+            .send()
+            .await?;
         if response.status() == StatusCode::UNAUTHORIZED || response.url().path() == LOGIN_PATH {
             return Err(SuapError::AuthenticationFailed);
         }
@@ -294,9 +366,14 @@ impl SuapClient {
     /// Fails with [`SuapError::NotAuthenticated`] when SUAP redirects to the login page.
     pub async fn fetch_page(&self, path: &str) -> Result<String, SuapError> {
         let response = self.client.get(self.base_url.join(path)?).send().await?;
-        if response.url().path() == LOGIN_PATH { return Err(SuapError::NotAuthenticated); }
+        if response.url().path() == LOGIN_PATH {
+            return Err(SuapError::NotAuthenticated);
+        }
         if !response.status().is_success() {
-            return Err(SuapError::Transport(format!("unexpected status {}", response.status())));
+            return Err(SuapError::Transport(format!(
+                "unexpected status {}",
+                response.status()
+            )));
         }
         Ok(response.text().await?)
     }
@@ -304,9 +381,19 @@ impl SuapClient {
     /// Posts `fields` as a form to `path` and returns where SUAP ended up after redirects.
     ///
     /// Fails with [`SuapError::NotAuthenticated`] when SUAP redirects to the login page.
-    pub async fn submit_form(&self, path: &str, fields: &[(String, String)]) -> Result<FormResponse, SuapError> {
+    pub async fn submit_form(
+        &self,
+        path: &str,
+        fields: &[(String, String)],
+    ) -> Result<FormResponse, SuapError> {
         let url = self.base_url.join(path)?;
-        let response = self.client.post(url.clone()).form(fields).header("Referer", url.as_str()).send().await?;
+        let response = self
+            .client
+            .post(url.clone())
+            .form(fields)
+            .header("Referer", url.as_str())
+            .send()
+            .await?;
         form_response(response).await
     }
 
@@ -323,22 +410,37 @@ impl SuapClient {
             form = form.text(name.clone(), value.clone());
         }
         for file in files {
-            let part = reqwest::multipart::Part::bytes(file.bytes.clone()).file_name(file.file_name.clone());
+            let part = reqwest::multipart::Part::bytes(file.bytes.clone())
+                .file_name(file.file_name.clone());
             form = form.part(file.field.clone(), part);
         }
-        let response = self.client.post(url.clone()).multipart(form).header("Referer", url.as_str()).send().await?;
+        let response = self
+            .client
+            .post(url.clone())
+            .multipart(form)
+            .header("Referer", url.as_str())
+            .send()
+            .await?;
         form_response(response).await
     }
 
-    pub fn base_url(&self) -> &Url { &self.base_url }
-    pub fn http_client(&self) -> &Client { &self.client }
-    pub fn session(&self) -> &SessionStore { &self.session }
+    pub fn base_url(&self) -> &Url {
+        &self.base_url
+    }
+    pub fn http_client(&self) -> &Client {
+        &self.client
+    }
+    pub fn session(&self) -> &SessionStore {
+        &self.session
+    }
 }
 
 fn extract_csrf_token(html: &str) -> Result<String, SuapError> {
     let document = Html::parse_document(html);
-    let selector = Selector::parse("input[name=csrfmiddlewaretoken]").expect("static selector is valid");
-    document.select(&selector)
+    let selector =
+        Selector::parse("input[name=csrfmiddlewaretoken]").expect("static selector is valid");
+    document
+        .select(&selector)
         .next()
         .and_then(|element| element.value().attr("value"))
         .map(str::to_owned)
@@ -385,25 +487,37 @@ pub enum SuapError {
 }
 
 impl From<Box<dyn std::error::Error + Send + Sync>> for SuapError {
-    fn from(error: Box<dyn std::error::Error + Send + Sync>) -> Self { Self::CookieStore(error.to_string()) }
+    fn from(error: Box<dyn std::error::Error + Send + Sync>) -> Self {
+        Self::CookieStore(error.to_string())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::{tempdir, TempDir};
-    use wiremock::{matchers::{body_string_contains, method, path}, Mock, MockServer, ResponseTemplate};
+    use wiremock::{
+        matchers::{body_string_contains, method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
 
-    const LOGIN_FORM: &str = r#"<form><input type="hidden" name="csrfmiddlewaretoken" value="tok"></form>"#;
+    const LOGIN_FORM: &str =
+        r#"<form><input type="hidden" name="csrfmiddlewaretoken" value="tok"></form>"#;
 
     fn paths() -> (TempDir, AppPaths) {
         let directory = tempdir().unwrap();
-        let paths = AppPaths::from_dirs(directory.path().join("config"), directory.path().join("data"));
+        let paths = AppPaths::from_dirs(
+            directory.path().join("config"),
+            directory.path().join("data"),
+        );
         (directory, paths)
     }
 
     fn config_for(server: &MockServer) -> SuapConfig {
-        SuapConfig { base_url: Url::parse(&format!("{}/", server.uri())).unwrap(), ..SuapConfig::default() }
+        SuapConfig {
+            base_url: Url::parse(&format!("{}/", server.uri())).unwrap(),
+            ..SuapConfig::default()
+        }
     }
 
     async fn mount_login_page(server: &MockServer) {
@@ -416,7 +530,8 @@ mod tests {
 
     #[test]
     fn extracts_csrf_token_from_form() {
-        let html = r#"<form><input type="hidden" name="csrfmiddlewaretoken" value="abc123"></form>"#;
+        let html =
+            r#"<form><input type="hidden" name="csrfmiddlewaretoken" value="abc123"></form>"#;
         assert_eq!(extract_csrf_token(html).unwrap(), "abc123");
     }
 
@@ -443,14 +558,19 @@ mod tests {
         let home = Path::new("home").join("kelson");
         assert_eq!(config_dir_in(&home), home.join(".config").join("suap"));
         let paths = AppPaths::discover().expect("home directory is available");
-        assert!(paths.config_dir().ends_with(Path::new(".config").join("suap")));
+        assert!(paths
+            .config_dir()
+            .ends_with(Path::new(".config").join("suap")));
     }
 
     #[test]
     fn config_round_trip_and_defaults() {
         let (_dir, paths) = paths();
         assert_eq!(load_config(&paths).unwrap(), None);
-        let config = SuapConfig { username: Some("kelson".to_owned()), ..SuapConfig::default() };
+        let config = SuapConfig {
+            username: Some("kelson".to_owned()),
+            ..SuapConfig::default()
+        };
         save_config(&paths, &config).unwrap();
         assert_eq!(load_config(&paths).unwrap(), Some(config));
     }
@@ -459,11 +579,20 @@ mod tests {
     fn profiles_have_separate_configuration_and_sessions() {
         let (_dir, default_paths) = paths();
         let local_paths = default_paths.clone().with_profile("local-1").unwrap();
-        assert_eq!((default_paths.profile(), local_paths.profile()), (DEFAULT_PROFILE, "local-1"));
+        assert_eq!(
+            (default_paths.profile(), local_paths.profile()),
+            (DEFAULT_PROFILE, "local-1")
+        );
         assert!(default_paths.session_file().ends_with("session.cookies"));
-        assert!(local_paths.session_file().ends_with("session-local-1.cookies"));
+        assert!(local_paths
+            .session_file()
+            .ends_with("session-local-1.cookies"));
 
-        let local = SuapConfig { base_url: Url::parse("http://localhost:8000/").unwrap(), username: Some("dev".to_owned()), ..SuapConfig::default() };
+        let local = SuapConfig {
+            base_url: Url::parse("http://localhost:8000/").unwrap(),
+            username: Some("dev".to_owned()),
+            ..SuapConfig::default()
+        };
         save_config(&local_paths, &local).unwrap();
         assert_eq!(load_config(&default_paths).unwrap(), None);
         let production = SuapConfig::default();
@@ -476,7 +605,9 @@ mod tests {
     fn rejects_invalid_profile_names() {
         for name in ["", "a b", "../x", "ç", &"a".repeat(MAX_PROFILE_LEN + 1)] {
             let (_dir, paths) = paths();
-            assert!(matches!(paths.with_profile(name), Err(SuapError::InvalidConfiguration(_))), "{name:?}");
+            let result = paths.with_profile(name);
+            let rejected = matches!(result, Err(SuapError::InvalidConfiguration(_)));
+            assert!(rejected, "{name:?}");
         }
     }
 
@@ -484,13 +615,23 @@ mod tests {
     fn legacy_flat_config_is_the_default_profile_and_is_migrated_on_save() {
         let (_dir, paths) = paths();
         paths.ensure_dirs().unwrap();
-        fs::write(paths.config_file(), "base_url = \"https://legacy.example/\"\nusername = \"antigo\"\n").unwrap();
+        fs::write(
+            paths.config_file(),
+            "base_url = \"https://legacy.example/\"\nusername = \"antigo\"\n",
+        )
+        .unwrap();
         let legacy = load_config(&paths).unwrap().unwrap();
-        assert_eq!((legacy.base_url.as_str(), legacy.username.as_deref()), ("https://legacy.example/", Some("antigo")));
+        assert_eq!(
+            (legacy.base_url.as_str(), legacy.username.as_deref()),
+            ("https://legacy.example/", Some("antigo"))
+        );
         let other = paths.clone().with_profile("other").unwrap();
         assert_eq!(load_config(&other).unwrap(), None);
 
-        let other_config = SuapConfig { username: Some("novo".to_owned()), ..SuapConfig::default() };
+        let other_config = SuapConfig {
+            username: Some("novo".to_owned()),
+            ..SuapConfig::default()
+        };
         save_config(&other, &other_config).unwrap();
         let saved = fs::read_to_string(paths.config_file()).unwrap();
         assert!(saved.contains("[profiles.default]") && saved.contains("[profiles.other]"));
@@ -504,7 +645,10 @@ mod tests {
         paths.ensure_dirs().unwrap();
         fs::write(paths.config_file(), "username = \"so-usuario\"\n").unwrap();
         let config = load_config(&paths).unwrap().unwrap();
-        assert_eq!((config.base_url, config.username.as_deref()), (SuapConfig::default().base_url, Some("so-usuario")));
+        assert_eq!(
+            (config.base_url, config.username.as_deref()),
+            (SuapConfig::default().base_url, Some("so-usuario"))
+        );
 
         fs::write(
             paths.config_file(),
@@ -512,21 +656,33 @@ mod tests {
         )
         .unwrap();
         let config = load_config(&paths).unwrap().unwrap();
-        assert_eq!((config.base_url.as_str(), config.username), ("https://novo.example/", None));
+        assert_eq!(
+            (config.base_url.as_str(), config.username),
+            ("https://novo.example/", None)
+        );
     }
 
     #[test]
     fn config_rejects_invalid_scheme_and_toml() {
         let (_dir, paths) = paths();
-        let bad = SuapConfig { base_url: Url::parse("ftp://example.org/").unwrap(), ..SuapConfig::default() };
-        assert!(matches!(save_config(&paths, &bad), Err(SuapError::InvalidConfiguration(_))));
+        let bad = SuapConfig {
+            base_url: Url::parse("ftp://example.org/").unwrap(),
+            ..SuapConfig::default()
+        };
+        assert!(matches!(
+            save_config(&paths, &bad),
+            Err(SuapError::InvalidConfiguration(_))
+        ));
 
         paths.ensure_dirs().unwrap();
         fs::write(paths.config_file(), "base_url = [").unwrap();
         assert!(matches!(load_config(&paths), Err(SuapError::TomlDe(_))));
 
         fs::write(paths.config_file(), "base_url = \"ftp://example.org/\"").unwrap();
-        assert!(matches!(load_config(&paths), Err(SuapError::InvalidConfiguration(_))));
+        assert!(matches!(
+            load_config(&paths),
+            Err(SuapError::InvalidConfiguration(_))
+        ));
     }
 
     #[tokio::test]
@@ -535,11 +691,21 @@ mod tests {
         let store = SessionStore::open(paths.session_file()).unwrap();
         assert_eq!(store.path(), paths.session_file());
         let url = Url::parse("https://suap.example/").unwrap();
-        store.cookie_provider().lock().unwrap().parse("sessionid=1; Max-Age=3600", &url).unwrap();
+        store
+            .cookie_provider()
+            .lock()
+            .unwrap()
+            .parse("sessionid=1; Max-Age=3600", &url)
+            .unwrap();
         store.save().await.unwrap();
 
         let reloaded = SessionStore::open(paths.session_file()).unwrap();
-        assert!(reloaded.cookie_provider().lock().unwrap().get("suap.example", "/", "sessionid").is_some());
+        assert!(reloaded
+            .cookie_provider()
+            .lock()
+            .unwrap()
+            .get("suap.example", "/", "sessionid")
+            .is_some());
     }
 
     #[test]
@@ -551,14 +717,22 @@ mod tests {
         for content in ["not json", legacy] {
             fs::write(paths.session_file(), content).unwrap();
             let store = SessionStore::open(paths.session_file()).unwrap();
-            assert!(store.cookie_provider().lock().unwrap().get("suap.example", "/", "sessionid").is_none());
+            assert!(store
+                .cookie_provider()
+                .lock()
+                .unwrap()
+                .get("suap.example", "/", "sessionid")
+                .is_none());
         }
     }
 
     #[tokio::test]
     async fn session_save_requires_parent_directory() {
         let store = SessionStore::open(PathBuf::new()).unwrap();
-        assert!(matches!(store.save().await, Err(SuapError::InvalidConfiguration(_))));
+        assert!(matches!(
+            store.save().await,
+            Err(SuapError::InvalidConfiguration(_))
+        ));
     }
 
     #[tokio::test]
@@ -577,10 +751,16 @@ mod tests {
     #[tokio::test]
     async fn login_fails_when_login_page_is_unavailable() {
         let server = MockServer::start().await;
-        Mock::given(method("GET")).respond_with(ResponseTemplate::new(500)).mount(&server).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
         let (_dir, paths) = paths();
         let client = SuapClient::open(&paths, &config_for(&server)).unwrap();
-        assert!(matches!(client.login("u", "p").await, Err(SuapError::AuthenticationFailed)));
+        assert!(matches!(
+            client.login("u", "p").await,
+            Err(SuapError::AuthenticationFailed)
+        ));
         let _ = (client.http_client(), client.session());
     }
 
@@ -589,10 +769,16 @@ mod tests {
         for status in [401, 500] {
             let server = MockServer::start().await;
             mount_login_page(&server).await;
-            Mock::given(method("POST")).respond_with(ResponseTemplate::new(status)).mount(&server).await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
             let (_dir, paths) = paths();
             let client = SuapClient::open(&paths, &config_for(&server)).unwrap();
-            assert!(matches!(client.login("u", "p").await, Err(SuapError::AuthenticationFailed)));
+            assert!(matches!(
+                client.login("u", "p").await,
+                Err(SuapError::AuthenticationFailed)
+            ));
         }
     }
 
@@ -604,7 +790,11 @@ mod tests {
             .respond_with(ResponseTemplate::new(302).insert_header("location", "/"))
             .mount(&server)
             .await;
-        Mock::given(method("GET")).and(path("/")).respond_with(ResponseTemplate::new(200)).mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
         let (_dir, paths) = paths();
         let client = SuapClient::open(&paths, &config_for(&server)).unwrap();
         client.login("u", "p").await.unwrap();
@@ -620,25 +810,42 @@ mod tests {
             .respond_with(ResponseTemplate::new(302).insert_header("location", "/"))
             .mount(&server)
             .await;
-        Mock::given(method("GET")).and(path("/")).respond_with(ResponseTemplate::new(500)).mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
         let (_dir, paths) = paths();
         let client = SuapClient::open(&paths, &config_for(&server)).unwrap();
-        assert!(matches!(client.login("u", "p").await, Err(SuapError::AuthenticationFailed)));
+        assert!(matches!(
+            client.login("u", "p").await,
+            Err(SuapError::AuthenticationFailed)
+        ));
     }
 
     #[tokio::test]
     async fn login_fails_without_csrf_token() {
         let server = MockServer::start().await;
-        Mock::given(method("GET")).respond_with(ResponseTemplate::new(200).set_body_string("<form></form>")).mount(&server).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<form></form>"))
+            .mount(&server)
+            .await;
         let (_dir, paths) = paths();
         let client = SuapClient::open(&paths, &config_for(&server)).unwrap();
-        assert!(matches!(client.login("u", "p").await, Err(SuapError::Parse(_))));
+        assert!(matches!(
+            client.login("u", "p").await,
+            Err(SuapError::Parse(_))
+        ));
     }
 
     #[tokio::test]
     async fn is_authenticated_reflects_response_status() {
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/")).respond_with(ResponseTemplate::new(403)).mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
         let (_dir, paths) = paths();
         let client = SuapClient::open(&paths, &config_for(&server)).unwrap();
         assert!(!client.is_authenticated().await.unwrap());
@@ -647,20 +854,38 @@ mod tests {
     #[tokio::test]
     async fn fetch_page_returns_body_and_maps_failures() {
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/ok/")).respond_with(ResponseTemplate::new(200).set_body_string("corpo")).mount(&server).await;
-        Mock::given(method("GET")).and(path("/erro/")).respond_with(ResponseTemplate::new(500)).mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/ok/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("corpo"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/erro/"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
         Mock::given(method("GET"))
             .and(path("/protegido/"))
             .respond_with(ResponseTemplate::new(302).insert_header("location", LOGIN_PATH))
             .mount(&server)
             .await;
-        Mock::given(method("GET")).and(path(LOGIN_PATH)).respond_with(ResponseTemplate::new(200)).mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path(LOGIN_PATH))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
         let (_dir, paths) = paths();
         let client = SuapClient::open(&paths, &config_for(&server)).unwrap();
         assert_eq!(client.base_url().as_str(), format!("{}/", server.uri()));
         assert_eq!(client.fetch_page("/ok/").await.unwrap(), "corpo");
-        assert!(matches!(client.fetch_page("/erro/").await, Err(SuapError::Transport(_))));
-        assert!(matches!(client.fetch_page("/protegido/").await, Err(SuapError::NotAuthenticated)));
+        assert!(matches!(
+            client.fetch_page("/erro/").await,
+            Err(SuapError::Transport(_))
+        ));
+        assert!(matches!(
+            client.fetch_page("/protegido/").await,
+            Err(SuapError::NotAuthenticated)
+        ));
     }
 
     #[tokio::test]
@@ -671,21 +896,45 @@ mod tests {
             .respond_with(ResponseTemplate::new(302).insert_header("location", "/destino/"))
             .mount(&server)
             .await;
-        Mock::given(method("GET")).and(path("/destino/")).respond_with(ResponseTemplate::new(200).set_body_string("fim")).mount(&server).await;
-        Mock::given(method("POST")).and(path("/erro/")).respond_with(ResponseTemplate::new(500)).mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/destino/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("fim"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/erro/"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
         Mock::given(method("POST"))
             .and(path("/protegido/"))
             .respond_with(ResponseTemplate::new(302).insert_header("location", LOGIN_PATH))
             .mount(&server)
             .await;
-        Mock::given(method("GET")).and(path(LOGIN_PATH)).respond_with(ResponseTemplate::new(200)).mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path(LOGIN_PATH))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
         let (_dir, paths) = paths();
         let client = SuapClient::open(&paths, &config_for(&server)).unwrap();
         let fields = [("a".to_owned(), "1".to_owned())];
         let response = client.submit_form("/ok/", &fields).await.unwrap();
-        assert_eq!(response, FormResponse { path: "/destino/".to_owned(), body: "fim".to_owned() });
-        assert!(matches!(client.submit_form("/erro/", &fields).await, Err(SuapError::Transport(_))));
-        assert!(matches!(client.submit_form("/protegido/", &fields).await, Err(SuapError::NotAuthenticated)));
+        assert_eq!(
+            response,
+            FormResponse {
+                path: "/destino/".to_owned(),
+                body: "fim".to_owned()
+            }
+        );
+        assert!(matches!(
+            client.submit_form("/erro/", &fields).await,
+            Err(SuapError::Transport(_))
+        ));
+        assert!(matches!(
+            client.submit_form("/protegido/", &fields).await,
+            Err(SuapError::NotAuthenticated)
+        ));
     }
 
     #[tokio::test]
@@ -699,14 +948,34 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_string("recebido"))
             .mount(&server)
             .await;
-        Mock::given(method("POST")).and(path("/erro/")).respond_with(ResponseTemplate::new(500)).mount(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/erro/"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
         let (_dir, paths) = paths();
         let client = SuapClient::open(&paths, &config_for(&server)).unwrap();
         let fields = [("campo".to_owned(), "valor".to_owned())];
-        let files = [FormFile { field: "arquivo".to_owned(), file_name: "a.pdf".to_owned(), bytes: b"conteudo".to_vec() }];
-        let response = client.submit_multipart("/upload/", &fields, &files).await.unwrap();
-        assert_eq!(response, FormResponse { path: "/upload/".to_owned(), body: "recebido".to_owned() });
-        assert!(matches!(client.submit_multipart("/erro/", &fields, &files).await, Err(SuapError::Transport(_))));
+        let files = [FormFile {
+            field: "arquivo".to_owned(),
+            file_name: "a.pdf".to_owned(),
+            bytes: b"conteudo".to_vec(),
+        }];
+        let response = client
+            .submit_multipart("/upload/", &fields, &files)
+            .await
+            .unwrap();
+        assert_eq!(
+            response,
+            FormResponse {
+                path: "/upload/".to_owned(),
+                body: "recebido".to_owned()
+            }
+        );
+        assert!(matches!(
+            client.submit_multipart("/erro/", &fields, &files).await,
+            Err(SuapError::Transport(_))
+        ));
     }
 
     #[test]
@@ -714,7 +983,9 @@ mod tests {
         let (_dir, paths) = paths();
         let plain = SuapConfig::default();
         save_config(&paths, &plain).unwrap();
-        assert!(!fs::read_to_string(paths.config_file()).unwrap().contains("open"));
+        assert!(!fs::read_to_string(paths.config_file())
+            .unwrap()
+            .contains("open"));
 
         let defaults = OpenDefaults {
             service: Some(7),
@@ -722,16 +993,24 @@ mod tests {
             campus: Some("2".to_owned()),
             center: Some("3".to_owned()),
         };
-        let config = SuapConfig { open: defaults, ..plain };
+        let config = SuapConfig {
+            open: defaults,
+            ..plain
+        };
         save_config(&paths, &config).unwrap();
-        assert!(fs::read_to_string(paths.config_file()).unwrap().contains("[profiles.default.open]"));
+        assert!(fs::read_to_string(paths.config_file())
+            .unwrap()
+            .contains("[profiles.default.open]"));
         assert_eq!(load_config(&paths).unwrap(), Some(config));
     }
 
     #[test]
     fn errors_convert_and_display() {
         let boxed: Box<dyn std::error::Error + Send + Sync> = "boom".into();
-        assert_eq!(SuapError::from(boxed).to_string(), "cookie store error: boom");
+        assert_eq!(
+            SuapError::from(boxed).to_string(),
+            "cookie store error: boom"
+        );
         for error in [
             SuapError::DirectoriesUnavailable,
             SuapError::NotAuthenticated,
