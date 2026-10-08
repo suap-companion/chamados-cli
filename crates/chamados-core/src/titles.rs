@@ -23,8 +23,17 @@ pub const MAX_TITLE_CHARS: usize = 120;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TitleEntry {
     pub title: Option<String>,
-    /// Unix time (seconds) of the last change.
+    /// Unix time in milliseconds of the last change (versions before 0.13 stored seconds).
     pub updated_at: u64,
+}
+
+impl TitleEntry {
+    /// Whether this entry should replace `other` when merging two copies: the later change wins, and
+    /// at the same time a title wins over a removal and then the greater text wins (a total order, so
+    /// merging does not depend on which copy is which).
+    pub fn newer_than(&self, other: &Self) -> bool {
+        (self.updated_at, &self.title) > (other.updated_at, &other.title)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -79,6 +88,28 @@ impl TitleStore {
             entries = file.tickets;
         }
         Ok(Self { path, entries })
+    }
+
+    /// Every entry, including removals (tombstones).
+    pub fn entries(&self) -> &BTreeMap<String, TitleEntry> {
+        &self.entries
+    }
+
+    /// Takes `entry` (from another copy of the titles) if it is newer than what is stored; returns
+    /// whether anything changed. The id and the title are validated, since they may come from the cloud.
+    pub fn merge_entry(&mut self, id: &str, entry: &TitleEntry) -> Result<bool, TicketError> {
+        check_ticket_id(id)?;
+        if let Some(title) = &entry.title {
+            validate_title(title)?;
+        }
+        let newer = self
+            .entries
+            .get(id)
+            .is_none_or(|current| entry.newer_than(current));
+        if newer {
+            self.entries.insert(id.to_owned(), entry.clone());
+        }
+        Ok(newer)
     }
 
     /// The local title of ticket `id`, if it has one.
@@ -175,6 +206,30 @@ mod tests {
         let saved = fs::read_to_string(&path).unwrap();
         assert!(saved.contains("\"updated_at\": 13") && saved.contains("\"version\": 1"));
         assert!(!path.with_extension("json.tmp").exists());
+    }
+
+    #[test]
+    fn merges_entries_from_another_copy_by_age_and_validates_them() {
+        let directory = tempdir().unwrap();
+        let mut store = TitleStore::open(directory.path().join("titles.json")).unwrap();
+        let entry = |title: Option<&str>, updated_at: u64| TitleEntry {
+            title: title.map(str::to_owned),
+            updated_at,
+        };
+        assert!(store.merge_entry("1", &entry(Some("novo"), 5)).unwrap());
+        assert!(!store.merge_entry("1", &entry(Some("novo"), 5)).unwrap());
+        assert!(!store.merge_entry("1", &entry(Some("velho"), 4)).unwrap());
+        assert!(store.merge_entry("1", &entry(None, 6)).unwrap());
+        assert_eq!(store.get("1"), None);
+        assert!(store.entries().contains_key("1"));
+        assert!(store.merge_entry("1", &entry(Some("de volta"), 7)).unwrap());
+        // Ties: a title beats a removal, and the greater text beats the smaller.
+        assert!(!entry(None, 7).newer_than(&entry(Some("de volta"), 7)));
+        assert!(entry(Some("b"), 7).newer_than(&entry(Some("a"), 7)));
+        assert_eq!(store.get("1"), Some("de volta"));
+
+        assert!(store.merge_entry("../1", &entry(Some("x"), 1)).is_err());
+        assert!(store.merge_entry("2", &entry(Some("a\nb"), 1)).is_err());
     }
 
     #[test]
