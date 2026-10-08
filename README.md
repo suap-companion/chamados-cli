@@ -38,6 +38,18 @@ Consulte a configuração sem exibir senha:
 cargo run -p chamados-cli -- config-show
 ```
 
+### Perfis (ambientes)
+
+Use `--profile <nome>` para manter vários ambientes (por exemplo, produção e um SUAP local) com configuração e sessão separadas. Sem a flag, vale o perfil `default`, e o `config-init` sem perfil grava o `default`. A flag funciona antes ou depois do subcomando:
+
+```bash
+chamados config-init --profile local --base-url http://localhost:8000 --username 2080882
+chamados --profile local login
+chamados list --profile local
+```
+
+Um perfil diferente de `default` precisa ser criado com `config-init` antes de ser usado. A configuração fica em `[profiles.<nome>]` no `config.toml` (um `config.toml` antigo, sem perfis, vale como o perfil `default`), e a sessão do `default` continua em `session.cookies`, enquanto a dos demais fica em `session-<nome>.cookies`.
+
 ### Login
 
 A senha nunca é persistida nem passada por argumento: o comando `login` a lê da variável de ambiente `SUAP_PASSWORD`. O usuário vem de `--username` ou, se omitido, do `username` da configuração local.
