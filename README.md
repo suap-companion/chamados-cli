@@ -74,11 +74,20 @@ Se a sessão estiver ausente ou expirada, o comando orienta a executar `chamados
 
 ### Abrir um chamado
 
+Guarde os padrões no perfil uma vez e abra chamados só com a descrição:
+
 ```bash
-cargo run -p chamados-cli -- open 53 --interested 1 --description "Não consigo acessar as bibliotecas virtuais"
+chamados config-init --service 53 --interested 1            # padrões do perfil (campus/centro também: --campus, --center)
+chamados open -d "Não consigo acessar as bibliotecas virtuais"
 ```
 
-`53` é o número do serviço no SUAP (o mesmo de `/centralservicos/abrir_chamado/53/`). O campus padrão é o do usuário e o centro de atendimento padrão é o único disponível para o campus; se houver vários, o comando lista as opções e pede `--center`. Outros campos do formulário podem ser enviados com `--field NOME=VALOR` (ex.: `--field patrimonio=123`), e `--campus` e `--center` sobrescrevem os padrões. `--interested` (id do vínculo da pessoa interessada, que o formulário do SUAP exige) é obrigatório.
+- **Serviço e interessado:** `53` é o número do serviço no SUAP (o mesmo de `/centralservicos/abrir_chamado/53/`) e `--interested` é o id do vínculo da pessoa interessada, que o formulário do SUAP exige. Podem vir do perfil (`config-init --service/--interested`) ou ser passados no comando (`chamados open 53 --interested 1 ...`), e o que vier no comando prevalece.
+- **Campus e centro de atendimento:** por padrão o do perfil; sem isso, o campus do usuário e o único centro disponível (se houver vários, o comando lista as opções e pede `--center`).
+- **Texto de várias linhas e entrada padrão:** `-d` aceita texto com quebras de linha. Com `-d -`, ou sem `-d`, a descrição é lida da entrada padrão: `cat descricao.txt | chamados open` (no PowerShell: `Get-Content descricao.txt | chamados open`).
+- **Anexos:** `-a arquivo.pdf` (repetível, no máximo 3). O SUAP só aceita `xlsx`, `xls`, `csv`, `docx`, `doc`, `pdf`, `jpg`, `jpeg` e `png`; o comando recusa outros tipos antes de enviar. O serviço precisa permitir anexos.
+- **Cópia por e-mail:** a opção "Enviar cópia de abertura deste chamado para os interessados?" vai marcada por padrão; use `--no-email-copy` para desmarcar.
+- **Assumir e atender:** `--assume` atribui o chamado a você logo após abrir; `--start` também o coloca em atendimento (implica `--assume`). Se um desses passos falhar, o chamado já foi aberto e o erro informa o número.
+- **Outros campos:** `--field NOME=VALOR` (ex.: `--field patrimonio=123`) e `--campus`/`--center` sobrescrevem os padrões.
 
 ### Ver detalhes de um chamado
 
@@ -93,7 +102,7 @@ Exibe título, situação, serviço, URL, dados do interessado, descrição e a 
 Para testar `open`, `list` e `show` sem tocar na produção, suba um SUAP local e rode o seed da Central de Serviços (idempotente; cria campus, servidor de teste, catálogo e grupo de atendimento). **Nunca** rode contra homologação ou produção:
 
 ```bash
-docker exec -i docker-web-1 python manage.py shell < scripts/seed_central_servicos.py
+docker exec -i <container-web-do-suap> python manage.py shell < scripts/seed_central_servicos.py
 ```
 
 O script imprime `servico_id`, `campus_id` e `centro_id`.

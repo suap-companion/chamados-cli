@@ -9,7 +9,7 @@ central de serviços. NUNCA rode contra homologação ou produção.
 
 Uso (container web do SUAP local):
 
-    docker exec -i docker-web-1 python manage.py shell < scripts/seed_central_servicos.py
+    docker exec -i <container-web-do-suap> python manage.py shell < scripts/seed_central_servicos.py
 """
 
 import os

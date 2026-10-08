@@ -9,6 +9,7 @@ fn config(server: &MockServer) -> SuapConfig {
     SuapConfig {
         base_url: Url::parse(&format!("{}/", server.uri())).unwrap(),
         username: Some("kelson".to_owned()),
+        ..SuapConfig::default()
     }
 }
 

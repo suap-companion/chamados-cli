@@ -88,6 +88,32 @@ fn config_dir_in(home: &Path) -> PathBuf {
 pub struct SuapConfig {
     pub base_url: Url,
     pub username: Option<String>,
+    /// Defaults for `chamados open`, kept per profile.
+    #[serde(default, skip_serializing_if = "OpenDefaults::is_empty")]
+    pub open: OpenDefaults,
+}
+
+/// Per-profile defaults used when opening tickets; every explicit option overrides them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenDefaults {
+    /// SUAP service id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<u64>,
+    /// Interested person (a SUAP "vínculo" id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interested: Option<String>,
+    /// Campus (`uo`) id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub campus: Option<String>,
+    /// Service center id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub center: Option<String>,
+}
+
+impl OpenDefaults {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 impl Default for SuapConfig {
@@ -95,6 +121,7 @@ impl Default for SuapConfig {
         Self {
             base_url: Url::parse("https://suap.ifrn.edu.br/").expect("default URL is valid"),
             username: None,
+            open: OpenDefaults::default(),
         }
     }
 }
@@ -123,7 +150,7 @@ impl ConfigFile {
         let (base_url, username) = (self.base_url.take(), self.username.take());
         if (base_url.is_some() || username.is_some()) && !self.profiles.contains_key(DEFAULT_PROFILE) {
             let base_url = base_url.unwrap_or_else(|| SuapConfig::default().base_url);
-            self.profiles.insert(DEFAULT_PROFILE.to_owned(), SuapConfig { base_url, username });
+            self.profiles.insert(DEFAULT_PROFILE.to_owned(), SuapConfig { base_url, username, ..SuapConfig::default() });
         }
     }
 }
@@ -202,6 +229,23 @@ pub struct FormResponse {
     pub body: String,
 }
 
+/// A file to upload with [`SuapClient::submit_multipart`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormFile {
+    pub field: String,
+    pub file_name: String,
+    pub bytes: Vec<u8>,
+}
+
+async fn form_response(response: reqwest::Response) -> Result<FormResponse, SuapError> {
+    if response.url().path() == LOGIN_PATH { return Err(SuapError::NotAuthenticated); }
+    if !response.status().is_success() {
+        return Err(SuapError::Transport(format!("unexpected status {}", response.status())));
+    }
+    let final_path = response.url().path().to_owned();
+    Ok(FormResponse { path: final_path, body: response.text().await? })
+}
+
 pub struct SuapClient {
     client: Client,
     session: SessionStore,
@@ -262,12 +306,27 @@ impl SuapClient {
     pub async fn submit_form(&self, path: &str, fields: &[(String, String)]) -> Result<FormResponse, SuapError> {
         let url = self.base_url.join(path)?;
         let response = self.client.post(url.clone()).form(fields).header("Referer", url.as_str()).send().await?;
-        if response.url().path() == LOGIN_PATH { return Err(SuapError::NotAuthenticated); }
-        if !response.status().is_success() {
-            return Err(SuapError::Transport(format!("unexpected status {}", response.status())));
+        form_response(response).await
+    }
+
+    /// Like [`SuapClient::submit_form`], but as `multipart/form-data` with file uploads.
+    pub async fn submit_multipart(
+        &self,
+        path: &str,
+        fields: &[(String, String)],
+        files: &[FormFile],
+    ) -> Result<FormResponse, SuapError> {
+        let url = self.base_url.join(path)?;
+        let mut form = reqwest::multipart::Form::new();
+        for (name, value) in fields {
+            form = form.text(name.clone(), value.clone());
         }
-        let final_path = response.url().path().to_owned();
-        Ok(FormResponse { path: final_path, body: response.text().await? })
+        for file in files {
+            let part = reqwest::multipart::Part::bytes(file.bytes.clone()).file_name(file.file_name.clone());
+            form = form.part(file.field.clone(), part);
+        }
+        let response = self.client.post(url.clone()).multipart(form).header("Referer", url.as_str()).send().await?;
+        form_response(response).await
     }
 
     pub fn base_url(&self) -> &Url { &self.base_url }
@@ -332,7 +391,7 @@ impl From<Box<dyn std::error::Error + Send + Sync>> for SuapError {
 mod tests {
     use super::*;
     use tempfile::{tempdir, TempDir};
-    use wiremock::{matchers::{method, path}, Mock, MockServer, ResponseTemplate};
+    use wiremock::{matchers::{body_string_contains, method, path}, Mock, MockServer, ResponseTemplate};
 
     const LOGIN_FORM: &str = r#"<form><input type="hidden" name="csrfmiddlewaretoken" value="tok"></form>"#;
 
@@ -343,7 +402,7 @@ mod tests {
     }
 
     fn config_for(server: &MockServer) -> SuapConfig {
-        SuapConfig { base_url: Url::parse(&format!("{}/", server.uri())).unwrap(), username: None }
+        SuapConfig { base_url: Url::parse(&format!("{}/", server.uri())).unwrap(), ..SuapConfig::default() }
     }
 
     async fn mount_login_page(server: &MockServer) {
@@ -403,7 +462,7 @@ mod tests {
         assert!(default_paths.session_file().ends_with("session.cookies"));
         assert!(local_paths.session_file().ends_with("session-local-1.cookies"));
 
-        let local = SuapConfig { base_url: Url::parse("http://localhost:8000/").unwrap(), username: Some("dev".to_owned()) };
+        let local = SuapConfig { base_url: Url::parse("http://localhost:8000/").unwrap(), username: Some("dev".to_owned()), ..SuapConfig::default() };
         save_config(&local_paths, &local).unwrap();
         assert_eq!(load_config(&default_paths).unwrap(), None);
         let production = SuapConfig::default();
@@ -458,7 +517,7 @@ mod tests {
     #[test]
     fn config_rejects_invalid_scheme_and_toml() {
         let (_dir, paths) = paths();
-        let bad = SuapConfig { base_url: Url::parse("ftp://example.org/").unwrap(), username: None };
+        let bad = SuapConfig { base_url: Url::parse("ftp://example.org/").unwrap(), ..SuapConfig::default() };
         assert!(matches!(save_config(&paths, &bad), Err(SuapError::InvalidConfiguration(_))));
 
         paths.ensure_dirs().unwrap();
@@ -621,6 +680,46 @@ mod tests {
         assert_eq!(response, FormResponse { path: "/destino/".to_owned(), body: "fim".to_owned() });
         assert!(matches!(client.submit_form("/erro/", &fields).await, Err(SuapError::Transport(_))));
         assert!(matches!(client.submit_form("/protegido/", &fields).await, Err(SuapError::NotAuthenticated)));
+    }
+
+    #[tokio::test]
+    async fn submit_multipart_uploads_files_and_reports_destination() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/upload/"))
+            .and(body_string_contains("name=\"campo\""))
+            .and(body_string_contains("name=\"arquivo\"; filename=\"a.pdf\""))
+            .and(body_string_contains("conteudo"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("recebido"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST")).and(path("/erro/")).respond_with(ResponseTemplate::new(500)).mount(&server).await;
+        let (_dir, paths) = paths();
+        let client = SuapClient::open(&paths, &config_for(&server)).unwrap();
+        let fields = [("campo".to_owned(), "valor".to_owned())];
+        let files = [FormFile { field: "arquivo".to_owned(), file_name: "a.pdf".to_owned(), bytes: b"conteudo".to_vec() }];
+        let response = client.submit_multipart("/upload/", &fields, &files).await.unwrap();
+        assert_eq!(response, FormResponse { path: "/upload/".to_owned(), body: "recebido".to_owned() });
+        assert!(matches!(client.submit_multipart("/erro/", &fields, &files).await, Err(SuapError::Transport(_))));
+    }
+
+    #[test]
+    fn open_defaults_are_serialized_only_when_set() {
+        let (_dir, paths) = paths();
+        let plain = SuapConfig::default();
+        save_config(&paths, &plain).unwrap();
+        assert!(!fs::read_to_string(paths.config_file()).unwrap().contains("open"));
+
+        let defaults = OpenDefaults {
+            service: Some(7),
+            interested: Some("1".to_owned()),
+            campus: Some("2".to_owned()),
+            center: Some("3".to_owned()),
+        };
+        let config = SuapConfig { open: defaults, ..plain };
+        save_config(&paths, &config).unwrap();
+        assert!(fs::read_to_string(paths.config_file()).unwrap().contains("[profiles.default.open]"));
+        assert_eq!(load_config(&paths).unwrap(), Some(config));
     }
 
     #[test]
