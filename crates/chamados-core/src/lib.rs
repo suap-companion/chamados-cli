@@ -8,6 +8,10 @@ use suap_core::{FormFile, SuapClient, SuapError};
 use thiserror::Error;
 use url::Url;
 
+pub mod titles;
+
+pub use titles::{validate_title, TitleEntry, TitleStore, MAX_TITLE_CHARS};
+
 const TICKET_PATH_PREFIX: &str = "/centralservicos/chamado/";
 const OPEN_PATH_PREFIX: &str = "/centralservicos/abrir_chamado/";
 const CAMPUS_PATH_PREFIX: &str = "/centralservicos/get_campus_com_centros_atendimento/";
@@ -144,7 +148,7 @@ impl<'a> SuapTicketSource<'a> {
     }
 }
 
-fn check_ticket_id(id: &str) -> Result<(), TicketError> {
+pub(crate) fn check_ticket_id(id: &str) -> Result<(), TicketError> {
     if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(TicketError::Source(format!("invalid ticket id {id:?}")));
     }
