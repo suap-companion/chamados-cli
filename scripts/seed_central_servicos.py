@@ -1,8 +1,8 @@
 """Seed mínimo da Central de Serviços para uma base SUAP LOCAL de desenvolvimento.
 
 Cria (de forma idempotente) um campus/setor, o servidor do usuário de teste, um atendente e o
-catálogo mínimo (área, categoria, grupo de serviço, centro de atendimento, serviço e grupo de
-atendimento) para que `chamados open` consiga abrir chamados.
+catálogo mínimo (área, categoria, grupo de serviço, centro de atendimento, serviço, grupo de
+atendimento e um artigo da base de conhecimento) para que `chamados open` consiga abrir chamados.
 
 Reaproveita as factories do próprio SUAP (`rh.tests.factories`), como o `builders.py` da
 central de serviços. NUNCA rode contra homologação ou produção.
@@ -17,7 +17,7 @@ import os
 from django.contrib.auth.models import Group
 from django.db import transaction
 
-from centralservicos.models import CategoriaServico, CentroAtendimento, GrupoAtendimento, GrupoServico, Servico
+from centralservicos.models import BaseConhecimento, CategoriaServico, CentroAtendimento, GrupoAtendimento, GrupoServico, Servico
 from comum.models import AreaAtuacao
 from rh.models import Setor
 from rh.tests.factories import ServidorFactory, SetorFactory
@@ -63,5 +63,14 @@ with transaction.atomic():
     )
     grupo_atendimento.responsaveis.add(usuario)
     grupo_atendimento.atendentes.add(usuario)
+
+    # O SUAP exige ao menos um artigo relacionado para resolver chamados.
+    artigo, criado = BaseConhecimento.objects.get_or_create(
+        titulo=f"{PREFIXO} - Artigo",
+        defaults={"resumo": "Artigo criado pelo seed de desenvolvimento.", "area": area, "atualizado_por": usuario},
+    )
+    if criado:
+        artigo.grupos_atendimento.add(grupo_atendimento)
+        artigo.servicos.add(servico)
 
     print(f"SEED OK servico_id={servico.pk} campus_id={setor.uo_id} centro_id={centro.pk} usuario={usuario.username}")
