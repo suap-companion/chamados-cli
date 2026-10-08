@@ -16,7 +16,7 @@ A separação permite reutilizar o núcleo Rust no Android sem colocar regras de
 
 O arquivo de configuração é `~/.config/suap/config.toml` em todos os sistemas (no Windows, `%USERPROFILE%\.config\suap\config.toml`). A sessão (`session.cookies`) fica no diretório de dados do sistema, obtido via `ProjectDirs`.
 
-> A partir da v0.5.0 a configuração deixou de ficar no diretório de configuração do sistema (ex.: `%APPDATA%` no Windows). Se você já tinha um `config.toml` lá, copie-o para `~/.config/suap/` ou rode `config-init` de novo.
+> A partir da v0.5.0 a configuração deixou de ficar no diretório de configuração do sistema (ex.: `%APPDATA%` no Windows). Se você já tinha um `config.toml` lá, copie-o para `~/.config/suap/` ou rode `chamados profile init` de novo.
 
 Consulte os caminhos com:
 
@@ -24,10 +24,10 @@ Consulte os caminhos com:
 cargo run -p chamados-cli -- paths
 ```
 
-Crie a configuração inicial com:
+Crie o perfil inicial (`default`) com:
 
 ```bash
-cargo run -p chamados-cli -- config-init \
+cargo run -p chamados-cli -- profile init \
   --base-url https://suap.ifrn.edu.br/ \
   --username seu_usuario
 ```
@@ -35,20 +35,40 @@ cargo run -p chamados-cli -- config-init \
 Consulte a configuração sem exibir senha:
 
 ```bash
-cargo run -p chamados-cli -- config-show
+cargo run -p chamados-cli -- profile show
 ```
+
+> A partir da v0.9.0 os comandos `config-init` e `config-show` foram substituídos pelos comandos `profile` (veja abaixo).
 
 ### Perfis (ambientes)
 
-Use `--profile <nome>` para manter vários ambientes (por exemplo, produção e um SUAP local) com configuração e sessão separadas. Sem a flag, vale o perfil `default`, e o `config-init` sem perfil grava o `default`. A flag funciona antes ou depois do subcomando:
+Use `--profile <nome>` para manter vários ambientes (por exemplo, produção e um SUAP local) com configuração e sessão separadas. Sem a flag, vale o perfil `default`, e `profile init` sem nome grava o `default`. A flag funciona antes ou depois do subcomando:
 
 ```bash
-chamados config-init --profile local --base-url http://localhost:8000 --username 2080882
+chamados profile init local --base-url http://localhost:8000 --username 2080882
 chamados --profile local login
 chamados list --profile local
 ```
 
-Um perfil diferente de `default` precisa ser criado com `config-init` antes de ser usado. A configuração fica em `[profiles.<nome>]` no `config.toml` (um `config.toml` antigo, sem perfis, vale como o perfil `default`), e a sessão do `default` continua em `session.cookies`, enquanto a dos demais fica em `session-<nome>.cookies`.
+Gerencie os perfis com `chamados profile`:
+
+| Comando | O que faz |
+|---------|-----------|
+| `profile init [nome] [--base-url ...] [--username ...] [--service ...] [--interested ...] [--campus ...] [--center ...]` | cria o perfil (erro se já existir); sem nome, usa o perfil selecionado por `--profile` (`default`) |
+| `profile update [nome] <opções>` | altera campos de um perfil existente (exige ao menos uma opção) |
+| `profile show [nome]` | exibe a configuração e se há sessão salva |
+| `profile list` | lista os perfis (o `default` aparece marcado) |
+| `profile remove <nome> --yes` | apaga a configuração e a sessão do perfil |
+
+Um perfil diferente de `default` precisa ser criado com `profile init` antes de ser usado. A configuração fica em `[profiles.<nome>]` no `config.toml` (um `config.toml` antigo, sem perfis, vale como o perfil `default`), e a sessão do `default` continua em `session.cookies`, enquanto a dos demais fica em `session-<nome>.cookies`.
+
+### Verificar a sessão
+
+```bash
+chamados session-status   # ou: chamados session-status --profile local
+```
+
+Informa se a sessão salva do perfil ainda é válida, sem pedir senha. Se não houver sessão ou ela tiver expirado, o comando termina com erro orientando a executar `chamados login` (a sessão salva nunca é apagada automaticamente).
 
 ### Login
 
@@ -79,11 +99,11 @@ Se a sessão estiver ausente ou expirada, o comando orienta a executar `chamados
 Guarde os padrões no perfil uma vez e abra chamados só com a descrição:
 
 ```bash
-chamados config-init --service 53 --interested 1            # padrões do perfil (campus/centro também: --campus, --center)
+chamados profile update --service 53 --interested 1         # padrões do perfil (campus/centro também: --campus, --center)
 chamados open -d "Não consigo acessar as bibliotecas virtuais"
 ```
 
-- **Serviço e interessado:** `53` é o número do serviço no SUAP (o mesmo de `/centralservicos/abrir_chamado/53/`) e `--interested` é o id do vínculo da pessoa interessada, que o formulário do SUAP exige. Podem vir do perfil (`config-init --service/--interested`) ou ser passados no comando (`chamados open 53 --interested 1 ...`), e o que vier no comando prevalece.
+- **Serviço e interessado:** `53` é o número do serviço no SUAP (o mesmo de `/centralservicos/abrir_chamado/53/`) e `--interested` é o id do vínculo da pessoa interessada, que o formulário do SUAP exige. Podem vir do perfil (`profile update --service/--interested`) ou ser passados no comando (`chamados open 53 --interested 1 ...`), e o que vier no comando prevalece.
 - **Campus e centro de atendimento:** por padrão o do perfil; sem isso, o campus do usuário e o único centro disponível (se houver vários, o comando lista as opções e pede `--center`).
 - **Texto de várias linhas e entrada padrão:** `-d` aceita texto com quebras de linha. Com `-d -`, ou sem `-d`, a descrição é lida da entrada padrão: `cat descricao.txt | chamados open` (no PowerShell: `Get-Content descricao.txt | chamados open`).
 - **Anexos:** `-a arquivo.pdf` (repetível, no máximo 3). O SUAP só aceita `xlsx`, `xls`, `csv`, `docx`, `doc`, `pdf`, `jpg`, `jpeg` e `png`; o comando recusa outros tipos antes de enviar. O serviço precisa permitir anexos.

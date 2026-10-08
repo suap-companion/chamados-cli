@@ -209,9 +209,33 @@ pub fn save_config(paths: &AppPaths, config: &SuapConfig) -> Result<(), SuapErro
     file.migrate_legacy();
     file.profiles
         .insert(paths.profile().to_owned(), config.clone());
+    write_config_file(paths, &file)
+}
+
+/// Removes the configuration of the profile selected in `paths`; returns whether it existed.
+///
+/// The profile's session file is not touched.
+pub fn remove_config(paths: &AppPaths) -> Result<bool, SuapError> {
+    let mut file = ConfigFile::read(paths)?;
+    file.migrate_legacy();
+    let existed = file.profiles.remove(paths.profile()).is_some();
+    if existed {
+        write_config_file(paths, &file)?;
+    }
+    Ok(existed)
+}
+
+/// Every configured profile with its configuration, sorted by name.
+pub fn list_profiles(paths: &AppPaths) -> Result<Vec<(String, SuapConfig)>, SuapError> {
+    let mut file = ConfigFile::read(paths)?;
+    file.migrate_legacy();
+    Ok(file.profiles.into_iter().collect())
+}
+
+fn write_config_file(paths: &AppPaths, file: &ConfigFile) -> Result<(), SuapError> {
     paths.ensure_dirs()?;
     let temporary = paths.config_file().with_extension("toml.tmp");
-    fs::write(&temporary, toml::to_string_pretty(&file)?)?;
+    fs::write(&temporary, toml::to_string_pretty(file)?)?;
     fs::rename(temporary, paths.config_file())?;
     Ok(())
 }
@@ -599,6 +623,35 @@ mod tests {
         save_config(&default_paths, &production).unwrap();
         assert_eq!(load_config(&local_paths).unwrap(), Some(local));
         assert_eq!(load_config(&default_paths).unwrap(), Some(production));
+    }
+
+    #[test]
+    fn lists_and_removes_profiles() {
+        let (_dir, default_paths) = paths();
+        assert!(list_profiles(&default_paths).unwrap().is_empty());
+        assert!(!remove_config(&default_paths).unwrap());
+
+        let local_paths = default_paths.clone().with_profile("local").unwrap();
+        let local = SuapConfig {
+            base_url: Url::parse("http://localhost:8000/").unwrap(),
+            ..SuapConfig::default()
+        };
+        save_config(&local_paths, &local).unwrap();
+        save_config(&default_paths, &SuapConfig::default()).unwrap();
+        let names: Vec<_> = list_profiles(&default_paths)
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, ["default", "local"]);
+
+        assert!(remove_config(&local_paths).unwrap());
+        assert_eq!(load_config(&local_paths).unwrap(), None);
+        assert_eq!(
+            load_config(&default_paths).unwrap(),
+            Some(SuapConfig::default())
+        );
+        assert!(!remove_config(&local_paths).unwrap());
     }
 
     #[test]
