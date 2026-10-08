@@ -195,7 +195,8 @@ pub struct SessionStore {
 impl SessionStore {
     pub fn open(path: PathBuf) -> Result<Self, SuapError> {
         let cookies = if path.exists() {
-            CookieStore::load_json(BufReader::new(fs::File::open(&path)?))?
+            // Sessions are disposable: a file in an older or unreadable format is dropped (log in again).
+            cookie_store::serde::json::load(BufReader::new(fs::File::open(&path)?)).unwrap_or_default()
         } else {
             CookieStore::default()
         };
@@ -211,7 +212,7 @@ impl SessionStore {
         let file = fs::File::create(&temporary)?;
         let mut writer = std::io::BufWriter::new(file);
         let cookies = self.cookies.lock().map_err(|_| SuapError::CookieStore("cookie store lock poisoned".to_owned()))?;
-        cookies.save_json(&mut writer)?;
+        cookie_store::serde::json::save(&cookies, &mut writer)?;
         drop(cookies);
         writer.flush()?;
         fs::rename(temporary, &self.path)?;
@@ -542,11 +543,16 @@ mod tests {
     }
 
     #[test]
-    fn session_store_rejects_corrupt_file() {
+    fn session_store_discards_unreadable_or_legacy_files() {
         let (_dir, paths) = paths();
         paths.ensure_dirs().unwrap();
-        fs::write(paths.session_file(), "not json").unwrap();
-        assert!(matches!(SessionStore::open(paths.session_file()), Err(SuapError::CookieStore(_))));
+        // Not JSON at all, and the pre-`cookie_store::serde` format (one JSON object per line).
+        let legacy = r#"{"raw_cookie":"sessionid=1; Path=/","path":["/",true],"domain":{"HostOnly":"suap.example"},"expires":{"AtUtc":"2999-01-01T00:00:00Z"}}"#;
+        for content in ["not json", legacy] {
+            fs::write(paths.session_file(), content).unwrap();
+            let store = SessionStore::open(paths.session_file()).unwrap();
+            assert!(store.cookie_provider().lock().unwrap().get("suap.example", "/", "sessionid").is_none());
+        }
     }
 
     #[tokio::test]

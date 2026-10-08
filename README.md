@@ -61,6 +61,8 @@ cargo run -p chamados-cli -- login --username seu_usuario
 
 Após o login, apenas os cookies de sessão são salvos em `session.cookies`.
 
+> A partir da v0.8.1 a sessão é gravada no formato `cookie_store::serde` (JSON). Sessões salvas por versões anteriores não são compatíveis: são descartadas ao abrir e basta rodar `chamados login` de novo.
+
 ### Listar chamados
 
 Com a sessão salva por `login`, liste os chamados (uma linha por chamado: `#id`, situação e assunto, separados por tabulação):
