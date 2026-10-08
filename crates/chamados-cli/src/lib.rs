@@ -12,7 +12,7 @@ use std::{
 };
 
 use chamados_core::{
-    validate_title, Attachment, NewTicket, SuapTicketSource, TicketDetails, TicketError,
+    validate_title, Attachment, Message, NewTicket, SuapTicketSource, TicketDetails, TicketError,
     TicketQueue, TicketSource, TitleStore,
 };
 use clap::{Args, Parser, Subcommand};
@@ -65,6 +65,10 @@ enum Command {
     },
     /// Abre um novo chamado no SUAP usando a sessão salva por `login`.
     Open(OpenArgs),
+    /// Adiciona um comentário (visível ao interessado) a um chamado, usando a sessão salva por `login`.
+    Comment(MessageArgs),
+    /// Adiciona uma nota interna (visível só à equipe de atendimento) a um chamado.
+    Note(MessageArgs),
     /// Define, exibe ou remove o título local de um chamado (o SUAP não tem título; fica só nesta máquina).
     Title {
         /// Número do chamado.
@@ -130,6 +134,15 @@ struct ProfileArgs {
     /// Centro de atendimento padrão do `open` neste perfil.
     #[arg(long)]
     center: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct MessageArgs {
+    /// Número do chamado.
+    id: u64,
+    /// Texto (pode ter várias linhas). Com `-` ou omitido, é lido da entrada padrão.
+    #[arg(long, short = 'm')]
+    message: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -242,6 +255,8 @@ fn execute(
         Some(Command::List { meus }) => list(paths, meus, out),
         Some(Command::Show { id }) => show(paths, id, out),
         Some(Command::Open(args)) => open(paths, args, input, out),
+        Some(Command::Comment(args)) => send_message(paths, args, Message::Comment, input, out),
+        Some(Command::Note(args)) => send_message(paths, args, Message::InternalNote, input, out),
         Some(Command::Title { id, text, remove }) => title(paths, id, text, remove, out),
         Some(Command::Status) => {
             writeln!(
@@ -542,6 +557,32 @@ fn show(paths: &AppPaths, id: u64, out: &mut dyn Write) -> Result<(), Box<dyn Er
     Ok(())
 }
 
+fn send_message(
+    paths: &AppPaths,
+    args: MessageArgs,
+    kind: Message,
+    input: &mut dyn Read,
+    out: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    let config = profile_config(paths)?;
+    let text = read_text(args.message, input)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let client = SuapClient::open(paths, &config)?;
+    let source = SuapTicketSource::new(&client, TicketQueue::Support);
+    let id = args.id.to_string();
+    runtime
+        .block_on(source.add_message(&id, kind, &text))
+        .map_err(explain)?;
+    let message = match kind {
+        Message::Comment => format!("Comentário adicionado ao chamado #{id}."),
+        Message::InternalNote => format!("Nota interna adicionada ao chamado #{id}."),
+    };
+    writeln!(out, "{message}")?;
+    Ok(())
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -713,7 +754,16 @@ fn print_details(
 
 /// Indents every line but the first, so multi-line values stay readable under their label.
 fn indent_continuation(text: &str, prefix: &str) -> String {
-    text.replace('\n', &format!("\n{prefix}"))
+    let mut lines = text.split('\n');
+    let first = lines.next().unwrap_or_default();
+    lines.fold(first.to_owned(), |mut indented, line| {
+        indented.push('\n');
+        if !line.is_empty() {
+            indented.push_str(prefix);
+            indented.push_str(line);
+        }
+        indented
+    })
 }
 
 /// Turns ticket errors into user-facing messages.
@@ -1284,6 +1334,85 @@ mod tests {
         assert!(err.contains("titles file"));
     }
 
+    const THREAD_PAGE: &str = r#"
+        <form method="post" action="/centralservicos/adicionar_comentario/5/">
+          <input type="hidden" name="csrfmiddlewaretoken" value="tok-comentario">
+          <textarea name="texto"></textarea></form>
+        <form method="post" action="/centralservicos/adicionar_nota_interna/5/">
+          <input type="hidden" name="csrfmiddlewaretoken" value="tok-nota">
+          <textarea name="texto"></textarea></form>"#;
+
+    fn thread_setup() -> (TempDir, AppPaths, tokio::runtime::Runtime, MockServer) {
+        let (dir, paths) = paths();
+        let (runtime, server) = bare_server();
+        run_args(&["profile", "init", "--base-url", &server.uri()], &paths);
+        let page = ResponseTemplate::new(200).set_body_string(THREAD_PAGE);
+        mount_text(
+            &runtime,
+            &server,
+            "GET",
+            "/centralservicos/chamado/5/",
+            page,
+        );
+        let ok = || ResponseTemplate::new(200).set_body_string("ok");
+        mount_text(
+            &runtime,
+            &server,
+            "POST",
+            "/centralservicos/adicionar_comentario/5/",
+            ok(),
+        );
+        mount_text(
+            &runtime,
+            &server,
+            "POST",
+            "/centralservicos/adicionar_nota_interna/5/",
+            ok(),
+        );
+        (dir, paths, runtime, server)
+    }
+
+    #[test]
+    fn comment_and_note_accept_multiline_text_and_standard_input() {
+        let (_dir, paths, runtime, server) = thread_setup();
+        let (code, out, err) = run_args(&["comment", "5", "-m", "linha 1\nlinha 2\n"], &paths);
+        assert_eq!((code, err.as_str()), (0, ""));
+        assert_eq!(out, "Comentário adicionado ao chamado #5.\n");
+        let (code, out, _) =
+            run_with_input(&["note", "5", "-m", "-"], &paths, "vindo\ndo stdin\r\n");
+        assert_eq!(code, 0);
+        assert_eq!(out, "Nota interna adicionada ao chamado #5.\n");
+        let (code, _, _) = run_with_input(&["note", "5"], &paths, "sem opção\n");
+        assert_eq!(code, 0);
+
+        let requests = runtime.block_on(server.received_requests()).unwrap();
+        let bodies: Vec<String> = requests
+            .iter()
+            .filter(|request| request.method == wiremock::http::Method::POST)
+            .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+            .collect();
+        assert!(
+            bodies[0].contains("csrfmiddlewaretoken=tok-comentario")
+                && bodies[0].contains("texto=linha+1%0Alinha+2")
+        );
+        assert!(
+            bodies[1].contains("csrfmiddlewaretoken=tok-nota")
+                && bodies[1].contains("texto=vindo%0Ado+stdin")
+        );
+        assert!(bodies[2].contains("texto=sem+op%C3%A7%C3%A3o"));
+    }
+
+    #[test]
+    fn comment_reports_empty_text_and_missing_forms() {
+        let (_dir, paths, _runtime, _server) = thread_setup();
+        let (code, _, err) = run_with_input(&["comment", "5"], &paths, "  \n");
+        assert_eq!(code, 1);
+        assert!(err.contains("texto não informado"));
+        let (code, _, err) = run_args(&["note", "9", "-m", "x"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("unexpected status 404"));
+    }
+
     #[test]
     fn open_saves_the_local_title_and_validates_it_first() {
         let (_dir, paths, runtime, server) = open_setup();
@@ -1348,9 +1477,9 @@ mod tests {
         run_args(&["profile", "init", "--base-url", &server.uri()], &paths);
         let html = r#"<main id="content"><div class="title-container"><h2>Chamado Interno 9</h2></div>
             <div class="accordion"><div class="accordion-body"><dl class="definition-list"><div class="list-item">
-            <dt>Descrição</dt><dd>linha 1<br>linha 2</dd></div></dl></div></div>
+            <dt>Descrição</dt><dd>linha 1<br>linha 2<br><br>depois</dd></div></dl></div></div>
             <div data-tab="linha_tempo"><ul class="timeline"><li><div class="timeline-date">01/01/2026 10:00:00</div>
-            <div class="timeline-content">Fulano comentou:<p>a<br>b</p></div></li></ul></div></main>"#;
+            <div class="timeline-content">Fulano comentou:<p>a<br>b</p><p>c</p></div></li></ul></div></main>"#;
         mount_listing(
             &runtime,
             &server,
@@ -1359,8 +1488,8 @@ mod tests {
         );
         let (code, out, _) = run_args(&["show", "9"], &paths);
         assert_eq!(code, 0);
-        assert!(out.contains("Descrição: linha 1\n    linha 2\n"));
-        assert!(out.contains("  01/01/2026 10:00:00  Fulano comentou: a\n      b\n"));
+        assert!(out.contains("Descrição: linha 1\n    linha 2\n\n    depois\n"));
+        assert!(out.contains("  01/01/2026 10:00:00  Fulano comentou: a\n      b\n\n      c\n"));
     }
 
     #[test]
