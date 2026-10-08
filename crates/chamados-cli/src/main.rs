@@ -8,9 +8,20 @@ fn main() {
         Ok(paths) => {
             let password = std::env::var(chamados_cli::PASSWORD_ENV).ok();
             // Only piped/redirected input is read as text; an interactive terminal is never waited on.
-            let mut input: Box<dyn Read> = if stdin().is_terminal() { Box::new(std::io::empty()) } else { Box::new(stdin()) };
-            chamados_cli::run(std::env::args_os(), &paths, password, &mut input, &mut stdout(), &mut stderr())
-        },
+            let mut input: Box<dyn Read> = if stdin().is_terminal() {
+                Box::new(std::io::empty())
+            } else {
+                Box::new(stdin())
+            };
+            chamados_cli::run(
+                std::env::args_os(),
+                &paths,
+                password,
+                &mut input,
+                &mut stdout(),
+                &mut stderr(),
+            )
+        }
         Err(error) => {
             eprintln!("erro: {error}");
             1

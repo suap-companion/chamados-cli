@@ -122,6 +122,8 @@ cargo llvm-cov --workspace --all-targets --ignore-filename-regex 'main\.rs' --fa
 ## Desenvolvimento
 
 ```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
 cargo check --workspace
 cargo test --workspace
 cargo run -p chamados-cli -- --help

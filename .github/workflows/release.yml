@@ -99,6 +99,13 @@ jobs:
           Copy-Item "target/${{ matrix.target }}/release/${{ env.BINARY }}.exe" dist/
           Compress-Archive -Path "dist/${{ env.BINARY }}.exe" -DestinationPath "${{ env.BINARY }}-${{ github.event.release.tag_name }}-${{ matrix.name }}.zip"
 
+      - name: Verify package
+        shell: bash
+        run: |
+          package="${{ env.BINARY }}-${{ github.event.release.tag_name }}-${{ matrix.name }}.${{ matrix.archive }}"
+          test -s "$package" || { echo "package missing or empty: $package"; exit 1; }
+          ls -l "$package"
+
       - name: Upload release asset
         uses: softprops/action-gh-release@v2
         with:

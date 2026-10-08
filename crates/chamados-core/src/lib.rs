@@ -17,7 +17,9 @@ const ASSUME_PATH_PREFIX: &str = "/centralservicos/auto_atribuir_chamado/";
 const START_PATH_PREFIX: &str = "/centralservicos/colocar_em_atendimento/";
 
 /// File types SUAP accepts as ticket attachments (it rejects any other).
-pub const ALLOWED_ATTACHMENT_EXTENSIONS: [&str; 9] = ["xlsx", "xls", "csv", "docx", "doc", "pdf", "jpg", "jpeg", "png"];
+pub const ALLOWED_ATTACHMENT_EXTENSIONS: [&str; 9] = [
+    "xlsx", "xls", "csv", "docx", "doc", "pdf", "jpg", "jpeg", "png",
+];
 /// Number of attachment slots in SUAP's "open ticket" form.
 pub const MAX_ATTACHMENTS: usize = 3;
 const ATTACHMENT_DESCRIPTION_MAX: usize = 80;
@@ -135,7 +137,10 @@ impl<'a> SuapTicketSource<'a> {
         if errors.is_empty() {
             return Ok(());
         }
-        Err(TicketError::Source(format!("SUAP refused the action: {}", errors.join("; "))))
+        Err(TicketError::Source(format!(
+            "SUAP refused the action: {}",
+            errors.join("; ")
+        )))
     }
 }
 
@@ -149,11 +154,18 @@ fn check_ticket_id(id: &str) -> Result<(), TicketError> {
 /// Checks the attachment count and file types against what SUAP accepts.
 pub fn validate_attachments(attachments: &[Attachment]) -> Result<(), TicketError> {
     if attachments.len() > MAX_ATTACHMENTS {
-        return Err(TicketError::Source(format!("at most {MAX_ATTACHMENTS} attachments are allowed")));
+        return Err(TicketError::Source(format!(
+            "at most {MAX_ATTACHMENTS} attachments are allowed"
+        )));
     }
     for attachment in attachments {
-        let extension = attachment.file_name.rsplit_once('.').map(|(_, extension)| extension.to_ascii_lowercase());
-        if !extension.is_some_and(|extension| ALLOWED_ATTACHMENT_EXTENSIONS.contains(&extension.as_str())) {
+        let extension = attachment
+            .file_name
+            .rsplit_once('.')
+            .map(|(_, extension)| extension.to_ascii_lowercase());
+        if !extension
+            .is_some_and(|extension| ALLOWED_ATTACHMENT_EXTENSIONS.contains(&extension.as_str()))
+        {
             return Err(TicketError::Source(format!(
                 "attachment {:?} has an unsupported type; allowed: {}",
                 attachment.file_name,
@@ -171,7 +183,11 @@ fn flash_errors(body: &str) -> Vec<String> {
         .select(&selector("p.alert-error"))
         .map(|message| {
             let own_text = message.children().filter_map(|node| node.value().as_text());
-            own_text.map(|text| text.trim()).filter(|text| !text.is_empty()).collect::<Vec<_>>().join(" ")
+            own_text
+                .map(|text| text.trim())
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
         })
         .filter(|message| !message.is_empty())
         .collect()
@@ -185,7 +201,10 @@ impl TicketSource for SuapTicketSource<'_> {
 
     async fn get_ticket(&self, id: &str) -> Result<TicketDetails, TicketError> {
         check_ticket_id(id)?;
-        let html = self.client.fetch_page(&format!("{TICKET_PATH_PREFIX}{id}/")).await?;
+        let html = self
+            .client
+            .fetch_page(&format!("{TICKET_PATH_PREFIX}{id}/"))
+            .await?;
         parse_ticket_details(&html, self.client.base_url(), id)
             .ok_or_else(|| TicketError::Source(format!("could not parse ticket {id}")))
     }
@@ -202,13 +221,17 @@ impl TicketSource for SuapTicketSource<'_> {
         validate_attachments(&ticket.attachments)?;
         let form_path = format!("{OPEN_PATH_PREFIX}{}/", ticket.service_id);
         let html = self.client.fetch_page(&form_path).await?;
-        let mut fields = parse_open_form(&html)
-            .ok_or_else(|| TicketError::Source(format!("service {} has no ticket form", ticket.service_id)))?;
+        let mut fields = parse_open_form(&html).ok_or_else(|| {
+            TicketError::Source(format!("service {} has no ticket form", ticket.service_id))
+        })?;
 
         let campus = match &ticket.campus {
             Some(campus) => campus.clone(),
             None => {
-                let reply = self.client.fetch_page(&format!("{CAMPUS_PATH_PREFIX}{}/0/", ticket.service_id)).await?;
+                let reply = self
+                    .client
+                    .fetch_page(&format!("{CAMPUS_PATH_PREFIX}{}/0/", ticket.service_id))
+                    .await?;
                 default_campus(&reply)?
             }
         };
@@ -232,8 +255,16 @@ impl TicketSource for SuapTicketSource<'_> {
         }
         let mut files = Vec::new();
         for (index, attachment) in ticket.attachments.iter().enumerate() {
-            let description: String = attachment.file_name.chars().take(ATTACHMENT_DESCRIPTION_MAX).collect();
-            set_field(&mut fields, &format!("chamadoanexo_set-{index}-descricao"), &description);
+            let description: String = attachment
+                .file_name
+                .chars()
+                .take(ATTACHMENT_DESCRIPTION_MAX)
+                .collect();
+            set_field(
+                &mut fields,
+                &format!("chamadoanexo_set-{index}-descricao"),
+                &description,
+            );
             files.push(FormFile {
                 field: format!("chamadoanexo_set-{index}-anexo"),
                 file_name: attachment.file_name.clone(),
@@ -247,7 +278,9 @@ impl TicketSource for SuapTicketSource<'_> {
         let response = if files.is_empty() {
             self.client.submit_form(&form_path, &fields).await?
         } else {
-            self.client.submit_multipart(&form_path, &fields, &files).await?
+            self.client
+                .submit_multipart(&form_path, &fields, &files)
+                .await?
         };
         parse_open_result(&response.path, &response.body)
     }
@@ -257,7 +290,10 @@ impl TicketSource for SuapTicketSource<'_> {
 pub fn parse_ticket_list(html: &str, base_url: &Url) -> Vec<RemoteTicket> {
     let document = Html::parse_document(html);
     let boxes = Selector::parse(".general-box").expect("static selector is valid");
-    document.select(&boxes).filter_map(|element| parse_ticket(element, base_url)).collect()
+    document
+        .select(&boxes)
+        .filter_map(|element| parse_ticket(element, base_url))
+        .collect()
 }
 
 fn parse_ticket(element: ElementRef<'_>, base_url: &Url) -> Option<RemoteTicket> {
@@ -281,7 +317,13 @@ fn text_of(element: ElementRef<'_>) -> String {
 
 /// Text of `element` with every run of whitespace (and element boundaries) collapsed to one space.
 fn flat_text(element: ElementRef<'_>) -> String {
-    element.text().collect::<Vec<_>>().join(" ").split_whitespace().collect::<Vec<_>>().join(" ")
+    element
+        .text()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Like [`flat_text`], but keeps the line breaks SUAP renders as `<br>` (multi-line descriptions and comments).
@@ -322,19 +364,29 @@ fn set_field(fields: &mut Vec<(String, String)>, name: &str, value: &str) {
 pub fn parse_open_form(html: &str) -> Option<Vec<(String, String)>> {
     let document = Html::parse_document(html);
     let (forms, description) = (selector("form"), selector("[name=descricao]"));
-    let form = document.select(&forms).find(|form| form.select(&description).next().is_some())?;
+    let form = document
+        .select(&forms)
+        .find(|form| form.select(&description).next().is_some())?;
 
     let (controls, options) = (selector("input, textarea, select"), selector("option"));
     let mut fields = Vec::new();
     for control in form.select(&controls) {
-        let Some(name) = control.value().attr("name") else { continue };
+        let Some(name) = control.value().attr("name") else {
+            continue;
+        };
         let value = match control.value().name() {
             "textarea" => text_of(control),
             "select" => {
                 let all: Vec<_> = control.select(&options).collect();
-                let chosen = all.iter().find(|option| option.value().attr("selected").is_some()).or(all.first());
+                let chosen = all
+                    .iter()
+                    .find(|option| option.value().attr("selected").is_some())
+                    .or(all.first());
                 match chosen {
-                    Some(option) => option.value().attr("value").map_or_else(|| text_of(*option), str::to_owned),
+                    Some(option) => option
+                        .value()
+                        .attr("value")
+                        .map_or_else(|| text_of(*option), str::to_owned),
                     None => continue,
                 }
             }
@@ -345,7 +397,11 @@ pub fn parse_open_form(html: &str) -> Option<Vec<(String, String)>> {
                 if skipped || (toggled && control.value().attr("checked").is_none()) {
                     continue;
                 }
-                control.value().attr("value").unwrap_or(if toggled { "on" } else { "" }).to_owned()
+                control
+                    .value()
+                    .attr("value")
+                    .unwrap_or(if toggled { "on" } else { "" })
+                    .to_owned()
             }
         };
         fields.push((name.to_owned(), value));
@@ -367,20 +423,36 @@ struct CentersReply {
 
 /// Picks the campus SUAP marks as selected (the user's own), or the first one available.
 fn default_campus(json: &str) -> Result<String, TicketError> {
-    let reply: CampusReply = serde_json::from_str(json).map_err(|error| TicketError::Source(format!("campus list: {error}")))?;
-    let chosen = reply.campus.iter().find(|campus| campus.2).or(reply.campus.first());
-    chosen.map(|campus| campus.0.to_string()).ok_or_else(|| TicketError::Source("no campus available for this service".to_owned()))
+    let reply: CampusReply = serde_json::from_str(json)
+        .map_err(|error| TicketError::Source(format!("campus list: {error}")))?;
+    let chosen = reply
+        .campus
+        .iter()
+        .find(|campus| campus.2)
+        .or(reply.campus.first());
+    chosen
+        .map(|campus| campus.0.to_string())
+        .ok_or_else(|| TicketError::Source("no campus available for this service".to_owned()))
 }
 
 /// Picks the only service center available; asks for an explicit one when there are several.
 fn default_center(json: &str) -> Result<String, TicketError> {
-    let reply: CentersReply = serde_json::from_str(json).map_err(|error| TicketError::Source(format!("center list: {error}")))?;
+    let reply: CentersReply = serde_json::from_str(json)
+        .map_err(|error| TicketError::Source(format!("center list: {error}")))?;
     match reply.centros.as_slice() {
-        [] => Err(TicketError::Source("no service center available for this campus".to_owned())),
+        [] => Err(TicketError::Source(
+            "no service center available for this campus".to_owned(),
+        )),
         [only] => Ok(only.0.to_string()),
         several => {
-            let options: Vec<_> = several.iter().map(|center| format!("{} ({})", center.0, center.1)).collect();
-            Err(TicketError::Source(format!("several service centers available, choose one: {}", options.join(", "))))
+            let options: Vec<_> = several
+                .iter()
+                .map(|center| format!("{} ({})", center.0, center.1))
+                .collect();
+            Err(TicketError::Source(format!(
+                "several service centers available, choose one: {}",
+                options.join(", ")
+            )))
         }
     }
 }
@@ -391,7 +463,11 @@ fn parse_open_result(path: &str, body: &str) -> Result<String, TicketError> {
         return Ok(id.trim_end_matches('/').to_owned());
     }
     if let Some((_, after)) = body.split_once(OPENED_MARKER) {
-        return Ok(after.trim_start().chars().take_while(char::is_ascii_digit).collect());
+        return Ok(after
+            .trim_start()
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect());
     }
     let document = Html::parse_document(body);
     let mut seen = HashSet::new();
@@ -401,22 +477,44 @@ fn parse_open_result(path: &str, body: &str) -> Result<String, TicketError> {
         .filter(|message| seen.insert(message.clone()))
         .collect();
     if errors.is_empty() {
-        return Err(TicketError::Source("could not confirm that the ticket was opened".to_owned()));
+        return Err(TicketError::Source(
+            "could not confirm that the ticket was opened".to_owned(),
+        ));
     }
-    Err(TicketError::Source(format!("SUAP rejected the ticket: {}", errors.join("; "))))
+    Err(TicketError::Source(format!(
+        "SUAP rejected the ticket: {}",
+        errors.join("; ")
+    )))
 }
 
 /// Extracts the details of ticket `id` from its SUAP page; `None` if the page is not a ticket page.
 pub fn parse_ticket_details(html: &str, base_url: &Url, id: &str) -> Option<TicketDetails> {
     let document = Html::parse_document(html);
-    let title = flat_text(document.select(&selector("main#content .title-container h2")).next()?);
-    let heading = document.select(&selector("main#content .accordion-button")).next().map(flat_text);
-    let statuses = document.select(&selector("main#content .object-status .status")).map(flat_text).collect();
+    let title = flat_text(
+        document
+            .select(&selector("main#content .title-container h2"))
+            .next()?,
+    );
+    let heading = document
+        .select(&selector("main#content .accordion-button"))
+        .next()
+        .map(flat_text);
+    let statuses = document
+        .select(&selector("main#content .object-status .status"))
+        .map(flat_text)
+        .collect();
 
     let (term, definition) = (selector("dt"), selector("dd"));
     let fields = document
-        .select(&selector("main#content .accordion-body .definition-list .list-item"))
-        .filter_map(|item| Some((flat_text(item.select(&term).next()?), rich_text(item.select(&definition).next()?))))
+        .select(&selector(
+            "main#content .accordion-body .definition-list .list-item",
+        ))
+        .filter_map(|item| {
+            Some((
+                flat_text(item.select(&term).next()?),
+                rich_text(item.select(&definition).next()?),
+            ))
+        })
         .collect();
 
     let (date, content) = (selector(".timeline-date"), selector(".timeline-content"));
@@ -437,7 +535,10 @@ pub fn parse_ticket_details(html: &str, base_url: &Url, id: &str) -> Option<Tick
         statuses,
         fields,
         timeline,
-        details_url: base_url.join(&format!("{TICKET_PATH_PREFIX}{id}/")).expect("ticket path is valid").to_string(),
+        details_url: base_url
+            .join(&format!("{TICKET_PATH_PREFIX}{id}/"))
+            .expect("ticket path is valid")
+            .to_string(),
     })
 }
 
@@ -445,7 +546,10 @@ pub fn parse_ticket_details(html: &str, base_url: &Url, id: &str) -> Option<Tick
 mod tests {
     use super::*;
     use tempfile::tempdir;
-    use wiremock::{matchers::{body_string_contains, method, path, query_param}, Mock, MockServer, ResponseTemplate};
+    use wiremock::{
+        matchers::{body_string_contains, method, path, query_param},
+        Mock, MockServer, ResponseTemplate,
+    };
 
     const LISTING: &str = r#"
         <div class="general-box danger"><div class="primary-info">
@@ -532,44 +636,96 @@ mod tests {
 
     #[test]
     fn picks_default_campus_and_center() {
-        assert_eq!(default_campus(r#"{"campus": [[1, "A", false], [2, "B", true]]}"#).unwrap(), "2");
-        assert_eq!(default_campus(r#"{"campus": [[1, "A", false], [2, "B", false]]}"#).unwrap(), "1");
-        assert!(default_campus(r#"{"campus": []}"#).unwrap_err().to_string().contains("no campus"));
-        assert!(default_campus("não é json").unwrap_err().to_string().contains("campus list"));
+        assert_eq!(
+            default_campus(r#"{"campus": [[1, "A", false], [2, "B", true]]}"#).unwrap(),
+            "2"
+        );
+        assert_eq!(
+            default_campus(r#"{"campus": [[1, "A", false], [2, "B", false]]}"#).unwrap(),
+            "1"
+        );
+        assert!(default_campus(r#"{"campus": []}"#)
+            .unwrap_err()
+            .to_string()
+            .contains("no campus"));
+        assert!(default_campus("não é json")
+            .unwrap_err()
+            .to_string()
+            .contains("campus list"));
 
-        assert_eq!(default_center(r#"{"centros": [[5, "Local", true]]}"#).unwrap(), "5");
-        assert!(default_center(r#"{"centros": []}"#).unwrap_err().to_string().contains("no service center"));
-        let several = default_center(r#"{"centros": [[5, "Local", true], [6, "Remoto", false]]}"#).unwrap_err().to_string();
+        assert_eq!(
+            default_center(r#"{"centros": [[5, "Local", true]]}"#).unwrap(),
+            "5"
+        );
+        assert!(default_center(r#"{"centros": []}"#)
+            .unwrap_err()
+            .to_string()
+            .contains("no service center"));
+        let several = default_center(r#"{"centros": [[5, "Local", true], [6, "Remoto", false]]}"#)
+            .unwrap_err()
+            .to_string();
         assert!(several.contains("5 (Local), 6 (Remoto)"));
-        assert!(default_center("não é json").unwrap_err().to_string().contains("center list"));
+        assert!(default_center("não é json")
+            .unwrap_err()
+            .to_string()
+            .contains("center list"));
     }
 
     #[test]
     fn interprets_open_results() {
-        assert_eq!(parse_open_result("/centralservicos/chamado/42/", "").unwrap(), "42");
+        assert_eq!(
+            parse_open_result("/centralservicos/chamado/42/", "").unwrap(),
+            "42"
+        );
         let flash = "<li>Chamado aberto com sucesso. Número do chamado: 77 </li>";
         assert_eq!(parse_open_result("/outra/", flash).unwrap(), "77");
         let errors = r#"<ul class="errorlist"><li>Campo obrigatório.</li></ul><p class="errornote">Campo obrigatório.</p>"#;
         assert_eq!(
-            parse_open_result("/abrir/", errors).unwrap_err().to_string(),
+            parse_open_result("/abrir/", errors)
+                .unwrap_err()
+                .to_string(),
             "ticket source error: SUAP rejected the ticket: Campo obrigatório."
         );
-        assert!(parse_open_result("/abrir/", "<p>nada</p>").unwrap_err().to_string().contains("could not confirm"));
+        assert!(parse_open_result("/abrir/", "<p>nada</p>")
+            .unwrap_err()
+            .to_string()
+            .contains("could not confirm"));
     }
 
     fn attachment(name: &str) -> Attachment {
-        Attachment { file_name: name.to_owned(), bytes: b"conteudo".to_vec() }
+        Attachment {
+            file_name: name.to_owned(),
+            bytes: b"conteudo".to_vec(),
+        }
     }
 
     #[test]
     fn validates_attachments() {
-        assert!(validate_attachments(&[attachment("a.PDF"), attachment("b.xlsx"), attachment("c.JpEg")]).is_ok());
+        assert!(validate_attachments(&[
+            attachment("a.PDF"),
+            attachment("b.xlsx"),
+            attachment("c.JpEg")
+        ])
+        .is_ok());
         assert!(validate_attachments(&[]).is_ok());
-        let too_many = [attachment("1.pdf"), attachment("2.pdf"), attachment("3.pdf"), attachment("4.pdf")];
-        assert!(validate_attachments(&too_many).unwrap_err().to_string().contains("at most 3"));
+        let too_many = [
+            attachment("1.pdf"),
+            attachment("2.pdf"),
+            attachment("3.pdf"),
+            attachment("4.pdf"),
+        ];
+        assert!(validate_attachments(&too_many)
+            .unwrap_err()
+            .to_string()
+            .contains("at most 3"));
         for name in ["virus.exe", "semextensao", "arquivo.pdf.zip"] {
-            let error = validate_attachments(&[attachment(name)]).unwrap_err().to_string();
-            assert!(error.contains("unsupported type") && error.contains("pdf, jpg"), "{name}");
+            let error = validate_attachments(&[attachment(name)])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("unsupported type") && error.contains("pdf, jpg"),
+                "{name}"
+            );
         }
     }
 
@@ -585,30 +741,69 @@ mod tests {
     #[tokio::test]
     async fn assumes_and_starts_service() {
         let server = MockServer::start().await;
-        mount_text(&server, "GET", "/centralservicos/auto_atribuir_chamado/5/", "<p class='alert-success'>ok</p>").await;
-        mount_text(&server, "GET", "/centralservicos/colocar_em_atendimento/5/", "ok").await;
-        mount_text(&server, "GET", "/centralservicos/auto_atribuir_chamado/6/", "<p class='alert-error'>Já resolvido <button>Fechar</button></p>").await;
+        mount_text(
+            &server,
+            "GET",
+            "/centralservicos/auto_atribuir_chamado/5/",
+            "<p class='alert-success'>ok</p>",
+        )
+        .await;
+        mount_text(
+            &server,
+            "GET",
+            "/centralservicos/colocar_em_atendimento/5/",
+            "ok",
+        )
+        .await;
+        mount_text(
+            &server,
+            "GET",
+            "/centralservicos/auto_atribuir_chamado/6/",
+            "<p class='alert-error'>Já resolvido <button>Fechar</button></p>",
+        )
+        .await;
         let (_dir, client) = client_for(&server).await;
         let source = SuapTicketSource::new(&client, TicketQueue::Support);
         source.assume_ticket("5").await.unwrap();
         source.start_service("5").await.unwrap();
         let refused = source.assume_ticket("6").await.unwrap_err().to_string();
-        assert_eq!(refused, "ticket source error: SUAP refused the action: Já resolvido");
-        assert!(matches!(source.start_service("x").await, Err(TicketError::Source(_))));
-        assert!(matches!(source.assume_ticket("404").await, Err(TicketError::Suap(SuapError::Transport(_)))));
+        assert_eq!(
+            refused,
+            "ticket source error: SUAP refused the action: Já resolvido"
+        );
+        assert!(matches!(
+            source.start_service("x").await,
+            Err(TicketError::Source(_))
+        ));
+        assert!(matches!(
+            source.assume_ticket("404").await,
+            Err(TicketError::Suap(SuapError::Transport(_)))
+        ));
     }
 
     #[tokio::test]
     async fn opens_ticket_with_attachments_and_email_copy() {
         let server = MockServer::start().await;
-        mount_text(&server, "GET", "/centralservicos/abrir_chamado/7/", OPEN_FORM).await;
+        mount_text(
+            &server,
+            "GET",
+            "/centralservicos/abrir_chamado/7/",
+            OPEN_FORM,
+        )
+        .await;
         Mock::given(method("POST"))
             .and(path("/centralservicos/abrir_chamado/7/"))
             .and(body_string_contains("name=\"enviar_copia_email\""))
-            .and(body_string_contains("name=\"chamadoanexo_set-0-descricao\""))
+            .and(body_string_contains(
+                "name=\"chamadoanexo_set-0-descricao\"",
+            ))
             .and(body_string_contains("relatorio.pdf"))
-            .and(body_string_contains("name=\"chamadoanexo_set-0-anexo\"; filename=\"relatorio.pdf\""))
-            .and(body_string_contains("name=\"chamadoanexo_set-1-anexo\"; filename=\"foto.png\""))
+            .and(body_string_contains(
+                "name=\"chamadoanexo_set-0-anexo\"; filename=\"relatorio.pdf\"",
+            ))
+            .and(body_string_contains(
+                "name=\"chamadoanexo_set-1-anexo\"; filename=\"foto.png\"",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_string("Número do chamado: 31"))
             .mount(&server)
             .await;
@@ -629,22 +824,46 @@ mod tests {
         let server = MockServer::start().await;
         let (_dir, client) = client_for(&server).await;
         let source = SuapTicketSource::new(&client, TicketQueue::Support);
-        let ticket = NewTicket { attachments: vec![attachment("virus.exe")], ..new_ticket() };
-        assert!(source.open_ticket(&ticket).await.unwrap_err().to_string().contains("unsupported type"));
+        let ticket = NewTicket {
+            attachments: vec![attachment("virus.exe")],
+            ..new_ticket()
+        };
+        assert!(source
+            .open_ticket(&ticket)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported type"));
     }
 
     #[tokio::test]
     async fn open_without_email_copy_drops_the_form_default() {
         let server = MockServer::start().await;
-        let form = format!("{OPEN_FORM}").replace("name=\"aceite\" checked", "name=\"enviar_copia_email\" checked");
+        let form = OPEN_FORM.replace(
+            "name=\"aceite\" checked",
+            "name=\"enviar_copia_email\" checked",
+        );
         mount_text(&server, "GET", "/centralservicos/abrir_chamado/7/", &form).await;
-        mount_text(&server, "POST", "/centralservicos/abrir_chamado/7/", "Número do chamado: 32").await;
+        mount_text(
+            &server,
+            "POST",
+            "/centralservicos/abrir_chamado/7/",
+            "Número do chamado: 32",
+        )
+        .await;
         let (_dir, client) = client_for(&server).await;
         let source = SuapTicketSource::new(&client, TicketQueue::Support);
-        let ticket = NewTicket { campus: Some("1".to_owned()), center: Some("2".to_owned()), ..new_ticket() };
+        let ticket = NewTicket {
+            campus: Some("1".to_owned()),
+            center: Some("2".to_owned()),
+            ..new_ticket()
+        };
         assert_eq!(source.open_ticket(&ticket).await.unwrap(), "32");
         let received = server.received_requests().await.unwrap();
-        let post = received.iter().find(|request| request.method == wiremock::http::Method::POST).unwrap();
+        let post = received
+            .iter()
+            .find(|request| request.method == wiremock::http::Method::POST)
+            .unwrap();
         assert!(!String::from_utf8_lossy(&post.body).contains("enviar_copia_email"));
     }
 
@@ -657,22 +876,47 @@ mod tests {
     }
 
     fn new_ticket() -> NewTicket {
-        NewTicket { service_id: 7, description: "Teste".to_owned(), ..NewTicket::default() }
+        NewTicket {
+            service_id: 7,
+            description: "Teste".to_owned(),
+            ..NewTicket::default()
+        }
     }
 
     #[tokio::test]
     async fn opens_ticket_using_suap_defaults() {
         let server = MockServer::start().await;
-        mount_text(&server, "GET", "/centralservicos/abrir_chamado/7/", OPEN_FORM).await;
-        mount_text(&server, "GET", "/centralservicos/get_campus_com_centros_atendimento/7/0/", r#"{"campus": [[3, "ZL", true]]}"#).await;
-        mount_text(&server, "GET", "/centralservicos/get_centros_atendimento_por_servico_e_campus/7/3/", r#"{"centros": [[9, "TI", true]]}"#).await;
+        mount_text(
+            &server,
+            "GET",
+            "/centralservicos/abrir_chamado/7/",
+            OPEN_FORM,
+        )
+        .await;
+        mount_text(
+            &server,
+            "GET",
+            "/centralservicos/get_campus_com_centros_atendimento/7/0/",
+            r#"{"campus": [[3, "ZL", true]]}"#,
+        )
+        .await;
+        mount_text(
+            &server,
+            "GET",
+            "/centralservicos/get_centros_atendimento_por_servico_e_campus/7/3/",
+            r#"{"centros": [[9, "TI", true]]}"#,
+        )
+        .await;
         Mock::given(method("POST"))
             .and(path("/centralservicos/abrir_chamado/7/"))
             .and(body_string_contains("descricao=Teste"))
             .and(body_string_contains("uo=3"))
             .and(body_string_contains("centro_atendimento=9"))
             .and(body_string_contains("csrfmiddlewaretoken=tok"))
-            .respond_with(ResponseTemplate::new(302).insert_header("location", "/centralservicos/chamado/99/"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", "/centralservicos/chamado/99/"),
+            )
             .mount(&server)
             .await;
         mount_text(&server, "GET", "/centralservicos/chamado/99/", "ok").await;
@@ -684,14 +928,23 @@ mod tests {
     #[tokio::test]
     async fn opens_ticket_with_explicit_values() {
         let server = MockServer::start().await;
-        mount_text(&server, "GET", "/centralservicos/abrir_chamado/7/", OPEN_FORM).await;
+        mount_text(
+            &server,
+            "GET",
+            "/centralservicos/abrir_chamado/7/",
+            OPEN_FORM,
+        )
+        .await;
         Mock::given(method("POST"))
             .and(path("/centralservicos/abrir_chamado/7/"))
             .and(body_string_contains("uo=4"))
             .and(body_string_contains("centro_atendimento=8"))
             .and(body_string_contains("interessado=55"))
             .and(body_string_contains("telefone=9999"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("Chamado aberto com sucesso. Número do chamado:123"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("Chamado aberto com sucesso. Número do chamado:123"),
+            )
             .mount(&server)
             .await;
         let (_dir, client) = client_for(&server).await;
@@ -709,24 +962,66 @@ mod tests {
     #[tokio::test]
     async fn open_ticket_reports_failures() {
         let server = MockServer::start().await;
-        mount_text(&server, "GET", "/centralservicos/abrir_chamado/7/", OPEN_FORM).await;
-        mount_text(&server, "GET", "/centralservicos/abrir_chamado/8/", "<p>sem formulário</p>").await;
-        mount_text(&server, "POST", "/centralservicos/abrir_chamado/7/", r#"<ul class="errorlist"><li>Descrição inválida.</li></ul>"#).await;
+        mount_text(
+            &server,
+            "GET",
+            "/centralservicos/abrir_chamado/7/",
+            OPEN_FORM,
+        )
+        .await;
+        mount_text(
+            &server,
+            "GET",
+            "/centralservicos/abrir_chamado/8/",
+            "<p>sem formulário</p>",
+        )
+        .await;
+        mount_text(
+            &server,
+            "POST",
+            "/centralservicos/abrir_chamado/7/",
+            r#"<ul class="errorlist"><li>Descrição inválida.</li></ul>"#,
+        )
+        .await;
         let (_dir, client) = client_for(&server).await;
         let source = SuapTicketSource::new(&client, TicketQueue::Support);
 
-        let no_form = NewTicket { service_id: 8, ..new_ticket() };
-        assert!(source.open_ticket(&no_form).await.unwrap_err().to_string().contains("no ticket form"));
+        let no_form = NewTicket {
+            service_id: 8,
+            ..new_ticket()
+        };
+        assert!(source
+            .open_ticket(&no_form)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("no ticket form"));
 
         let missing_campus_list = source.open_ticket(&new_ticket()).await;
-        assert!(matches!(missing_campus_list, Err(TicketError::Suap(SuapError::Transport(_)))));
+        assert!(matches!(
+            missing_campus_list,
+            Err(TicketError::Suap(SuapError::Transport(_)))
+        ));
 
-        let explicit_campus = NewTicket { campus: Some("1".to_owned()), ..new_ticket() };
+        let explicit_campus = NewTicket {
+            campus: Some("1".to_owned()),
+            ..new_ticket()
+        };
         let missing_center_list = source.open_ticket(&explicit_campus).await;
-        assert!(matches!(missing_center_list, Err(TicketError::Suap(SuapError::Transport(_)))));
+        assert!(matches!(
+            missing_center_list,
+            Err(TicketError::Suap(SuapError::Transport(_)))
+        ));
 
-        let explicit_all = NewTicket { center: Some("2".to_owned()), ..explicit_campus };
-        let rejected = source.open_ticket(&explicit_all).await.unwrap_err().to_string();
+        let explicit_all = NewTicket {
+            center: Some("2".to_owned()),
+            ..explicit_campus
+        };
+        let rejected = source
+            .open_ticket(&explicit_all)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(rejected.contains("Descrição inválida."));
     }
 
@@ -747,33 +1042,56 @@ mod tests {
                 details_url: "https://suap.example/centralservicos/chamado/559298/".to_owned(),
             }
         );
-        assert_eq!((tickets[1].id.as_str(), tickets[1].subject.clone(), tickets[1].status.clone()), ("1", None, None));
+        assert_eq!(
+            (
+                tickets[1].id.as_str(),
+                tickets[1].subject.clone(),
+                tickets[1].status.clone()
+            ),
+            ("1", None, None)
+        );
     }
 
     #[test]
     fn parses_ticket_details() {
         let details = parse_ticket_details(DETAILS, &base(), "559298").unwrap();
         assert_eq!(details.title, "Chamado Interno 559298");
-        assert_eq!(details.heading.as_deref(), Some("1.2 Gestão | Atualização de versão"));
-        assert_eq!(details.statuses, ["Em atendimento", "Tempo previsto ultrapassado"]);
+        assert_eq!(
+            details.heading.as_deref(),
+            Some("1.2 Gestão | Atualização de versão")
+        );
+        assert_eq!(
+            details.statuses,
+            ["Em atendimento", "Tempo previsto ultrapassado"]
+        );
         assert_eq!(
             details.fields,
             [
                 ("Interessado".to_owned(), "Wagner Oliveira".to_owned()),
-                ("Descrição".to_owned(), "Atualizar para a versão 5.3.0\nsegunda linha\n\ndepois do vazio".to_owned()),
+                (
+                    "Descrição".to_owned(),
+                    "Atualizar para a versão 5.3.0\nsegunda linha\n\ndepois do vazio".to_owned()
+                ),
             ]
         );
         assert_eq!(
             details.timeline,
-            [TimelineEntry { date: "06/10/2026 19:15:03".to_owned(), text: "Kelson comentou: Build pronto.".to_owned() }]
+            [TimelineEntry {
+                date: "06/10/2026 19:15:03".to_owned(),
+                text: "Kelson comentou: Build pronto.".to_owned()
+            }]
         );
-        assert_eq!(details.details_url, "https://suap.example/centralservicos/chamado/559298/");
+        assert_eq!(
+            details.details_url,
+            "https://suap.example/centralservicos/chamado/559298/"
+        );
         assert_eq!(details.clone(), details);
     }
 
     #[test]
     fn details_of_minimal_page_have_no_optional_parts() {
-        let html = r#"<main id="content"><div class="title-container"><h2>Chamado</h2></div></main>"#;
+        let html =
+            r#"<main id="content"><div class="title-container"><h2>Chamado</h2></div></main>"#;
         let details = parse_ticket_details(html, &base(), "1").unwrap();
         assert!(details.heading.is_none() && details.statuses.is_empty());
         assert!(details.fields.is_empty() && details.timeline.is_empty());
@@ -791,14 +1109,22 @@ mod tests {
 
     #[test]
     fn queues_have_distinct_paths() {
-        assert!(TicketQueue::Support.path().contains("listar_chamados_suporte"));
+        assert!(TicketQueue::Support
+            .path()
+            .contains("listar_chamados_suporte"));
         assert!(TicketQueue::Mine.path().contains("meus_chamados"));
     }
 
     #[test]
     fn errors_are_displayed() {
-        assert_eq!(TicketError::NotImplemented.to_string(), "ticket source is not implemented yet");
-        assert_eq!(TicketError::Source("x".to_owned()).to_string(), "ticket source error: x");
+        assert_eq!(
+            TicketError::NotImplemented.to_string(),
+            "ticket source is not implemented yet"
+        );
+        assert_eq!(
+            TicketError::Source("x".to_owned()).to_string(),
+            "ticket source error: x"
+        );
         assert_eq!(
             TicketError::from(SuapError::NotAuthenticated).to_string(),
             "SUAP session is not authenticated"
@@ -819,7 +1145,8 @@ mod tests {
 
     async fn client_for(server: &MockServer) -> (tempfile::TempDir, SuapClient) {
         let directory = tempdir().unwrap();
-        let paths = suap_core::AppPaths::from_dirs(directory.path().join("c"), directory.path().join("d"));
+        let paths =
+            suap_core::AppPaths::from_dirs(directory.path().join("c"), directory.path().join("d"));
         let config = suap_core::SuapConfig {
             base_url: Url::parse(&format!("{}/", server.uri())).unwrap(),
             ..suap_core::SuapConfig::default()
@@ -856,11 +1183,26 @@ mod tests {
             .await;
         let (_dir, client) = client_for(&server).await;
         let source = SuapTicketSource::new(&client, TicketQueue::Support);
-        assert_eq!(source.get_ticket("559298").await.unwrap().title, "Chamado Interno 559298");
-        assert!(matches!(source.get_ticket("7").await, Err(TicketError::Source(_))));
-        assert!(matches!(source.get_ticket("").await, Err(TicketError::Source(_))));
-        assert!(matches!(source.get_ticket("../x").await, Err(TicketError::Source(_))));
-        assert!(matches!(source.get_ticket("404").await, Err(TicketError::Suap(SuapError::Transport(_)))));
+        assert_eq!(
+            source.get_ticket("559298").await.unwrap().title,
+            "Chamado Interno 559298"
+        );
+        assert!(matches!(
+            source.get_ticket("7").await,
+            Err(TicketError::Source(_))
+        ));
+        assert!(matches!(
+            source.get_ticket("").await,
+            Err(TicketError::Source(_))
+        ));
+        assert!(matches!(
+            source.get_ticket("../x").await,
+            Err(TicketError::Source(_))
+        ));
+        assert!(matches!(
+            source.get_ticket("404").await,
+            Err(TicketError::Suap(SuapError::Transport(_)))
+        ));
     }
 
     #[tokio::test]
@@ -871,9 +1213,16 @@ mod tests {
             .respond_with(ResponseTemplate::new(302).insert_header("location", "/accounts/login/"))
             .mount(&server)
             .await;
-        Mock::given(method("GET")).and(path("/accounts/login/")).respond_with(ResponseTemplate::new(200)).mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/accounts/login/"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
         let (_dir, client) = client_for(&server).await;
         let source = SuapTicketSource::new(&client, TicketQueue::Support);
-        assert!(matches!(source.list_tickets().await, Err(TicketError::Suap(SuapError::NotAuthenticated))));
+        assert!(matches!(
+            source.list_tickets().await,
+            Err(TicketError::Suap(SuapError::NotAuthenticated))
+        ));
     }
 }

@@ -2,14 +2,28 @@
 //!
 //! The binary entry point (`main.rs`) is a thin wrapper; everything testable lives here.
 
-use std::{error::Error, ffi::OsString, fs, io::{Read, Write}, path::PathBuf};
+use std::{
+    error::Error,
+    ffi::OsString,
+    fs,
+    io::{Read, Write},
+    path::PathBuf,
+};
 
+use chamados_core::{
+    Attachment, NewTicket, SuapTicketSource, TicketDetails, TicketError, TicketQueue, TicketSource,
+};
 use clap::{Args, Parser, Subcommand};
-use chamados_core::{Attachment, NewTicket, SuapTicketSource, TicketDetails, TicketError, TicketQueue, TicketSource};
-use suap_core::{load_config, save_config, AppPaths, SuapClient, SuapConfig, SuapError, DEFAULT_PROFILE};
+use suap_core::{
+    load_config, save_config, AppPaths, SuapClient, SuapConfig, SuapError, DEFAULT_PROFILE,
+};
 
 #[derive(Debug, Parser)]
-#[command(name = "chamados", version, about = "Cliente local para chamados do SUAP")]
+#[command(
+    name = "chamados",
+    version,
+    about = "Cliente local para chamados do SUAP"
+)]
 struct Cli {
     /// Perfil (ambiente) a usar; cada perfil tem sua configuração e sua sessão.
     #[arg(long, global = true, default_value = DEFAULT_PROFILE)]
@@ -109,6 +123,8 @@ struct OpenArgs {
     fields: Vec<(String, String)>,
 }
 
+const HELP_HINT: &str = "Use `chamados --help` para consultar os comandos disponíveis.";
+
 /// Name of the environment variable that holds the SUAP password.
 pub const PASSWORD_ENV: &str = "SUAP_PASSWORD";
 
@@ -174,11 +190,14 @@ fn execute(
         Some(Command::Show { id }) => show(paths, id, out),
         Some(Command::Open(args)) => open(paths, args, input, out),
         Some(Command::Status) => {
-            writeln!(out, "chamados-cli: fundação inicial instalada; integração ainda não implementada.")?;
+            writeln!(
+                out,
+                "chamados-cli: fundação inicial instalada; integração ainda não implementada."
+            )?;
             Ok(())
         }
         None => {
-            writeln!(out, "Use `chamados --help` para consultar os comandos disponíveis.")?;
+            writeln!(out, "{HELP_HINT}")?;
             Ok(())
         }
     }
@@ -211,7 +230,8 @@ fn show_config(paths: &AppPaths, out: &mut dyn Write) -> Result<(), Box<dyn Erro
         Some(config) => {
             writeln!(out, "profile: {}", paths.profile())?;
             writeln!(out, "base_url: {}", config.base_url)?;
-            writeln!(out, "username: {}", config.username.as_deref().unwrap_or("<não configurado>"))?;
+            let username = config.username.as_deref().unwrap_or("<não configurado>");
+            writeln!(out, "username: {username}")?;
             let open = &config.open;
             let defaults = [
                 ("service", open.service.map(|service| service.to_string())),
@@ -219,14 +239,21 @@ fn show_config(paths: &AppPaths, out: &mut dyn Write) -> Result<(), Box<dyn Erro
                 ("campus", open.campus.clone()),
                 ("center", open.center.clone()),
             ];
-            for (name, value) in defaults.iter().filter_map(|(name, value)| Some((name, value.as_ref()?))) {
+            for (name, value) in defaults
+                .iter()
+                .filter_map(|(name, value)| Some((name, value.as_ref()?)))
+            {
                 writeln!(out, "open.{name}: {value}")?;
             }
             writeln!(out, "file: {}", paths.config_file().display())?;
         }
         None => {
             let (profile, file) = (paths.profile(), paths.config_file());
-            writeln!(out, "Nenhuma configuração encontrada para o perfil {profile} em {}", file.display())?;
+            let message = format!(
+                "Nenhuma configuração encontrada para o perfil {profile} em {}",
+                file.display()
+            );
+            writeln!(out, "{message}")?;
         }
     }
     Ok(())
@@ -242,20 +269,34 @@ fn login(
     let username = username
         .or_else(|| config.username.clone())
         .ok_or("usuário não informado: use --username ou `config-init --username`")?;
-    let password = password.ok_or_else(|| format!("senha não informada: defina a variável de ambiente {PASSWORD_ENV}"))?;
+    let password = password.ok_or_else(|| {
+        format!("senha não informada: defina a variável de ambiente {PASSWORD_ENV}")
+    })?;
 
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
     let client = SuapClient::open(paths, &config)?;
     runtime.block_on(client.login(&username, &password))?;
     let (profile, session) = (paths.profile(), paths.session_file());
-    writeln!(out, "Login realizado como {username} (perfil {profile}). Sessão salva em {}", session.display())?;
+    let message = format!(
+        "Login realizado como {username} (perfil {profile}). Sessão salva em {}",
+        session.display()
+    );
+    writeln!(out, "{message}")?;
     Ok(())
 }
 
 fn list(paths: &AppPaths, mine: bool, out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
     let config = profile_config(paths)?;
-    let queue = if mine { TicketQueue::Mine } else { TicketQueue::Support };
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let queue = if mine {
+        TicketQueue::Mine
+    } else {
+        TicketQueue::Support
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
     let client = SuapClient::open(paths, &config)?;
     let source = SuapTicketSource::new(&client, queue);
 
@@ -274,10 +315,14 @@ fn list(paths: &AppPaths, mine: bool, out: &mut dyn Write) -> Result<(), Box<dyn
 
 fn show(paths: &AppPaths, id: u64, out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
     let config = profile_config(paths)?;
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
     let client = SuapClient::open(paths, &config)?;
     let source = SuapTicketSource::new(&client, TicketQueue::Support);
-    let details = runtime.block_on(source.get_ticket(&id.to_string())).map_err(explain)?;
+    let details = runtime
+        .block_on(source.get_ticket(&id.to_string()))
+        .map_err(explain)?;
     print_details(&details, out)?;
     Ok(())
 }
@@ -296,7 +341,10 @@ fn read_text(value: Option<String>, input: &mut dyn Read) -> Result<String, Box<
     };
     let text = text.trim_end_matches(['\r', '\n']).to_owned();
     if text.trim().is_empty() {
-        return Err("texto não informado: passe o valor na opção, use `-` ou envie pela entrada padrão".into());
+        return Err(
+            "texto não informado: passe o valor na opção, use `-` ou envie pela entrada padrão"
+                .into(),
+        );
     }
     Ok(text)
 }
@@ -304,8 +352,12 @@ fn read_text(value: Option<String>, input: &mut dyn Read) -> Result<String, Box<
 fn read_attachments(files: &[PathBuf]) -> Result<Vec<Attachment>, Box<dyn Error>> {
     let mut attachments = Vec::new();
     for path in files {
-        let bytes = fs::read(path).map_err(|error| format!("não foi possível ler o anexo {}: {error}", path.display()))?;
-        let file_name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+        let bytes = fs::read(path)
+            .map_err(|error| format!("não foi possível ler o anexo {}: {error}", path.display()))?;
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
         attachments.push(Attachment { file_name, bytes });
     }
     Ok(attachments)
@@ -313,10 +365,19 @@ fn read_attachments(files: &[PathBuf]) -> Result<Vec<Attachment>, Box<dyn Error>
 
 /// Error for a step done after the ticket was already opened, so the new ticket id is not lost.
 fn after_open(id: &str, action: &str, error: TicketError) -> Box<dyn Error> {
-    format!("o chamado #{id} foi aberto, mas não foi possível {action}: {}", explain(error)).into()
+    format!(
+        "o chamado #{id} foi aberto, mas não foi possível {action}: {}",
+        explain(error)
+    )
+    .into()
 }
 
-fn open(paths: &AppPaths, args: OpenArgs, input: &mut dyn Read, out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
+fn open(
+    paths: &AppPaths,
+    args: OpenArgs,
+    input: &mut dyn Read,
+    out: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
     let config = profile_config(paths)?;
     let defaults = &config.open;
     let service_id = args.service.or(defaults.service).ok_or("serviço não informado: passe o número ou defina o padrão do perfil (config-init --service)")?;
@@ -335,18 +396,29 @@ fn open(paths: &AppPaths, args: OpenArgs, input: &mut dyn Read, out: &mut dyn Wr
         attachments: read_attachments(&args.attach)?,
     };
 
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
     let client = SuapClient::open(paths, &config)?;
     let source = SuapTicketSource::new(&client, TicketQueue::Support);
-    let id = runtime.block_on(source.open_ticket(&ticket)).map_err(explain)?;
-    writeln!(out, "Chamado #{id} aberto: {}", client.base_url().join(&format!("centralservicos/chamado/{id}/"))?)?;
+    let id = runtime
+        .block_on(source.open_ticket(&ticket))
+        .map_err(explain)?;
+    let url = client
+        .base_url()
+        .join(&format!("centralservicos/chamado/{id}/"))?;
+    writeln!(out, "Chamado #{id} aberto: {url}")?;
 
     if args.assume || args.start {
-        runtime.block_on(source.assume_ticket(&id)).map_err(|error| after_open(&id, "assumi-lo", error))?;
+        runtime
+            .block_on(source.assume_ticket(&id))
+            .map_err(|error| after_open(&id, "assumi-lo", error))?;
         writeln!(out, "Chamado #{id} assumido.")?;
     }
     if args.start {
-        runtime.block_on(source.start_service(&id)).map_err(|error| after_open(&id, "colocá-lo em atendimento", error))?;
+        runtime
+            .block_on(source.start_service(&id))
+            .map_err(|error| after_open(&id, "colocá-lo em atendimento", error))?;
         writeln!(out, "Chamado #{id} em atendimento.")?;
     }
     Ok(())
@@ -355,14 +427,16 @@ fn open(paths: &AppPaths, args: OpenArgs, input: &mut dyn Read, out: &mut dyn Wr
 fn print_details(details: &TicketDetails, out: &mut dyn Write) -> std::io::Result<()> {
     writeln!(out, "{}", details.title)?;
     writeln!(out, "Situação: {}", details.statuses.join("; "))?;
-    writeln!(out, "Serviço: {}", details.heading.as_deref().unwrap_or("-"))?;
+    let heading = details.heading.as_deref().unwrap_or("-");
+    writeln!(out, "Serviço: {heading}")?;
     writeln!(out, "URL: {}", details.details_url)?;
     for (label, value) in &details.fields {
         writeln!(out, "{label}: {}", indent_continuation(value, "    "))?;
     }
     writeln!(out, "\nLinha do tempo:")?;
     for entry in &details.timeline {
-        writeln!(out, "  {}  {}", entry.date, indent_continuation(&entry.text, "      "))?;
+        let text = indent_continuation(&entry.text, "      ");
+        writeln!(out, "  {}  {text}", entry.date)?;
     }
     Ok(())
 }
@@ -375,12 +449,18 @@ fn indent_continuation(text: &str, prefix: &str) -> String {
 /// Turns ticket errors into user-facing messages.
 fn explain(error: TicketError) -> Box<dyn Error> {
     match error {
-        TicketError::Suap(SuapError::NotAuthenticated) => "sessão ausente ou expirada: execute `chamados login`".into(),
+        TicketError::Suap(SuapError::NotAuthenticated) => {
+            "sessão ausente ou expirada: execute `chamados login`".into()
+        }
         other => other.into(),
     }
 }
 
-fn init_config(paths: &AppPaths, args: ConfigInitArgs, out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
+fn init_config(
+    paths: &AppPaths,
+    args: ConfigInitArgs,
+    out: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
     let mut config = load_config(paths)?.unwrap_or_default();
 
     if let Some(base_url) = args.base_url {
@@ -396,7 +476,12 @@ fn init_config(paths: &AppPaths, args: ConfigInitArgs, out: &mut dyn Write) -> R
     open.center = args.center.or(open.center.take());
 
     save_config(paths, &config)?;
-    writeln!(out, "Configuração salva em {} (perfil {})", paths.config_file().display(), paths.profile())?;
+    let message = format!(
+        "Configuração salva em {} (perfil {})",
+        paths.config_file().display(),
+        paths.profile()
+    );
+    writeln!(out, "{message}")?;
     Ok(())
 }
 
@@ -404,18 +489,35 @@ fn init_config(paths: &AppPaths, args: ConfigInitArgs, out: &mut dyn Write) -> R
 mod tests {
     use super::*;
     use tempfile::{tempdir, TempDir};
-    use wiremock::{matchers::{method, path}, Mock, MockServer, ResponseTemplate};
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
 
     fn paths() -> (TempDir, AppPaths) {
         let directory = tempdir().unwrap();
-        let paths = AppPaths::from_dirs(directory.path().join("config"), directory.path().join("data"));
+        let paths = AppPaths::from_dirs(
+            directory.path().join("config"),
+            directory.path().join("data"),
+        );
         (directory, paths)
     }
 
     fn run_args(args: &[&str], paths: &AppPaths) -> (i32, String, String) {
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = run(std::iter::once("chamados").chain(args.iter().copied()), paths, None, &mut std::io::empty(), &mut out, &mut err);
-        (code, String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
+        let code = run(
+            std::iter::once("chamados").chain(args.iter().copied()),
+            paths,
+            None,
+            &mut std::io::empty(),
+            &mut out,
+            &mut err,
+        );
+        (
+            code,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
     }
 
     #[test]
@@ -469,7 +571,10 @@ mod tests {
     #[test]
     fn config_init_then_show() {
         let (_dir, paths) = paths();
-        let (code, out, _) = run_args(&["config-init", "--base-url", "https://example.org/"], &paths);
+        let (code, out, _) = run_args(
+            &["config-init", "--base-url", "https://example.org/"],
+            &paths,
+        );
         assert_eq!(code, 0);
         assert!(out.contains("Configuração salva"));
 
@@ -486,7 +591,16 @@ mod tests {
     fn profiles_isolate_configuration_and_session() {
         let (_dir, paths) = paths();
         let (_runtime, server) = mock_server(true);
-        let (code, out, _) = run_args(&["config-init", "--profile", "local", "--base-url", &server.uri()], &paths);
+        let (code, out, _) = run_args(
+            &[
+                "config-init",
+                "--profile",
+                "local",
+                "--base-url",
+                &server.uri(),
+            ],
+            &paths,
+        );
         assert!(code == 0 && out.contains("(perfil local)"));
 
         let (_, out, _) = run_args(&["config-show"], &paths);
@@ -496,10 +610,19 @@ mod tests {
         let (_, out, _) = run_args(&["paths", "--profile", "local"], &paths);
         assert!(out.contains("profile: local") && out.contains("session-local.cookies"));
 
-        let (code, out, err) = run_login(&["login", "--profile", "local", "--username", "dev"], &paths, Some("segredo"));
+        let (code, out, err) = run_login(
+            &["login", "--profile", "local", "--username", "dev"],
+            &paths,
+            Some("segredo"),
+        );
         assert_eq!((code, err.as_str()), (0, ""));
         assert!(out.contains("(perfil local)"));
-        assert!(paths.clone().with_profile("local").unwrap().session_file().exists());
+        assert!(paths
+            .clone()
+            .with_profile("local")
+            .unwrap()
+            .session_file()
+            .exists());
         assert!(!paths.session_file().exists());
     }
 
@@ -556,11 +679,18 @@ mod tests {
             &mut out,
             &mut err,
         );
-        (code, String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
+        (
+            code,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
     }
 
     fn mock_server(login_succeeds: bool) -> (tokio::runtime::Runtime, MockServer) {
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let server = runtime.block_on(async {
             let server = MockServer::start().await;
             Mock::given(method("GET"))
@@ -575,8 +705,15 @@ mod tests {
             } else {
                 ResponseTemplate::new(401)
             };
-            Mock::given(method("POST")).respond_with(post).mount(&server).await;
-            Mock::given(method("GET")).and(path("/")).respond_with(ResponseTemplate::new(200)).mount(&server).await;
+            Mock::given(method("POST"))
+                .respond_with(post)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
             server
         });
         (runtime, server)
@@ -587,7 +724,8 @@ mod tests {
         let (_dir, paths) = paths();
         let (_runtime, server) = mock_server(true);
         run_args(&["config-init", "--base-url", &server.uri()], &paths);
-        let (code, out, err) = run_login(&["login", "--username", "kelson"], &paths, Some("segredo"));
+        let (code, out, err) =
+            run_login(&["login", "--username", "kelson"], &paths, Some("segredo"));
         assert_eq!((code, err.as_str()), (0, ""));
         assert!(out.contains("Login realizado como kelson") && !out.contains("segredo"));
         assert!(paths.session_file().exists());
@@ -597,7 +735,16 @@ mod tests {
     fn login_falls_back_to_configured_username() {
         let (_dir, paths) = paths();
         let (_runtime, server) = mock_server(true);
-        run_args(&["config-init", "--base-url", &server.uri(), "--username", "cfg"], &paths);
+        run_args(
+            &[
+                "config-init",
+                "--base-url",
+                &server.uri(),
+                "--username",
+                "cfg",
+            ],
+            &paths,
+        );
         let (code, out, _) = run_login(&["login"], &paths, Some("segredo"));
         assert_eq!(code, 0);
         assert!(out.contains("como cfg"));
@@ -614,9 +761,17 @@ mod tests {
         assert!(!paths.session_file().exists());
     }
 
-    fn mount_listing(runtime: &tokio::runtime::Runtime, server: &MockServer, request_path: &str, body: ResponseTemplate) {
+    fn mount_listing(
+        runtime: &tokio::runtime::Runtime,
+        server: &MockServer,
+        request_path: &str,
+        body: ResponseTemplate,
+    ) {
         runtime.block_on(
-            Mock::given(method("GET")).and(path(request_path.to_owned())).respond_with(body).mount(server),
+            Mock::given(method("GET"))
+                .and(path(request_path.to_owned()))
+                .respond_with(body)
+                .mount(server),
         );
     }
 
@@ -628,8 +783,18 @@ mod tests {
         let html = r#"<div class="general-box"><span class="status">Em atendimento</span>
             <h4><a href="/centralservicos/chamado/7/">REQ #7 <strong>Assunto</strong></a></h4></div>
             <div class="general-box"><h4><a href="/centralservicos/chamado/8/">REQ #8</a></h4></div>"#;
-        mount_listing(&runtime, &server, "/centralservicos/listar_chamados_suporte/", ResponseTemplate::new(200).set_body_string(html));
-        mount_listing(&runtime, &server, "/centralservicos/meus_chamados/", ResponseTemplate::new(200).set_body_string(html));
+        mount_listing(
+            &runtime,
+            &server,
+            "/centralservicos/listar_chamados_suporte/",
+            ResponseTemplate::new(200).set_body_string(html),
+        );
+        mount_listing(
+            &runtime,
+            &server,
+            "/centralservicos/meus_chamados/",
+            ResponseTemplate::new(200).set_body_string(html),
+        );
 
         for args in [&["list"][..], &["list", "--meus"][..]] {
             let (code, out, err) = run_args(args, &paths);
@@ -649,11 +814,19 @@ mod tests {
             <div class="accordion-body"><dl class="definition-list"><div class="list-item"><dt>Descrição</dt><dd>Texto</dd></div></dl></div></div>
             <div data-tab="linha_tempo"><ul class="timeline"><li><div class="timeline-date">01/01/2026 10:00:00</div>
             <div class="timeline-content">Chamado aberto</div></li></ul></div></main>"#;
-        mount_listing(&runtime, &server, "/centralservicos/chamado/7/", ResponseTemplate::new(200).set_body_string(html));
+        mount_listing(
+            &runtime,
+            &server,
+            "/centralservicos/chamado/7/",
+            ResponseTemplate::new(200).set_body_string(html),
+        );
         let (code, out, err) = run_args(&["show", "7"], &paths);
         assert_eq!((code, err.as_str()), (0, ""));
-        assert!(out.starts_with("Chamado Interno 7\nSituação: Aberto\nServiço: Serviço | Assunto\nURL: "));
-        assert!(out.contains("Descrição: Texto\n\nLinha do tempo:\n  01/01/2026 10:00:00  Chamado aberto\n"));
+        assert!(out
+            .starts_with("Chamado Interno 7\nSituação: Aberto\nServiço: Serviço | Assunto\nURL: "));
+        assert!(out.contains(
+            "Descrição: Texto\n\nLinha do tempo:\n  01/01/2026 10:00:00  Chamado aberto\n"
+        ));
     }
 
     #[test]
@@ -666,7 +839,12 @@ mod tests {
             <dt>Descrição</dt><dd>linha 1<br>linha 2</dd></div></dl></div></div>
             <div data-tab="linha_tempo"><ul class="timeline"><li><div class="timeline-date">01/01/2026 10:00:00</div>
             <div class="timeline-content">Fulano comentou:<p>a<br>b</p></div></li></ul></div></main>"#;
-        mount_listing(&runtime, &server, "/centralservicos/chamado/9/", ResponseTemplate::new(200).set_body_string(html));
+        mount_listing(
+            &runtime,
+            &server,
+            "/centralservicos/chamado/9/",
+            ResponseTemplate::new(200).set_body_string(html),
+        );
         let (code, out, _) = run_args(&["show", "9"], &paths);
         assert_eq!(code, 0);
         assert!(out.contains("Descrição: linha 1\n    linha 2\n"));
@@ -679,7 +857,12 @@ mod tests {
         let (runtime, server) = mock_server(true);
         run_args(&["config-init", "--base-url", &server.uri()], &paths);
         let html = r#"<main id="content"><div class="title-container"><h2>Chamado Interno 8</h2></div></main>"#;
-        mount_listing(&runtime, &server, "/centralservicos/chamado/8/", ResponseTemplate::new(200).set_body_string(html));
+        mount_listing(
+            &runtime,
+            &server,
+            "/centralservicos/chamado/8/",
+            ResponseTemplate::new(200).set_body_string(html),
+        );
         let (code, out, _) = run_args(&["show", "8"], &paths);
         assert_eq!(code, 0);
         assert!(out.contains("Serviço: -"));
@@ -715,7 +898,11 @@ mod tests {
             &mut out,
             &mut err,
         );
-        (code, String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
+        (
+            code,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
     }
 
     const OPEN_FORM: &str = r#"<form method="post"><textarea name="descricao"></textarea>
@@ -726,18 +913,45 @@ mod tests {
         let (dir, paths) = paths();
         let (runtime, server) = bare_server();
         let uri = server.uri();
-        let init = ["config-init", "--base-url", &uri, "--service", "7", "--interested", "1", "--campus", "2", "--center", "3"];
+        let init = [
+            "config-init",
+            "--base-url",
+            &uri,
+            "--service",
+            "7",
+            "--interested",
+            "1",
+            "--campus",
+            "2",
+            "--center",
+            "3",
+        ];
         assert_eq!(run_args(&init, &paths).0, 0);
         let form = ResponseTemplate::new(200).set_body_string(OPEN_FORM);
-        mount_text(&runtime, &server, "GET", "/centralservicos/abrir_chamado/7/", form);
+        mount_text(
+            &runtime,
+            &server,
+            "GET",
+            "/centralservicos/abrir_chamado/7/",
+            form,
+        );
         let created = ResponseTemplate::new(200).set_body_string("Número do chamado: 99");
-        mount_text(&runtime, &server, "POST", "/centralservicos/abrir_chamado/7/", created);
+        mount_text(
+            &runtime,
+            &server,
+            "POST",
+            "/centralservicos/abrir_chamado/7/",
+            created,
+        );
         (dir, paths, runtime, server)
     }
 
     fn posted_body(runtime: &tokio::runtime::Runtime, server: &MockServer) -> String {
         let requests = runtime.block_on(server.received_requests()).unwrap();
-        let post = requests.iter().find(|request| request.method == wiremock::http::Method::POST).unwrap();
+        let post = requests
+            .iter()
+            .find(|request| request.method == wiremock::http::Method::POST)
+            .unwrap();
         String::from_utf8_lossy(&post.body).into_owned()
     }
 
@@ -748,8 +962,12 @@ mod tests {
         assert_eq!((code, err.as_str()), (0, ""));
         assert!(out.starts_with("Chamado #99 aberto: "));
         let body = posted_body(&runtime, &server);
-        assert!(body.contains("descricao=linha+1%0Alinha+2&") || body.contains("descricao=linha+1%0Alinha+2"));
-        assert!(body.contains("interessado=1") && body.contains("uo=2") && body.contains("centro_atendimento=3"));
+        assert!(body.contains("descricao=linha+1%0Alinha+2&"));
+        assert!(
+            body.contains("interessado=1")
+                && body.contains("uo=2")
+                && body.contains("centro_atendimento=3")
+        );
         assert!(body.contains("enviar_copia_email=on"));
     }
 
@@ -796,7 +1014,10 @@ mod tests {
         let (code, _, err) = run_args(&["open", "-d", "x", "-a", report.to_str().unwrap()], &paths);
         assert_eq!((code, err.as_str()), (0, ""));
         let body = posted_body(&runtime, &server);
-        assert!(body.contains("name=\"chamadoanexo_set-0-anexo\"; filename=\"relatorio.pdf\"") && body.contains("%PDF conteudo"));
+        assert!(
+            body.contains("name=\"chamadoanexo_set-0-anexo\"; filename=\"relatorio.pdf\"")
+                && body.contains("%PDF conteudo")
+        );
 
         let exe = dir.path().join("virus.exe");
         std::fs::write(&exe, b"MZ").unwrap();
@@ -805,7 +1026,10 @@ mod tests {
         assert!(err.contains("unsupported type"));
 
         let missing = dir.path().join("nao-existe.pdf");
-        let (code, _, err) = run_args(&["open", "-d", "x", "-a", missing.to_str().unwrap()], &paths);
+        let (code, _, err) = run_args(
+            &["open", "-d", "x", "-a", missing.to_str().unwrap()],
+            &paths,
+        );
         assert_eq!(code, 1);
         assert!(err.contains("não foi possível ler o anexo"));
     }
@@ -814,30 +1038,60 @@ mod tests {
     fn open_can_assume_and_start_the_ticket() {
         let (_dir, paths, runtime, server) = open_setup();
         let ok = || ResponseTemplate::new(200);
-        mount_text(&runtime, &server, "GET", "/centralservicos/auto_atribuir_chamado/99/", ok());
-        mount_text(&runtime, &server, "GET", "/centralservicos/colocar_em_atendimento/99/", ok());
+        mount_text(
+            &runtime,
+            &server,
+            "GET",
+            "/centralservicos/auto_atribuir_chamado/99/",
+            ok(),
+        );
+        mount_text(
+            &runtime,
+            &server,
+            "GET",
+            "/centralservicos/colocar_em_atendimento/99/",
+            ok(),
+        );
 
         let (code, out, _) = run_args(&["open", "-d", "x", "--assume"], &paths);
         assert!(code == 0 && out.contains("assumido.") && !out.contains("em atendimento."));
         let (code, out, _) = run_args(&["open", "-d", "x", "--start"], &paths);
-        assert!(code == 0 && out.contains("assumido.") && out.contains("Chamado #99 em atendimento."));
+        assert!(
+            code == 0 && out.contains("assumido.") && out.contains("Chamado #99 em atendimento.")
+        );
     }
 
     #[test]
     fn open_reports_failures_after_the_ticket_was_created() {
         let (_dir, paths, runtime, server) = open_setup();
-        let refused = ResponseTemplate::new(200).set_body_string("<p class='alert-error'>Sem permissão</p>");
-        mount_text(&runtime, &server, "GET", "/centralservicos/auto_atribuir_chamado/99/", refused);
+        let refused =
+            ResponseTemplate::new(200).set_body_string("<p class='alert-error'>Sem permissão</p>");
+        mount_text(
+            &runtime,
+            &server,
+            "GET",
+            "/centralservicos/auto_atribuir_chamado/99/",
+            refused,
+        );
         let (code, out, err) = run_args(&["open", "-d", "x", "--assume"], &paths);
         assert_eq!(code, 1);
-        assert!(out.contains("Chamado #99 aberto") && err.contains("o chamado #99 foi aberto, mas não foi possível assumi-lo"));
+        assert!(
+            out.contains("Chamado #99 aberto")
+                && err.contains("o chamado #99 foi aberto, mas não foi possível assumi-lo")
+        );
         assert!(err.contains("Sem permissão"));
     }
 
     #[test]
     fn open_reports_failure_when_starting_service() {
         let (_dir, paths, runtime, server) = open_setup();
-        mount_text(&runtime, &server, "GET", "/centralservicos/auto_atribuir_chamado/99/", ResponseTemplate::new(200));
+        mount_text(
+            &runtime,
+            &server,
+            "GET",
+            "/centralservicos/auto_atribuir_chamado/99/",
+            ResponseTemplate::new(200),
+        );
         let (code, out, err) = run_args(&["open", "-d", "x", "--start"], &paths);
         assert_eq!(code, 1);
         assert!(out.contains("assumido.") && err.contains("colocá-lo em atendimento"));
@@ -847,7 +1101,12 @@ mod tests {
     fn config_show_lists_open_defaults() {
         let (_dir, paths, _runtime, _server) = open_setup();
         let (_, out, _) = run_args(&["config-show"], &paths);
-        for expected in ["open.service: 7", "open.interested: 1", "open.campus: 2", "open.center: 3"] {
+        for expected in [
+            "open.service: 7",
+            "open.interested: 1",
+            "open.campus: 2",
+            "open.center: 3",
+        ] {
             assert!(out.contains(expected), "{expected}");
         }
         run_args(&["config-init", "--username", "mantem"], &paths);
@@ -856,14 +1115,26 @@ mod tests {
     }
 
     fn bare_server() -> (tokio::runtime::Runtime, MockServer) {
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let server = runtime.block_on(MockServer::start());
         (runtime, server)
     }
 
-    fn mount_text(runtime: &tokio::runtime::Runtime, server: &MockServer, verb: &str, request_path: &str, body: ResponseTemplate) {
+    fn mount_text(
+        runtime: &tokio::runtime::Runtime,
+        server: &MockServer,
+        verb: &str,
+        request_path: &str,
+        body: ResponseTemplate,
+    ) {
         runtime.block_on(
-            Mock::given(method(verb)).and(path(request_path.to_owned())).respond_with(body).mount(server),
+            Mock::given(method(verb))
+                .and(path(request_path.to_owned()))
+                .respond_with(body)
+                .mount(server),
         );
     }
 
@@ -874,14 +1145,62 @@ mod tests {
         run_args(&["config-init", "--base-url", &server.uri()], &paths);
         let form = r#"<form method="post"><input type="hidden" name="csrfmiddlewaretoken" value="tok">
             <textarea name="descricao"></textarea></form>"#;
-        mount_text(&runtime, &server, "GET", "/centralservicos/abrir_chamado/7/", ResponseTemplate::new(200).set_body_string(form));
-        mount_text(&runtime, &server, "GET", "/centralservicos/get_campus_com_centros_atendimento/7/0/", ResponseTemplate::new(200).set_body_string(r#"{"campus": [[3, "ZL", true]]}"#));
-        mount_text(&runtime, &server, "GET", "/centralservicos/get_centros_atendimento_por_servico_e_campus/7/3/", ResponseTemplate::new(200).set_body_string(r#"{"centros": [[9, "TI", true]]}"#));
-        mount_text(&runtime, &server, "POST", "/centralservicos/abrir_chamado/7/", ResponseTemplate::new(302).insert_header("location", "/centralservicos/chamado/99/"));
-        mount_text(&runtime, &server, "GET", "/centralservicos/chamado/99/", ResponseTemplate::new(200));
-        let (code, out, err) = run_args(&["open", "7", "--description", "Teste", "--interested", "1", "--field", "telefone=1=2"], &paths);
+        mount_text(
+            &runtime,
+            &server,
+            "GET",
+            "/centralservicos/abrir_chamado/7/",
+            ResponseTemplate::new(200).set_body_string(form),
+        );
+        mount_text(
+            &runtime,
+            &server,
+            "GET",
+            "/centralservicos/get_campus_com_centros_atendimento/7/0/",
+            ResponseTemplate::new(200).set_body_string(r#"{"campus": [[3, "ZL", true]]}"#),
+        );
+        mount_text(
+            &runtime,
+            &server,
+            "GET",
+            "/centralservicos/get_centros_atendimento_por_servico_e_campus/7/3/",
+            ResponseTemplate::new(200).set_body_string(r#"{"centros": [[9, "TI", true]]}"#),
+        );
+        mount_text(
+            &runtime,
+            &server,
+            "POST",
+            "/centralservicos/abrir_chamado/7/",
+            ResponseTemplate::new(302).insert_header("location", "/centralservicos/chamado/99/"),
+        );
+        mount_text(
+            &runtime,
+            &server,
+            "GET",
+            "/centralservicos/chamado/99/",
+            ResponseTemplate::new(200),
+        );
+        let (code, out, err) = run_args(
+            &[
+                "open",
+                "7",
+                "--description",
+                "Teste",
+                "--interested",
+                "1",
+                "--field",
+                "telefone=1=2",
+            ],
+            &paths,
+        );
         assert_eq!((code, err.as_str()), (0, ""));
-        assert_eq!(out, format!("Chamado #99 aberto: {}/centralservicos/chamado/99/\n", server.uri()));
+        assert_eq!(
+            out,
+            format!(
+                "Chamado #99 aberto: {}/centralservicos/chamado/99/\n",
+                server.uri()
+            )
+        );
     }
 
     #[test]
@@ -890,14 +1209,43 @@ mod tests {
         let (runtime, server) = bare_server();
         run_args(&["config-init", "--base-url", &server.uri()], &paths);
         let form = r#"<form method="post"><textarea name="descricao"></textarea></form>"#;
-        mount_text(&runtime, &server, "GET", "/centralservicos/abrir_chamado/7/", ResponseTemplate::new(200).set_body_string(form));
-        mount_text(&runtime, &server, "POST", "/centralservicos/abrir_chamado/7/", ResponseTemplate::new(200).set_body_string("<p>sem retorno</p>"));
-        let (code, _, err) = run_args(&["open", "7", "-d", "Teste", "--campus", "1", "--center", "2", "--interested", "3"], &paths);
+        mount_text(
+            &runtime,
+            &server,
+            "GET",
+            "/centralservicos/abrir_chamado/7/",
+            ResponseTemplate::new(200).set_body_string(form),
+        );
+        mount_text(
+            &runtime,
+            &server,
+            "POST",
+            "/centralservicos/abrir_chamado/7/",
+            ResponseTemplate::new(200).set_body_string("<p>sem retorno</p>"),
+        );
+        let (code, _, err) = run_args(
+            &[
+                "open",
+                "7",
+                "-d",
+                "Teste",
+                "--campus",
+                "1",
+                "--center",
+                "2",
+                "--interested",
+                "3",
+            ],
+            &paths,
+        );
         assert_eq!(code, 1);
         assert!(err.contains("could not confirm"));
 
         for bad in ["semigual", "=semnome"] {
-            let (code, _, err) = run_args(&["open", "7", "-d", "x", "--interested", "1", "--field", bad], &paths);
+            let (code, _, err) = run_args(
+                &["open", "7", "-d", "x", "--interested", "1", "--field", bad],
+                &paths,
+            );
             assert_eq!(code, 2);
             assert!(err.contains("NOME=VALOR"));
         }
@@ -908,7 +1256,12 @@ mod tests {
         let (_dir, paths) = paths();
         let (runtime, server) = mock_server(true);
         run_args(&["config-init", "--base-url", &server.uri()], &paths);
-        mount_listing(&runtime, &server, "/centralservicos/listar_chamados_suporte/", ResponseTemplate::new(200));
+        mount_listing(
+            &runtime,
+            &server,
+            "/centralservicos/listar_chamados_suporte/",
+            ResponseTemplate::new(200),
+        );
         let (code, out, _) = run_args(&["list"], &paths);
         assert_eq!(code, 0);
         assert!(out.contains("Nenhum chamado"));
@@ -935,7 +1288,12 @@ mod tests {
         let (_dir, paths) = paths();
         let (runtime, server) = mock_server(true);
         run_args(&["config-init", "--base-url", &server.uri()], &paths);
-        mount_listing(&runtime, &server, "/centralservicos/listar_chamados_suporte/", ResponseTemplate::new(500));
+        mount_listing(
+            &runtime,
+            &server,
+            "/centralservicos/listar_chamados_suporte/",
+            ResponseTemplate::new(500),
+        );
         let (code, _, err) = run_args(&["list"], &paths);
         assert_eq!(code, 1);
         assert!(err.contains("unexpected status 500"));
@@ -972,7 +1330,14 @@ mod tests {
     fn output_failure_is_reported_as_error() {
         let (_dir, paths) = paths();
         let mut err = Vec::new();
-        let code = run(["chamados", "status"], &paths, None, &mut std::io::empty(), &mut FailingWriter, &mut err);
+        let code = run(
+            ["chamados", "status"],
+            &paths,
+            None,
+            &mut std::io::empty(),
+            &mut FailingWriter,
+            &mut err,
+        );
         assert_eq!(code, 1);
         assert!(String::from_utf8(err).unwrap().contains("closed"));
         FailingWriter.flush().unwrap();
