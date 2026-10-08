@@ -174,7 +174,9 @@ O script imprime `servico_id`, `campus_id` e `centro_id`.
 
 - **RS-01 — Cobertura de testes de 100%.** Os testes automatizados do workspace devem cobrir 100% das linhas de código. A verificação roda no CI (`ci.yml`) e o build falha se a cobertura ficar abaixo disso. O ponto de entrada `main.rs` de cada binário deve conter apenas o encadeamento mínimo e é excluído da medição; toda a lógica fica em `lib.rs`, onde é testada.
 
-Para verificar localmente (requer `cargo install cargo-llvm-cov` e o componente `llvm-tools-preview`):
+- **RS-02 — Entradas de texto aceitam várias linhas e a entrada padrão.** Toda entrada de texto livre do `chamados` (descrição, comentário, nota interna e mensagens de resolvido e de suspenso, e qualquer campo de texto livre futuro) aceita **várias linhas** e pode ser lida da **entrada padrão**: a opção do comando (`-d`/`-m`) recebe o texto, `-` lê o texto do stdin, e omitir a opção também lê o stdin. Só a quebra de linha final é removida, texto vazio é recusado antes de qualquer envio e um terminal interativo nunca é aguardado. A exceção é o título local (`chamados title`), que tem uma única linha por decisão de projeto. O requisito é verificado por teste para cada comando de texto (`rs02_every_text_input_accepts_multiple_lines_and_standard_input`), e outro teste obriga a classificar cada comando novo como "com texto" ou "sem texto".
+
+Para verificar a cobertura localmente (requer `cargo install cargo-llvm-cov` e o componente `llvm-tools-preview`):
 
 ```bash
 cargo llvm-cov --workspace --all-targets --ignore-filename-regex 'main\.rs' --fail-under-lines 100

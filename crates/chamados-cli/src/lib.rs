@@ -855,6 +855,7 @@ fn explain(error: TicketError) -> Box<dyn Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use tempfile::{tempdir, TempDir};
     use wiremock::{
         matchers::{method, path},
@@ -1602,6 +1603,142 @@ mod tests {
         let (code, _, err) = run_args(&["resolve", "5", "-m", "x", "--article", "99"], &paths);
         assert_eq!(code, 1);
         assert!(err.contains("article 99 is not offered"));
+    }
+
+    /// Commands that take free text, with the option that carries it, the form field SUAP receives
+    /// it in and the path it is posted to. Each must satisfy requirement RS-02.
+    const TEXT_COMMANDS: [(&[&str], &str, &str, &str); 5] = [
+        (
+            &["open"],
+            "-d",
+            "descricao",
+            "/centralservicos/abrir_chamado/7/",
+        ),
+        (
+            &["comment", "5"],
+            "-m",
+            "texto",
+            "/centralservicos/adicionar_comentario/5/",
+        ),
+        (
+            &["note", "5"],
+            "-m",
+            "texto",
+            "/centralservicos/adicionar_nota_interna/5/",
+        ),
+        (
+            &["suspend", "5"],
+            "-m",
+            "observacao",
+            "/centralservicos/suspender_chamado/5/",
+        ),
+        (
+            &["resolve", "5"],
+            "-m",
+            "comentario",
+            "/centralservicos/resolver_chamado/5/",
+        ),
+    ];
+
+    /// Commands without free text. A new command must be added to one of the two lists, which forces
+    /// a decision about RS-02 (and a test for it) whenever a command is created.
+    const NON_TEXT_COMMANDS: [&str; 8] = [
+        "paths",
+        "profile",
+        "session-status",
+        "login",
+        "list",
+        "show",
+        "title",
+        "status",
+    ];
+
+    #[test]
+    fn every_command_is_classified_for_the_text_input_requirement() {
+        let mut declared: Vec<&str> = TEXT_COMMANDS.iter().map(|command| command.0[0]).collect();
+        declared.extend(NON_TEXT_COMMANDS);
+        declared.sort_unstable();
+        let command = Cli::command();
+        let mut actual: Vec<&str> = command
+            .get_subcommands()
+            .map(|sub| sub.get_name())
+            .collect();
+        actual.sort_unstable();
+        assert_eq!(declared, actual, "classify the new command for RS-02");
+    }
+
+    /// One mock SUAP that accepts every text-carrying command.
+    fn text_requirement_setup() -> (TempDir, AppPaths, tokio::runtime::Runtime, MockServer) {
+        let (dir, paths, runtime, server) = open_setup();
+        let get = |path: &str, body: &str| {
+            let page = ResponseTemplate::new(200).set_body_string(body.to_owned());
+            mount_text(&runtime, &server, "GET", path, page);
+        };
+        get("/centralservicos/chamado/5/", THREAD_PAGE);
+        let field = |name: &str| {
+            format!(r#"<form action="" method="POST"><textarea name="{name}"></textarea></form>"#)
+        };
+        get(
+            "/centralservicos/suspender_chamado/5/",
+            &field("observacao"),
+        );
+        get("/centralservicos/resolver_chamado/5/", &field("comentario"));
+        for path in [
+            "/centralservicos/adicionar_comentario/5/",
+            "/centralservicos/adicionar_nota_interna/5/",
+            "/centralservicos/suspender_chamado/5/",
+            "/centralservicos/resolver_chamado/5/",
+        ] {
+            let accepted = ResponseTemplate::new(200).set_body_string("ok");
+            mount_text(&runtime, &server, "POST", path, accepted);
+        }
+        (dir, paths, runtime, server)
+    }
+
+    fn posts_to(runtime: &tokio::runtime::Runtime, server: &MockServer, path: &str) -> Vec<String> {
+        let requests = runtime.block_on(server.received_requests()).unwrap();
+        requests
+            .iter()
+            .filter(|request| request.method == wiremock::http::Method::POST)
+            .filter(|request| request.url.path() == path)
+            .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn rs02_every_text_input_accepts_multiple_lines_and_standard_input() {
+        let (_dir, paths, runtime, server) = text_requirement_setup();
+        for (command, flag, field, post_path) in TEXT_COMMANDS {
+            let expected = format!("{field}=linha+1%0Alinha+2");
+            let with_flag = |value: &'static str| [command, &[flag, value]].concat();
+
+            // (a) several lines in the option itself
+            let (code, _, err) = run_args(&with_flag("linha 1\nlinha 2"), &paths);
+            assert_eq!((code, err.as_str()), (0, ""), "{command:?} option");
+            // (b) standard input with `-`
+            let (code, _, err) = run_with_input(&with_flag("-"), &paths, "linha 1\nlinha 2\n");
+            assert_eq!((code, err.as_str()), (0, ""), "{command:?} dash");
+            // (c) standard input when the option is omitted (CRLF line ending removed)
+            let (code, _, err) = run_with_input(command, &paths, "linha 1\nlinha 2\r\n");
+            assert_eq!((code, err.as_str()), (0, ""), "{command:?} omitted");
+
+            let posts = posts_to(&runtime, &server, post_path);
+            assert_eq!(posts.len(), 3, "{command:?}");
+            for body in &posts {
+                let encoded = body.split('&').any(|pair| pair == expected);
+                assert!(encoded, "{command:?} sent {body}");
+            }
+
+            // (d) empty input is refused before anything is sent
+            let (code, _, err) = run_with_input(command, &paths, " \n");
+            assert_eq!(code, 1, "{command:?} empty");
+            assert!(err.contains("texto não informado"), "{command:?}: {err}");
+            assert_eq!(
+                posts_to(&runtime, &server, post_path).len(),
+                3,
+                "{command:?}"
+            );
+        }
     }
 
     #[test]
