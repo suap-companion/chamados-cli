@@ -2,9 +2,9 @@
 
 use std::collections::HashSet;
 
-use scraper::{ElementRef, Html, Selector};
+use scraper::{node::Node, ElementRef, Html, Selector};
 use serde::Deserialize;
-use suap_core::{SuapClient, SuapError};
+use suap_core::{FormFile, SuapClient, SuapError};
 use thiserror::Error;
 use url::Url;
 
@@ -13,6 +13,14 @@ const OPEN_PATH_PREFIX: &str = "/centralservicos/abrir_chamado/";
 const CAMPUS_PATH_PREFIX: &str = "/centralservicos/get_campus_com_centros_atendimento/";
 const CENTERS_PATH_PREFIX: &str = "/centralservicos/get_centros_atendimento_por_servico_e_campus/";
 const OPENED_MARKER: &str = "Número do chamado:";
+const ASSUME_PATH_PREFIX: &str = "/centralservicos/auto_atribuir_chamado/";
+const START_PATH_PREFIX: &str = "/centralservicos/colocar_em_atendimento/";
+
+/// File types SUAP accepts as ticket attachments (it rejects any other).
+pub const ALLOWED_ATTACHMENT_EXTENSIONS: [&str; 9] = ["xlsx", "xls", "csv", "docx", "doc", "pdf", "jpg", "jpeg", "png"];
+/// Number of attachment slots in SUAP's "open ticket" form.
+pub const MAX_ATTACHMENTS: usize = 3;
+const ATTACHMENT_DESCRIPTION_MAX: usize = 80;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteTicket {
@@ -51,6 +59,13 @@ pub struct TicketDetails {
     pub details_url: String,
 }
 
+/// A file to attach when opening a ticket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attachment {
+    pub file_name: String,
+    pub bytes: Vec<u8>,
+}
+
 /// Data needed to open a new ticket.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NewTicket {
@@ -65,6 +80,10 @@ pub struct NewTicket {
     pub interested: Option<String>,
     /// Any other form field, overriding the form defaults (e.g. `patrimonio`).
     pub extra_fields: Vec<(String, String)>,
+    /// Send SUAP's "copy of the opening" e-mail to the interested people.
+    pub copy_email: bool,
+    /// Files to attach (at most [`MAX_ATTACHMENTS`], of an allowed type).
+    pub attachments: Vec<Attachment>,
 }
 
 /// Which SUAP ticket listing to read.
@@ -91,6 +110,10 @@ pub trait TicketSource {
     async fn get_ticket(&self, id: &str) -> Result<TicketDetails, TicketError>;
     /// Opens a new ticket and returns its id.
     async fn open_ticket(&self, ticket: &NewTicket) -> Result<String, TicketError>;
+    /// Assigns the ticket to the logged user ("assumir").
+    async fn assume_ticket(&self, id: &str) -> Result<(), TicketError>;
+    /// Moves the ticket to "Em atendimento" (the user must have assumed it first).
+    async fn start_service(&self, id: &str) -> Result<(), TicketError>;
 }
 
 /// Reads tickets from the SUAP web interface using an authenticated session.
@@ -103,6 +126,55 @@ impl<'a> SuapTicketSource<'a> {
     pub fn new(client: &'a SuapClient, queue: TicketQueue) -> Self {
         Self { client, queue }
     }
+
+    /// Calls a SUAP ticket action (a GET) and surfaces the error flash message, if any.
+    async fn run_action(&self, prefix: &str, id: &str) -> Result<(), TicketError> {
+        check_ticket_id(id)?;
+        let body = self.client.fetch_page(&format!("{prefix}{id}/")).await?;
+        let errors = flash_errors(&body);
+        if errors.is_empty() {
+            return Ok(());
+        }
+        Err(TicketError::Source(format!("SUAP refused the action: {}", errors.join("; "))))
+    }
+}
+
+fn check_ticket_id(id: &str) -> Result<(), TicketError> {
+    if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(TicketError::Source(format!("invalid ticket id {id:?}")));
+    }
+    Ok(())
+}
+
+/// Checks the attachment count and file types against what SUAP accepts.
+pub fn validate_attachments(attachments: &[Attachment]) -> Result<(), TicketError> {
+    if attachments.len() > MAX_ATTACHMENTS {
+        return Err(TicketError::Source(format!("at most {MAX_ATTACHMENTS} attachments are allowed")));
+    }
+    for attachment in attachments {
+        let extension = attachment.file_name.rsplit_once('.').map(|(_, extension)| extension.to_ascii_lowercase());
+        if !extension.is_some_and(|extension| ALLOWED_ATTACHMENT_EXTENSIONS.contains(&extension.as_str())) {
+            return Err(TicketError::Source(format!(
+                "attachment {:?} has an unsupported type; allowed: {}",
+                attachment.file_name,
+                ALLOWED_ATTACHMENT_EXTENSIONS.join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Error messages SUAP flashes on the page (`<p class="... alert-error">`), without the close button text.
+fn flash_errors(body: &str) -> Vec<String> {
+    let document = Html::parse_document(body);
+    document
+        .select(&selector("p.alert-error"))
+        .map(|message| {
+            let own_text = message.children().filter_map(|node| node.value().as_text());
+            own_text.map(|text| text.trim()).filter(|text| !text.is_empty()).collect::<Vec<_>>().join(" ")
+        })
+        .filter(|message| !message.is_empty())
+        .collect()
 }
 
 impl TicketSource for SuapTicketSource<'_> {
@@ -112,15 +184,22 @@ impl TicketSource for SuapTicketSource<'_> {
     }
 
     async fn get_ticket(&self, id: &str) -> Result<TicketDetails, TicketError> {
-        if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(TicketError::Source(format!("invalid ticket id {id:?}")));
-        }
+        check_ticket_id(id)?;
         let html = self.client.fetch_page(&format!("{TICKET_PATH_PREFIX}{id}/")).await?;
         parse_ticket_details(&html, self.client.base_url(), id)
             .ok_or_else(|| TicketError::Source(format!("could not parse ticket {id}")))
     }
 
+    async fn assume_ticket(&self, id: &str) -> Result<(), TicketError> {
+        self.run_action(ASSUME_PATH_PREFIX, id).await
+    }
+
+    async fn start_service(&self, id: &str) -> Result<(), TicketError> {
+        self.run_action(START_PATH_PREFIX, id).await
+    }
+
     async fn open_ticket(&self, ticket: &NewTicket) -> Result<String, TicketError> {
+        validate_attachments(&ticket.attachments)?;
         let form_path = format!("{OPEN_PATH_PREFIX}{}/", ticket.service_id);
         let html = self.client.fetch_page(&form_path).await?;
         let mut fields = parse_open_form(&html)
@@ -147,11 +226,29 @@ impl TicketSource for SuapTicketSource<'_> {
         if let Some(interested) = &ticket.interested {
             set_field(&mut fields, "interessado", interested);
         }
+        fields.retain(|(name, _)| name != "enviar_copia_email");
+        if ticket.copy_email {
+            fields.push(("enviar_copia_email".to_owned(), "on".to_owned()));
+        }
+        let mut files = Vec::new();
+        for (index, attachment) in ticket.attachments.iter().enumerate() {
+            let description: String = attachment.file_name.chars().take(ATTACHMENT_DESCRIPTION_MAX).collect();
+            set_field(&mut fields, &format!("chamadoanexo_set-{index}-descricao"), &description);
+            files.push(FormFile {
+                field: format!("chamadoanexo_set-{index}-anexo"),
+                file_name: attachment.file_name.clone(),
+                bytes: attachment.bytes.clone(),
+            });
+        }
         for (name, value) in &ticket.extra_fields {
             set_field(&mut fields, name, value);
         }
 
-        let response = self.client.submit_form(&form_path, &fields).await?;
+        let response = if files.is_empty() {
+            self.client.submit_form(&form_path, &fields).await?
+        } else {
+            self.client.submit_multipart(&form_path, &fields, &files).await?
+        };
         parse_open_result(&response.path, &response.body)
     }
 }
@@ -185,6 +282,28 @@ fn text_of(element: ElementRef<'_>) -> String {
 /// Text of `element` with every run of whitespace (and element boundaries) collapsed to one space.
 fn flat_text(element: ElementRef<'_>) -> String {
     element.text().collect::<Vec<_>>().join(" ").split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Like [`flat_text`], but keeps the line breaks SUAP renders as `<br>` (multi-line descriptions and comments).
+fn rich_text(element: ElementRef<'_>) -> String {
+    let mut text = String::new();
+    for node in element.descendants() {
+        match node.value() {
+            Node::Text(chunk) => {
+                let words = chunk.split_whitespace().collect::<Vec<_>>().join(" ");
+                if words.is_empty() {
+                    continue;
+                }
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push(' ');
+                }
+                text.push_str(&words);
+            }
+            Node::Element(tag) if tag.name() == "br" => text.push('\n'),
+            _ => {}
+        }
+    }
+    text.trim().to_owned()
 }
 
 fn selector(css: &str) -> Selector {
@@ -297,7 +416,7 @@ pub fn parse_ticket_details(html: &str, base_url: &Url, id: &str) -> Option<Tick
     let (term, definition) = (selector("dt"), selector("dd"));
     let fields = document
         .select(&selector("main#content .accordion-body .definition-list .list-item"))
-        .filter_map(|item| Some((flat_text(item.select(&term).next()?), flat_text(item.select(&definition).next()?))))
+        .filter_map(|item| Some((flat_text(item.select(&term).next()?), rich_text(item.select(&definition).next()?))))
         .collect();
 
     let (date, content) = (selector(".timeline-date"), selector(".timeline-content"));
@@ -306,7 +425,7 @@ pub fn parse_ticket_details(html: &str, base_url: &Url, id: &str) -> Option<Tick
         .filter_map(|item| {
             Some(TimelineEntry {
                 date: flat_text(item.select(&date).next()?),
-                text: flat_text(item.select(&content).next()?),
+                text: rich_text(item.select(&content).next()?),
             })
         })
         .collect();
@@ -351,10 +470,11 @@ mod tests {
           <div class="list-item"><dt>Sem valor</dt></div>
           <div class="list-item"><dd>Sem rótulo</dd></div>
           <div class="list-item"><dt>Descrição</dt><dd>Atualizar para a
-             versão 5.3.0</dd></div></dl></div></div>
+             versão 5.3.0<br>segunda linha<br><br>depois do vazio</dd></div></dl></div></div>
         <div data-tab="linha_tempo"><ul class="timeline">
           <li><div class="timeline-content"><h4>Adicionar comentário:</h4></div></li>
-          <li><div class="timeline-date">06/10/2026 19:15:03</div><div class="timeline-content"><h4><a>Kelson</a><small>comentou:</small></h4><p>Build pronto.</p></div></li>
+          <li><div class="timeline-date">06/10/2026 19:15:03</div><div class="timeline-content"><h4><a>Kelson</a><small>comentou:</small></h4>
+            <p>Build pronto.</p></div></li>
           <li><div class="timeline-date">06/10/2026 19:14:31</div></li>
         </ul></div></main>"#;
 
@@ -435,6 +555,97 @@ mod tests {
             "ticket source error: SUAP rejected the ticket: Campo obrigatório."
         );
         assert!(parse_open_result("/abrir/", "<p>nada</p>").unwrap_err().to_string().contains("could not confirm"));
+    }
+
+    fn attachment(name: &str) -> Attachment {
+        Attachment { file_name: name.to_owned(), bytes: b"conteudo".to_vec() }
+    }
+
+    #[test]
+    fn validates_attachments() {
+        assert!(validate_attachments(&[attachment("a.PDF"), attachment("b.xlsx"), attachment("c.JpEg")]).is_ok());
+        assert!(validate_attachments(&[]).is_ok());
+        let too_many = [attachment("1.pdf"), attachment("2.pdf"), attachment("3.pdf"), attachment("4.pdf")];
+        assert!(validate_attachments(&too_many).unwrap_err().to_string().contains("at most 3"));
+        for name in ["virus.exe", "semextensao", "arquivo.pdf.zip"] {
+            let error = validate_attachments(&[attachment(name)]).unwrap_err().to_string();
+            assert!(error.contains("unsupported type") && error.contains("pdf, jpg"), "{name}");
+        }
+    }
+
+    #[test]
+    fn extracts_flash_errors_without_button_text() {
+        let page = r#"<p class="x alert-error">Não pode. <button>Fechar</button></p>
+            <p class="alert-error"><button>Fechar</button></p>
+            <p class="alert-success">Feito</p>"#;
+        assert_eq!(flash_errors(page), ["Não pode."]);
+        assert!(flash_errors("<p>nada</p>").is_empty());
+    }
+
+    #[tokio::test]
+    async fn assumes_and_starts_service() {
+        let server = MockServer::start().await;
+        mount_text(&server, "GET", "/centralservicos/auto_atribuir_chamado/5/", "<p class='alert-success'>ok</p>").await;
+        mount_text(&server, "GET", "/centralservicos/colocar_em_atendimento/5/", "ok").await;
+        mount_text(&server, "GET", "/centralservicos/auto_atribuir_chamado/6/", "<p class='alert-error'>Já resolvido <button>Fechar</button></p>").await;
+        let (_dir, client) = client_for(&server).await;
+        let source = SuapTicketSource::new(&client, TicketQueue::Support);
+        source.assume_ticket("5").await.unwrap();
+        source.start_service("5").await.unwrap();
+        let refused = source.assume_ticket("6").await.unwrap_err().to_string();
+        assert_eq!(refused, "ticket source error: SUAP refused the action: Já resolvido");
+        assert!(matches!(source.start_service("x").await, Err(TicketError::Source(_))));
+        assert!(matches!(source.assume_ticket("404").await, Err(TicketError::Suap(SuapError::Transport(_)))));
+    }
+
+    #[tokio::test]
+    async fn opens_ticket_with_attachments_and_email_copy() {
+        let server = MockServer::start().await;
+        mount_text(&server, "GET", "/centralservicos/abrir_chamado/7/", OPEN_FORM).await;
+        Mock::given(method("POST"))
+            .and(path("/centralservicos/abrir_chamado/7/"))
+            .and(body_string_contains("name=\"enviar_copia_email\""))
+            .and(body_string_contains("name=\"chamadoanexo_set-0-descricao\""))
+            .and(body_string_contains("relatorio.pdf"))
+            .and(body_string_contains("name=\"chamadoanexo_set-0-anexo\"; filename=\"relatorio.pdf\""))
+            .and(body_string_contains("name=\"chamadoanexo_set-1-anexo\"; filename=\"foto.png\""))
+            .respond_with(ResponseTemplate::new(200).set_body_string("Número do chamado: 31"))
+            .mount(&server)
+            .await;
+        let (_dir, client) = client_for(&server).await;
+        let source = SuapTicketSource::new(&client, TicketQueue::Support);
+        let ticket = NewTicket {
+            campus: Some("1".to_owned()),
+            center: Some("2".to_owned()),
+            copy_email: true,
+            attachments: vec![attachment("relatorio.pdf"), attachment("foto.png")],
+            ..new_ticket()
+        };
+        assert_eq!(source.open_ticket(&ticket).await.unwrap(), "31");
+    }
+
+    #[tokio::test]
+    async fn open_ticket_rejects_bad_attachments_before_any_request() {
+        let server = MockServer::start().await;
+        let (_dir, client) = client_for(&server).await;
+        let source = SuapTicketSource::new(&client, TicketQueue::Support);
+        let ticket = NewTicket { attachments: vec![attachment("virus.exe")], ..new_ticket() };
+        assert!(source.open_ticket(&ticket).await.unwrap_err().to_string().contains("unsupported type"));
+    }
+
+    #[tokio::test]
+    async fn open_without_email_copy_drops_the_form_default() {
+        let server = MockServer::start().await;
+        let form = format!("{OPEN_FORM}").replace("name=\"aceite\" checked", "name=\"enviar_copia_email\" checked");
+        mount_text(&server, "GET", "/centralservicos/abrir_chamado/7/", &form).await;
+        mount_text(&server, "POST", "/centralservicos/abrir_chamado/7/", "Número do chamado: 32").await;
+        let (_dir, client) = client_for(&server).await;
+        let source = SuapTicketSource::new(&client, TicketQueue::Support);
+        let ticket = NewTicket { campus: Some("1".to_owned()), center: Some("2".to_owned()), ..new_ticket() };
+        assert_eq!(source.open_ticket(&ticket).await.unwrap(), "32");
+        let received = server.received_requests().await.unwrap();
+        let post = received.iter().find(|request| request.method == wiremock::http::Method::POST).unwrap();
+        assert!(!String::from_utf8_lossy(&post.body).contains("enviar_copia_email"));
     }
 
     async fn mount_text(server: &MockServer, verb: &str, request_path: &str, body: &str) {
@@ -549,7 +760,7 @@ mod tests {
             details.fields,
             [
                 ("Interessado".to_owned(), "Wagner Oliveira".to_owned()),
-                ("Descrição".to_owned(), "Atualizar para a versão 5.3.0".to_owned()),
+                ("Descrição".to_owned(), "Atualizar para a versão 5.3.0\nsegunda linha\n\ndepois do vazio".to_owned()),
             ]
         );
         assert_eq!(
@@ -611,7 +822,7 @@ mod tests {
         let paths = suap_core::AppPaths::from_dirs(directory.path().join("c"), directory.path().join("d"));
         let config = suap_core::SuapConfig {
             base_url: Url::parse(&format!("{}/", server.uri())).unwrap(),
-            username: None,
+            ..suap_core::SuapConfig::default()
         };
         (directory, SuapClient::open(&paths, &config).unwrap())
     }

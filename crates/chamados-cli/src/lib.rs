@@ -2,10 +2,10 @@
 //!
 //! The binary entry point (`main.rs`) is a thin wrapper; everything testable lives here.
 
-use std::{error::Error, ffi::OsString, io::Write};
+use std::{error::Error, ffi::OsString, fs, io::{Read, Write}, path::PathBuf};
 
-use clap::{Parser, Subcommand};
-use chamados_core::{NewTicket, SuapTicketSource, TicketDetails, TicketError, TicketQueue, TicketSource};
+use clap::{Args, Parser, Subcommand};
+use chamados_core::{Attachment, NewTicket, SuapTicketSource, TicketDetails, TicketError, TicketQueue, TicketSource};
 use suap_core::{load_config, save_config, AppPaths, SuapClient, SuapConfig, SuapError, DEFAULT_PROFILE};
 
 #[derive(Debug, Parser)]
@@ -25,12 +25,7 @@ enum Command {
     /// Exibe a configuração local sem dados sensíveis.
     ConfigShow,
     /// Cria uma configuração local inicial.
-    ConfigInit {
-        #[arg(long)]
-        base_url: Option<String>,
-        #[arg(long)]
-        username: Option<String>,
-    },
+    ConfigInit(ConfigInitArgs),
     /// Autentica no SUAP usando a senha da variável de ambiente `SUAP_PASSWORD`.
     Login {
         /// Usuário do SUAP; se omitido, usa o `username` da configuração local.
@@ -49,25 +44,7 @@ enum Command {
         id: u64,
     },
     /// Abre um novo chamado no SUAP usando a sessão salva por `login`.
-    Open {
-        /// Número do serviço no SUAP (o mesmo de /centralservicos/abrir_chamado/<serviço>/).
-        service: u64,
-        /// Descrição do chamado.
-        #[arg(long, short)]
-        description: String,
-        /// Campus (id da unidade organizacional); por padrão, o do usuário.
-        #[arg(long)]
-        campus: Option<String>,
-        /// Centro de atendimento (id); por padrão, o único disponível para o campus.
-        #[arg(long)]
-        center: Option<String>,
-        /// Interessado (id do vínculo no SUAP); o formulário do SUAP exige este campo.
-        #[arg(long)]
-        interested: String,
-        /// Campo extra do formulário no formato NOME=VALOR (repetível), ex.: --field patrimonio=123.
-        #[arg(long = "field", value_parser = parse_field)]
-        fields: Vec<(String, String)>,
-    },
+    Open(OpenArgs),
     /// Exibe uma mensagem sobre o estado inicial do projeto.
     Status,
 }
@@ -79,16 +56,71 @@ fn parse_field(raw: &str) -> Result<(String, String), String> {
     }
 }
 
+#[derive(Debug, Args)]
+struct ConfigInitArgs {
+    #[arg(long)]
+    base_url: Option<String>,
+    #[arg(long)]
+    username: Option<String>,
+    /// Serviço padrão do `open` neste perfil.
+    #[arg(long)]
+    service: Option<u64>,
+    /// Interessado padrão do `open` neste perfil (id do vínculo).
+    #[arg(long)]
+    interested: Option<String>,
+    /// Campus padrão do `open` neste perfil.
+    #[arg(long)]
+    campus: Option<String>,
+    /// Centro de atendimento padrão do `open` neste perfil.
+    #[arg(long)]
+    center: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct OpenArgs {
+    /// Número do serviço no SUAP (o mesmo de /centralservicos/abrir_chamado/<serviço>/); por padrão, o do perfil.
+    service: Option<u64>,
+    /// Descrição (pode ter várias linhas). Com `-` ou omitida, é lida da entrada padrão.
+    #[arg(long, short)]
+    description: Option<String>,
+    /// Campus (id da unidade organizacional); por padrão, o do perfil ou o do usuário.
+    #[arg(long)]
+    campus: Option<String>,
+    /// Centro de atendimento (id); por padrão, o do perfil ou o único disponível para o campus.
+    #[arg(long)]
+    center: Option<String>,
+    /// Interessado (id do vínculo no SUAP); por padrão, o do perfil. O formulário do SUAP exige este campo.
+    #[arg(long)]
+    interested: Option<String>,
+    /// Anexa um arquivo (repetível, no máximo 3; tipos aceitos pelo SUAP: xlsx, xls, csv, docx, doc, pdf, jpg, jpeg, png).
+    #[arg(long, short = 'a')]
+    attach: Vec<PathBuf>,
+    /// Não envia a cópia de abertura por e-mail aos interessados (o padrão é enviar).
+    #[arg(long)]
+    no_email_copy: bool,
+    /// Assume o chamado (atribui a você) logo após abrir.
+    #[arg(long)]
+    assume: bool,
+    /// Coloca o chamado em atendimento logo após abrir (implica --assume).
+    #[arg(long)]
+    start: bool,
+    /// Campo extra do formulário no formato NOME=VALOR (repetível), ex.: --field patrimonio=123.
+    #[arg(long = "field", value_parser = parse_field)]
+    fields: Vec<(String, String)>,
+}
+
 /// Name of the environment variable that holds the SUAP password.
 pub const PASSWORD_ENV: &str = "SUAP_PASSWORD";
 
 /// Runs the CLI with `args`, writing to `out`/`err`, and returns the process exit code.
 ///
-/// `password` is the value of [`PASSWORD_ENV`], read by the caller so it can be injected in tests.
+/// `password` is the value of [`PASSWORD_ENV`] and `input` the standard input (empty when it is a terminal);
+/// both are read by the caller so they can be injected in tests.
 pub fn run<I, T>(
     args: I,
     paths: &AppPaths,
     password: Option<String>,
+    input: &mut dyn Read,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32
@@ -117,7 +149,7 @@ where
         }
     };
 
-    match execute(cli, &paths, password, out) {
+    match execute(cli, &paths, password, input, out) {
         Ok(()) => 0,
         Err(error) => {
             let _ = writeln!(err, "erro: {error}");
@@ -130,19 +162,17 @@ fn execute(
     cli: Cli,
     paths: &AppPaths,
     password: Option<String>,
+    input: &mut dyn Read,
     out: &mut dyn Write,
 ) -> Result<(), Box<dyn Error>> {
     match cli.command {
         Some(Command::Paths) => show_paths(paths, out),
         Some(Command::ConfigShow) => show_config(paths, out),
-        Some(Command::ConfigInit { base_url, username }) => init_config(paths, base_url, username, out),
+        Some(Command::ConfigInit(args)) => init_config(paths, args, out),
         Some(Command::Login { username }) => login(paths, username, password, out),
         Some(Command::List { meus }) => list(paths, meus, out),
         Some(Command::Show { id }) => show(paths, id, out),
-        Some(Command::Open { service, description, campus, center, interested, fields }) => {
-            let ticket = NewTicket { service_id: service, description, campus, center, interested: Some(interested), extra_fields: fields };
-            open(paths, &ticket, out)
-        }
+        Some(Command::Open(args)) => open(paths, args, input, out),
         Some(Command::Status) => {
             writeln!(out, "chamados-cli: fundação inicial instalada; integração ainda não implementada.")?;
             Ok(())
@@ -182,6 +212,16 @@ fn show_config(paths: &AppPaths, out: &mut dyn Write) -> Result<(), Box<dyn Erro
             writeln!(out, "profile: {}", paths.profile())?;
             writeln!(out, "base_url: {}", config.base_url)?;
             writeln!(out, "username: {}", config.username.as_deref().unwrap_or("<não configurado>"))?;
+            let open = &config.open;
+            let defaults = [
+                ("service", open.service.map(|service| service.to_string())),
+                ("interested", open.interested.clone()),
+                ("campus", open.campus.clone()),
+                ("center", open.center.clone()),
+            ];
+            for (name, value) in defaults.iter().filter_map(|(name, value)| Some((name, value.as_ref()?))) {
+                writeln!(out, "open.{name}: {value}")?;
+            }
             writeln!(out, "file: {}", paths.config_file().display())?;
         }
         None => {
@@ -242,13 +282,73 @@ fn show(paths: &AppPaths, id: u64, out: &mut dyn Write) -> Result<(), Box<dyn Er
     Ok(())
 }
 
-fn open(paths: &AppPaths, ticket: &NewTicket, out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
+/// Text given as an option value, or read from `input` when the value is `-` or missing.
+///
+/// Newlines inside the text are kept (multi-line); only the trailing line break is removed.
+fn read_text(value: Option<String>, input: &mut dyn Read) -> Result<String, Box<dyn Error>> {
+    let text = match value {
+        Some(text) if text != "-" => text,
+        _ => {
+            let mut piped = String::new();
+            input.read_to_string(&mut piped)?;
+            piped
+        }
+    };
+    let text = text.trim_end_matches(['\r', '\n']).to_owned();
+    if text.trim().is_empty() {
+        return Err("texto não informado: passe o valor na opção, use `-` ou envie pela entrada padrão".into());
+    }
+    Ok(text)
+}
+
+fn read_attachments(files: &[PathBuf]) -> Result<Vec<Attachment>, Box<dyn Error>> {
+    let mut attachments = Vec::new();
+    for path in files {
+        let bytes = fs::read(path).map_err(|error| format!("não foi possível ler o anexo {}: {error}", path.display()))?;
+        let file_name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+        attachments.push(Attachment { file_name, bytes });
+    }
+    Ok(attachments)
+}
+
+/// Error for a step done after the ticket was already opened, so the new ticket id is not lost.
+fn after_open(id: &str, action: &str, error: TicketError) -> Box<dyn Error> {
+    format!("o chamado #{id} foi aberto, mas não foi possível {action}: {}", explain(error)).into()
+}
+
+fn open(paths: &AppPaths, args: OpenArgs, input: &mut dyn Read, out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
     let config = profile_config(paths)?;
+    let defaults = &config.open;
+    let service_id = args.service.or(defaults.service).ok_or("serviço não informado: passe o número ou defina o padrão do perfil (config-init --service)")?;
+    let interested = args.interested.or_else(|| defaults.interested.clone());
+    if interested.is_none() {
+        return Err("interessado não informado: use --interested ou defina o padrão do perfil (config-init --interested)".into());
+    }
+    let ticket = NewTicket {
+        service_id,
+        description: read_text(args.description, input)?,
+        campus: args.campus.or_else(|| defaults.campus.clone()),
+        center: args.center.or_else(|| defaults.center.clone()),
+        interested,
+        extra_fields: args.fields,
+        copy_email: !args.no_email_copy,
+        attachments: read_attachments(&args.attach)?,
+    };
+
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let client = SuapClient::open(paths, &config)?;
     let source = SuapTicketSource::new(&client, TicketQueue::Support);
-    let id = runtime.block_on(source.open_ticket(ticket)).map_err(explain)?;
+    let id = runtime.block_on(source.open_ticket(&ticket)).map_err(explain)?;
     writeln!(out, "Chamado #{id} aberto: {}", client.base_url().join(&format!("centralservicos/chamado/{id}/"))?)?;
+
+    if args.assume || args.start {
+        runtime.block_on(source.assume_ticket(&id)).map_err(|error| after_open(&id, "assumi-lo", error))?;
+        writeln!(out, "Chamado #{id} assumido.")?;
+    }
+    if args.start {
+        runtime.block_on(source.start_service(&id)).map_err(|error| after_open(&id, "colocá-lo em atendimento", error))?;
+        writeln!(out, "Chamado #{id} em atendimento.")?;
+    }
     Ok(())
 }
 
@@ -258,13 +358,18 @@ fn print_details(details: &TicketDetails, out: &mut dyn Write) -> std::io::Resul
     writeln!(out, "Serviço: {}", details.heading.as_deref().unwrap_or("-"))?;
     writeln!(out, "URL: {}", details.details_url)?;
     for (label, value) in &details.fields {
-        writeln!(out, "{label}: {value}")?;
+        writeln!(out, "{label}: {}", indent_continuation(value, "    "))?;
     }
     writeln!(out, "\nLinha do tempo:")?;
     for entry in &details.timeline {
-        writeln!(out, "  {}  {}", entry.date, entry.text)?;
+        writeln!(out, "  {}  {}", entry.date, indent_continuation(&entry.text, "      "))?;
     }
     Ok(())
+}
+
+/// Indents every line but the first, so multi-line values stay readable under their label.
+fn indent_continuation(text: &str, prefix: &str) -> String {
+    text.replace('\n', &format!("\n{prefix}"))
 }
 
 /// Turns ticket errors into user-facing messages.
@@ -275,20 +380,20 @@ fn explain(error: TicketError) -> Box<dyn Error> {
     }
 }
 
-fn init_config(
-    paths: &AppPaths,
-    base_url: Option<String>,
-    username: Option<String>,
-    out: &mut dyn Write,
-) -> Result<(), Box<dyn Error>> {
+fn init_config(paths: &AppPaths, args: ConfigInitArgs, out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
     let mut config = load_config(paths)?.unwrap_or_default();
 
-    if let Some(base_url) = base_url {
+    if let Some(base_url) = args.base_url {
         config.base_url = base_url.parse()?;
     }
-    if username.is_some() {
-        config.username = username;
+    if args.username.is_some() {
+        config.username = args.username;
     }
+    let open = &mut config.open;
+    open.service = args.service.or(open.service);
+    open.interested = args.interested.or(open.interested.take());
+    open.campus = args.campus.or(open.campus.take());
+    open.center = args.center.or(open.center.take());
 
     save_config(paths, &config)?;
     writeln!(out, "Configuração salva em {} (perfil {})", paths.config_file().display(), paths.profile())?;
@@ -309,7 +414,7 @@ mod tests {
 
     fn run_args(args: &[&str], paths: &AppPaths) -> (i32, String, String) {
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = run(std::iter::once("chamados").chain(args.iter().copied()), paths, None, &mut out, &mut err);
+        let code = run(std::iter::once("chamados").chain(args.iter().copied()), paths, None, &mut std::io::empty(), &mut out, &mut err);
         (code, String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
     }
 
@@ -447,6 +552,7 @@ mod tests {
             std::iter::once("chamados").chain(args.iter().copied()),
             paths,
             password.map(str::to_owned),
+            &mut std::io::empty(),
             &mut out,
             &mut err,
         );
@@ -551,6 +657,23 @@ mod tests {
     }
 
     #[test]
+    fn show_keeps_line_breaks_of_multiline_text() {
+        let (_dir, paths) = paths();
+        let (runtime, server) = bare_server();
+        run_args(&["config-init", "--base-url", &server.uri()], &paths);
+        let html = r#"<main id="content"><div class="title-container"><h2>Chamado Interno 9</h2></div>
+            <div class="accordion"><div class="accordion-body"><dl class="definition-list"><div class="list-item">
+            <dt>Descrição</dt><dd>linha 1<br>linha 2</dd></div></dl></div></div>
+            <div data-tab="linha_tempo"><ul class="timeline"><li><div class="timeline-date">01/01/2026 10:00:00</div>
+            <div class="timeline-content">Fulano comentou:<p>a<br>b</p></div></li></ul></div></main>"#;
+        mount_listing(&runtime, &server, "/centralservicos/chamado/9/", ResponseTemplate::new(200).set_body_string(html));
+        let (code, out, _) = run_args(&["show", "9"], &paths);
+        assert_eq!(code, 0);
+        assert!(out.contains("Descrição: linha 1\n    linha 2\n"));
+        assert!(out.contains("  01/01/2026 10:00:00  Fulano comentou: a\n      b\n"));
+    }
+
+    #[test]
     fn show_prints_placeholder_without_heading() {
         let (_dir, paths) = paths();
         let (runtime, server) = mock_server(true);
@@ -580,6 +703,156 @@ mod tests {
         let (code, _, err) = run_args(&["show", "abc"], &paths);
         assert_eq!(code, 2);
         assert!(!err.is_empty());
+    }
+
+    fn run_with_input(args: &[&str], paths: &AppPaths, input: &str) -> (i32, String, String) {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run(
+            std::iter::once("chamados").chain(args.iter().copied()),
+            paths,
+            None,
+            &mut input.as_bytes(),
+            &mut out,
+            &mut err,
+        );
+        (code, String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
+    }
+
+    const OPEN_FORM: &str = r#"<form method="post"><textarea name="descricao"></textarea>
+        <input type="checkbox" name="enviar_copia_email" checked></form>"#;
+
+    /// Profile with `open` defaults pointing at a mock SUAP that accepts tickets for service 7.
+    fn open_setup() -> (TempDir, AppPaths, tokio::runtime::Runtime, MockServer) {
+        let (dir, paths) = paths();
+        let (runtime, server) = bare_server();
+        let uri = server.uri();
+        let init = ["config-init", "--base-url", &uri, "--service", "7", "--interested", "1", "--campus", "2", "--center", "3"];
+        assert_eq!(run_args(&init, &paths).0, 0);
+        let form = ResponseTemplate::new(200).set_body_string(OPEN_FORM);
+        mount_text(&runtime, &server, "GET", "/centralservicos/abrir_chamado/7/", form);
+        let created = ResponseTemplate::new(200).set_body_string("Número do chamado: 99");
+        mount_text(&runtime, &server, "POST", "/centralservicos/abrir_chamado/7/", created);
+        (dir, paths, runtime, server)
+    }
+
+    fn posted_body(runtime: &tokio::runtime::Runtime, server: &MockServer) -> String {
+        let requests = runtime.block_on(server.received_requests()).unwrap();
+        let post = requests.iter().find(|request| request.method == wiremock::http::Method::POST).unwrap();
+        String::from_utf8_lossy(&post.body).into_owned()
+    }
+
+    #[test]
+    fn open_uses_profile_defaults_multiline_text_and_email_copy() {
+        let (_dir, paths, runtime, server) = open_setup();
+        let (code, out, err) = run_args(&["open", "-d", "linha 1\nlinha 2\n"], &paths);
+        assert_eq!((code, err.as_str()), (0, ""));
+        assert!(out.starts_with("Chamado #99 aberto: "));
+        let body = posted_body(&runtime, &server);
+        assert!(body.contains("descricao=linha+1%0Alinha+2&") || body.contains("descricao=linha+1%0Alinha+2"));
+        assert!(body.contains("interessado=1") && body.contains("uo=2") && body.contains("centro_atendimento=3"));
+        assert!(body.contains("enviar_copia_email=on"));
+    }
+
+    #[test]
+    fn open_reads_the_description_from_standard_input() {
+        let (_dir, paths, runtime, server) = open_setup();
+        for args in [&["open"][..], &["open", "-d", "-"][..]] {
+            let (code, _, err) = run_with_input(args, &paths, "vindo\ndo stdin\r\n");
+            assert_eq!((code, err.as_str()), (0, ""));
+        }
+        assert!(posted_body(&runtime, &server).contains("descricao=vindo%0Ado+stdin&"));
+
+        let (code, _, err) = run_with_input(&["open"], &paths, "  \n");
+        assert_eq!(code, 1);
+        assert!(err.contains("texto não informado"));
+    }
+
+    #[test]
+    fn open_can_skip_the_email_copy() {
+        let (_dir, paths, runtime, server) = open_setup();
+        let (code, _, _) = run_args(&["open", "-d", "x", "--no-email-copy"], &paths);
+        assert_eq!(code, 0);
+        assert!(!posted_body(&runtime, &server).contains("enviar_copia_email"));
+    }
+
+    #[test]
+    fn open_requires_service_and_interested_from_options_or_profile() {
+        let (_dir, paths) = paths();
+        let (_runtime, server) = bare_server();
+        run_args(&["config-init", "--base-url", &server.uri()], &paths);
+        let (code, _, err) = run_args(&["open", "-d", "x", "--interested", "1"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("serviço não informado"));
+        let (code, _, err) = run_args(&["open", "7", "-d", "x"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("interessado não informado"));
+    }
+
+    #[test]
+    fn open_attaches_files_and_validates_them() {
+        let (dir, paths, runtime, server) = open_setup();
+        let report = dir.path().join("relatorio.pdf");
+        std::fs::write(&report, b"%PDF conteudo").unwrap();
+        let (code, _, err) = run_args(&["open", "-d", "x", "-a", report.to_str().unwrap()], &paths);
+        assert_eq!((code, err.as_str()), (0, ""));
+        let body = posted_body(&runtime, &server);
+        assert!(body.contains("name=\"chamadoanexo_set-0-anexo\"; filename=\"relatorio.pdf\"") && body.contains("%PDF conteudo"));
+
+        let exe = dir.path().join("virus.exe");
+        std::fs::write(&exe, b"MZ").unwrap();
+        let (code, _, err) = run_args(&["open", "-d", "x", "-a", exe.to_str().unwrap()], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("unsupported type"));
+
+        let missing = dir.path().join("nao-existe.pdf");
+        let (code, _, err) = run_args(&["open", "-d", "x", "-a", missing.to_str().unwrap()], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("não foi possível ler o anexo"));
+    }
+
+    #[test]
+    fn open_can_assume_and_start_the_ticket() {
+        let (_dir, paths, runtime, server) = open_setup();
+        let ok = || ResponseTemplate::new(200);
+        mount_text(&runtime, &server, "GET", "/centralservicos/auto_atribuir_chamado/99/", ok());
+        mount_text(&runtime, &server, "GET", "/centralservicos/colocar_em_atendimento/99/", ok());
+
+        let (code, out, _) = run_args(&["open", "-d", "x", "--assume"], &paths);
+        assert!(code == 0 && out.contains("assumido.") && !out.contains("em atendimento."));
+        let (code, out, _) = run_args(&["open", "-d", "x", "--start"], &paths);
+        assert!(code == 0 && out.contains("assumido.") && out.contains("Chamado #99 em atendimento."));
+    }
+
+    #[test]
+    fn open_reports_failures_after_the_ticket_was_created() {
+        let (_dir, paths, runtime, server) = open_setup();
+        let refused = ResponseTemplate::new(200).set_body_string("<p class='alert-error'>Sem permissão</p>");
+        mount_text(&runtime, &server, "GET", "/centralservicos/auto_atribuir_chamado/99/", refused);
+        let (code, out, err) = run_args(&["open", "-d", "x", "--assume"], &paths);
+        assert_eq!(code, 1);
+        assert!(out.contains("Chamado #99 aberto") && err.contains("o chamado #99 foi aberto, mas não foi possível assumi-lo"));
+        assert!(err.contains("Sem permissão"));
+    }
+
+    #[test]
+    fn open_reports_failure_when_starting_service() {
+        let (_dir, paths, runtime, server) = open_setup();
+        mount_text(&runtime, &server, "GET", "/centralservicos/auto_atribuir_chamado/99/", ResponseTemplate::new(200));
+        let (code, out, err) = run_args(&["open", "-d", "x", "--start"], &paths);
+        assert_eq!(code, 1);
+        assert!(out.contains("assumido.") && err.contains("colocá-lo em atendimento"));
+    }
+
+    #[test]
+    fn config_show_lists_open_defaults() {
+        let (_dir, paths, _runtime, _server) = open_setup();
+        let (_, out, _) = run_args(&["config-show"], &paths);
+        for expected in ["open.service: 7", "open.interested: 1", "open.campus: 2", "open.center: 3"] {
+            assert!(out.contains(expected), "{expected}");
+        }
+        run_args(&["config-init", "--username", "mantem"], &paths);
+        let (_, out, _) = run_args(&["config-show"], &paths);
+        assert!(out.contains("open.service: 7") && out.contains("username: mantem"));
     }
 
     fn bare_server() -> (tokio::runtime::Runtime, MockServer) {
@@ -699,7 +972,7 @@ mod tests {
     fn output_failure_is_reported_as_error() {
         let (_dir, paths) = paths();
         let mut err = Vec::new();
-        let code = run(["chamados", "status"], &paths, None, &mut FailingWriter, &mut err);
+        let code = run(["chamados", "status"], &paths, None, &mut std::io::empty(), &mut FailingWriter, &mut err);
         assert_eq!(code, 1);
         assert!(String::from_utf8(err).unwrap().contains("closed"));
         FailingWriter.flush().unwrap();
