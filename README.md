@@ -85,7 +85,7 @@ Após o login, apenas os cookies de sessão são salvos em `session.cookies`.
 
 ### Listar chamados
 
-Com a sessão salva por `login`, liste os chamados (uma linha por chamado: `#id`, situação e assunto, separados por tabulação):
+Com a sessão salva por `login`, liste os chamados (uma linha por chamado: `#id`, situação, título local e assunto, separados por tabulação; `-` quando não há título):
 
 ```bash
 cargo run -p chamados-cli -- list           # fila de suporte (menu "Chamados")
@@ -110,6 +110,19 @@ chamados open -d "Não consigo acessar as bibliotecas virtuais"
 - **Cópia por e-mail:** a opção "Enviar cópia de abertura deste chamado para os interessados?" vai marcada por padrão; use `--no-email-copy` para desmarcar.
 - **Assumir e atender:** `--assume` atribui o chamado a você logo após abrir; `--start` também o coloca em atendimento (implica `--assume`). Se um desses passos falhar, o chamado já foi aberto e o erro informa o número.
 - **Outros campos:** `--field NOME=VALOR` (ex.: `--field patrimonio=123`) e `--campus`/`--center` sobrescrevem os padrões.
+
+### Títulos locais
+
+O SUAP não tem título para chamados, o que dificulta a manutenção. Dê um título ao chamado ao abrir ou depois; ele fica **só nesta máquina** e aparece no `list` e no `show`:
+
+```bash
+chamados open -d "Atualizar o Moodle para a 5.3.0" --title "Moodle 5.3.0"   # ao abrir (-t)
+chamados title 559298 "Moodle 5.3.0"     # define ou altera
+chamados title 559298                    # exibe o título atual
+chamados title 559298 --remove           # remove
+```
+
+O título tem uma única linha, de até 120 caracteres. Fica em `titles.json` no diretório de dados (`titles-<perfil>.json` nos demais perfis), com a hora de cada alteração e as remoções registradas, para permitir sincronização futura. Esse arquivo é dado seu: se estiver corrompido, o comando informa o erro em vez de descartá-lo.
 
 ### Ver detalhes de um chamado
 

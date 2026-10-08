@@ -8,10 +8,12 @@ use std::{
     fs,
     io::{Read, Write},
     path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use chamados_core::{
-    Attachment, NewTicket, SuapTicketSource, TicketDetails, TicketError, TicketQueue, TicketSource,
+    validate_title, Attachment, NewTicket, SuapTicketSource, TicketDetails, TicketError,
+    TicketQueue, TicketSource, TitleStore,
 };
 use clap::{Args, Parser, Subcommand};
 use suap_core::{
@@ -63,6 +65,17 @@ enum Command {
     },
     /// Abre um novo chamado no SUAP usando a sessão salva por `login`.
     Open(OpenArgs),
+    /// Define, exibe ou remove o título local de um chamado (o SUAP não tem título; fica só nesta máquina).
+    Title {
+        /// Número do chamado.
+        id: u64,
+        /// Novo título (uma linha). Sem texto, exibe o título atual.
+        #[arg(conflicts_with = "remove")]
+        text: Option<String>,
+        /// Remove o título local.
+        #[arg(long)]
+        remove: bool,
+    },
     /// Exibe uma mensagem sobre o estado inicial do projeto.
     Status,
 }
@@ -135,6 +148,9 @@ struct OpenArgs {
     /// Interessado (id do vínculo no SUAP); por padrão, o do perfil. O formulário do SUAP exige este campo.
     #[arg(long)]
     interested: Option<String>,
+    /// Título local do chamado (uma linha), guardado só nesta máquina; também vale `chamados title`.
+    #[arg(long, short = 't')]
+    title: Option<String>,
     /// Anexa um arquivo (repetível, no máximo 3; tipos aceitos pelo SUAP: xlsx, xls, csv, docx, doc, pdf, jpg, jpeg, png).
     #[arg(long, short = 'a')]
     attach: Vec<PathBuf>,
@@ -226,6 +242,7 @@ fn execute(
         Some(Command::List { meus }) => list(paths, meus, out),
         Some(Command::Show { id }) => show(paths, id, out),
         Some(Command::Open(args)) => open(paths, args, input, out),
+        Some(Command::Title { id, text, remove }) => title(paths, id, text, remove, out),
         Some(Command::Status) => {
             writeln!(
                 out,
@@ -496,6 +513,7 @@ fn list(paths: &AppPaths, mine: bool, out: &mut dyn Write) -> Result<(), Box<dyn
     let source = SuapTicketSource::new(&client, queue);
 
     let tickets = runtime.block_on(source.list_tickets()).map_err(explain)?;
+    let titles = TitleStore::open(paths.titles_file())?;
 
     if tickets.is_empty() {
         writeln!(out, "Nenhum chamado encontrado.")?;
@@ -503,7 +521,8 @@ fn list(paths: &AppPaths, mine: bool, out: &mut dyn Write) -> Result<(), Box<dyn
     for ticket in tickets {
         let status = ticket.status.as_deref().unwrap_or("-");
         let subject = ticket.subject.as_deref().unwrap_or("-");
-        writeln!(out, "#{}\t{status}\t{subject}", ticket.id)?;
+        let title = titles.get(&ticket.id).unwrap_or("-");
+        writeln!(out, "#{}\t{status}\t{title}\t{subject}", ticket.id)?;
     }
     Ok(())
 }
@@ -518,7 +537,46 @@ fn show(paths: &AppPaths, id: u64, out: &mut dyn Write) -> Result<(), Box<dyn Er
     let details = runtime
         .block_on(source.get_ticket(&id.to_string()))
         .map_err(explain)?;
-    print_details(&details, out)?;
+    let titles = TitleStore::open(paths.titles_file())?;
+    print_details(&details, titles.get(&id.to_string()), out)?;
+    Ok(())
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+fn title(
+    paths: &AppPaths,
+    id: u64,
+    text: Option<String>,
+    remove: bool,
+    out: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    let mut titles = TitleStore::open(paths.titles_file())?;
+    let id = id.to_string();
+    if remove {
+        let had_title = titles.remove(&id, unix_now())?;
+        titles.save()?;
+        let message = if had_title {
+            format!("Título local do chamado #{id} removido.")
+        } else {
+            format!("O chamado #{id} não tinha título local.")
+        };
+        writeln!(out, "{message}")?;
+    } else if let Some(text) = text {
+        titles.set(&id, &text, unix_now())?;
+        titles.save()?;
+        writeln!(out, "Título local do chamado #{id} salvo.")?;
+    } else {
+        let message = match titles.get(&id) {
+            Some(title) => title.to_owned(),
+            None => format!("O chamado #{id} não tem título local."),
+        };
+        writeln!(out, "{message}")?;
+    }
     Ok(())
 }
 
@@ -580,6 +638,8 @@ fn open(
     if interested.is_none() {
         return Err("interessado não informado: use --interested ou defina o padrão do perfil (profile update --interested)".into());
     }
+    let local_title = args.title.as_deref().map(validate_title).transpose()?;
+    let mut titles = TitleStore::open(paths.titles_file())?;
     let ticket = NewTicket {
         service_id,
         description: read_text(args.description, input)?,
@@ -604,6 +664,14 @@ fn open(
         .join(&format!("centralservicos/chamado/{id}/"))?;
     writeln!(out, "Chamado #{id} aberto: {url}")?;
 
+    if let Some(local_title) = local_title {
+        let saved = titles
+            .set(&id, &local_title, unix_now())
+            .and_then(|()| titles.save());
+        saved.map_err(|error| after_open(&id, "salvar o título local", error))?;
+        writeln!(out, "Título local salvo: {local_title}")?;
+    }
+
     if args.assume || args.start {
         runtime
             .block_on(source.assume_ticket(&id))
@@ -619,8 +687,15 @@ fn open(
     Ok(())
 }
 
-fn print_details(details: &TicketDetails, out: &mut dyn Write) -> std::io::Result<()> {
+fn print_details(
+    details: &TicketDetails,
+    local_title: Option<&str>,
+    out: &mut dyn Write,
+) -> std::io::Result<()> {
     writeln!(out, "{}", details.title)?;
+    if let Some(local_title) = local_title {
+        writeln!(out, "Título: {local_title}")?;
+    }
     writeln!(out, "Situação: {}", details.statuses.join("; "))?;
     let heading = details.heading.as_deref().unwrap_or("-");
     writeln!(out, "Serviço: {heading}")?;
@@ -1130,8 +1205,114 @@ mod tests {
         for args in [&["list"][..], &["list", "--meus"][..]] {
             let (code, out, err) = run_args(args, &paths);
             assert_eq!((code, err.as_str()), (0, ""));
-            assert_eq!(out, "#7\tEm atendimento\tAssunto\n#8\t-\t-\n");
+            assert_eq!(out, "#7\tEm atendimento\t-\tAssunto\n#8\t-\t-\t-\n");
         }
+    }
+
+    #[test]
+    fn titles_are_set_shown_removed_and_listed() {
+        let (_dir, paths) = paths();
+        let (runtime, server) = mock_server(true);
+        run_args(&["profile", "init", "--base-url", &server.uri()], &paths);
+        let (_, out, _) = run_args(&["title", "7"], &paths);
+        assert!(out.contains("não tem título local"));
+
+        let (code, out, _) = run_args(&["title", "7", "  Atualizar o Moodle  "], &paths);
+        assert!(code == 0 && out.contains("Título local do chamado #7 salvo"));
+        let (_, out, _) = run_args(&["title", "7"], &paths);
+        assert_eq!(out, "Atualizar o Moodle\n");
+
+        let listing = r#"<div class="general-box"><span class="status">Em atendimento</span>
+            <h4><a href="/centralservicos/chamado/7/">REQ #7 <strong>Assunto</strong></a></h4></div>
+            <div class="general-box"><h4><a href="/centralservicos/chamado/8/">REQ #8</a></h4></div>"#;
+        mount_listing(
+            &runtime,
+            &server,
+            "/centralservicos/listar_chamados_suporte/",
+            ResponseTemplate::new(200).set_body_string(listing),
+        );
+        let (_, out, _) = run_args(&["list"], &paths);
+        assert_eq!(
+            out,
+            "#7\tEm atendimento\tAtualizar o Moodle\tAssunto\n#8\t-\t-\t-\n"
+        );
+
+        let page = r#"<main id="content"><div class="title-container"><h2>Chamado Interno 7</h2></div></main>"#;
+        mount_listing(
+            &runtime,
+            &server,
+            "/centralservicos/chamado/7/",
+            ResponseTemplate::new(200).set_body_string(page),
+        );
+        let (_, out, _) = run_args(&["show", "7"], &paths);
+        assert!(out.starts_with("Chamado Interno 7\nTítulo: Atualizar o Moodle\n"));
+
+        let (_, out, _) = run_args(&["title", "7", "--remove"], &paths);
+        assert!(out.contains("removido"));
+        let (_, out, _) = run_args(&["title", "7", "--remove"], &paths);
+        assert!(out.contains("não tinha título local"));
+        let (_, out, _) = run_args(&["show", "7"], &paths);
+        assert!(!out.contains("Título:"));
+        assert!(paths.titles_file().exists());
+    }
+
+    #[test]
+    fn titles_are_kept_per_profile() {
+        let (_dir, paths) = paths();
+        run_args(&["title", "7", "No default"], &paths);
+        run_args(&["title", "7", "No local", "--profile", "local"], &paths);
+        let (_, out, _) = run_args(&["title", "7"], &paths);
+        assert_eq!(out, "No default\n");
+        let (_, out, _) = run_args(&["title", "7", "--profile", "local"], &paths);
+        assert_eq!(out, "No local\n");
+    }
+
+    #[test]
+    fn title_rejects_invalid_input() {
+        let (_dir, paths) = paths();
+        let (code, _, err) = run_args(&["title", "7", "duas\nlinhas"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("single line"));
+        let (code, _, err) = run_args(&["title", "7", "x", "--remove"], &paths);
+        assert_eq!(code, 2);
+        assert!(!err.is_empty());
+
+        paths.ensure_dirs().unwrap();
+        std::fs::write(paths.titles_file(), "quebrado").unwrap();
+        let (code, _, err) = run_args(&["title", "7"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("titles file"));
+    }
+
+    #[test]
+    fn open_saves_the_local_title_and_validates_it_first() {
+        let (_dir, paths, runtime, server) = open_setup();
+        let (code, out, err) = run_args(&["open", "-d", "x", "--title", " Meu título "], &paths);
+        assert_eq!((code, err.as_str()), (0, ""));
+        assert!(out.contains("Título local salvo: Meu título"));
+        let (_, out, _) = run_args(&["title", "99"], &paths);
+        assert_eq!(out, "Meu título\n");
+
+        let before = runtime.block_on(server.received_requests()).unwrap().len();
+        let (code, _, err) = run_args(&["open", "-d", "x", "-t", "a\nb"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("single line"));
+        let after = runtime.block_on(server.received_requests()).unwrap().len();
+        assert_eq!(before, after, "no request may be made for an invalid title");
+    }
+
+    #[test]
+    fn open_reports_a_title_that_could_not_be_saved_after_the_ticket_was_created() {
+        let (_dir, paths, _runtime, _server) = open_setup();
+        paths.ensure_dirs().unwrap();
+        // The temporary file name is taken by a directory, so saving the titles fails.
+        std::fs::create_dir(paths.titles_file().with_extension("json.tmp")).unwrap();
+        let (code, out, err) = run_args(&["open", "-d", "x", "-t", "Titulo"], &paths);
+        assert_eq!(code, 1);
+        assert!(out.contains("Chamado #99 aberto"));
+        assert!(
+            err.contains("o chamado #99 foi aberto, mas não foi possível salvar o título local")
+        );
     }
 
     #[test]

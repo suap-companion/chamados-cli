@@ -20,6 +20,7 @@ const ORGANIZATION: &str = "suap-companion";
 const APPLICATION: &str = "chamados";
 const CONFIG_FILE: &str = "config.toml";
 const SESSION_FILE: &str = "session.cookies";
+const TITLES_FILE: &str = "titles.json";
 const CONFIG_DIR_IN_HOME: [&str; 2] = [".config", "suap"];
 const LOGIN_PATH: &str = "/accounts/login/";
 
@@ -82,6 +83,14 @@ impl AppPaths {
         }
         self.data_dir
             .join(format!("session-{}.cookies", self.profile))
+    }
+
+    /// Local ticket titles of the selected profile (`titles.json` for `default`, else `titles-<profile>.json`).
+    pub fn titles_file(&self) -> PathBuf {
+        if self.profile == DEFAULT_PROFILE {
+            return self.data_dir.join(TITLES_FILE);
+        }
+        self.data_dir.join(format!("titles-{}.json", self.profile))
     }
 
     pub fn ensure_dirs(&self) -> Result<(), SuapError> {
@@ -611,6 +620,8 @@ mod tests {
         assert!(local_paths
             .session_file()
             .ends_with("session-local-1.cookies"));
+        assert!(default_paths.titles_file().ends_with("titles.json"));
+        assert!(local_paths.titles_file().ends_with("titles-local-1.json"));
 
         let local = SuapConfig {
             base_url: Url::parse("http://localhost:8000/").unwrap(),
