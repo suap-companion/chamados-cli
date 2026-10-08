@@ -11,9 +11,11 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 chamados-core = { path = "../chamados-core" }
+chamados-sync = { path = "../chamados-sync" }
 suap-core = { path = "../suap-core" }
 tokio = { version = "1", features = ["rt"] }
 
 [dev-dependencies]
+keyring-core = "1"
 tempfile = "3"
 wiremock = "0.6"

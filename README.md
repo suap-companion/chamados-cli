@@ -170,6 +170,81 @@ docker exec -i <container-web-do-suap> python manage.py shell < scripts/seed_cen
 
 O script imprime `servico_id`, `campus_id` e `centro_id`.
 
+## Sincronização em nuvem (cifrada)
+
+Os **títulos locais** e as **configurações dos perfis** podem ser sincronizados entre dispositivos. Tudo é **cifrado no seu computador** (XChaCha20-Poly1305, chave de 256 bits) antes de sair: o armazenamento só enxerga bytes ilegíveis, e a chave nunca vai para a nuvem.
+
+**Nunca sincronizam:** sessões e cookies (`session*.cookies`), a senha (`SUAP_PASSWORD`), credenciais da nuvem e a própria chave.
+
+### Configurar
+
+```bash
+# 1. Onde guardar (por enquanto, uma pasta: sincronizada por outro programa, disco de rede ou, para testar, qualquer diretório)
+chamados sync setup --path /caminho/da/pasta --key-source file    # key-source: keyring (padrão), file ou env
+
+# 2. A chave (uma só, para todos os seus dispositivos)
+chamados sync key generate
+
+# 3. Quais perfis sincronizam (começam desligados)
+chamados profile update --sync true                 # perfil default
+chamados profile update local --sync true
+
+# 4. Sincronizar
+chamados sync
+```
+
+Em outro dispositivo, repita o `setup` e **leve a chave por um canal seu** (nunca pela nuvem): `chamados sync key export` imprime a chave em hexadecimal e `chamados sync key import` a lê da entrada padrão (`chamados sync key export | ssh outro chamados sync key import`). `chamados sync key status` informa onde a chave está e se existe.
+
+### Onde fica a chave
+
+| `--key-source` | Onde | Quando usar |
+|----------------|------|-------------|
+| `keyring` (padrão) | repositório de segredos do sistema (Windows Credential Manager, macOS Keychain, Linux Secret Service) | desktop com sessão aberta |
+| `file` | arquivo `~/.config/suap/sync.key` (ou `--key-file`), permissão `0600` verificada no Linux e no macOS | servidores, SSH e **automação** |
+| `env` | variável de ambiente `CHAMADOS_SYNC_KEY` (somente leitura) | contêineres e CI |
+
+O chaveiro de um desktop só abre numa sessão gráfica desbloqueada, então `cron` e timers devem usar `file` ou `env`.
+
+### Opções do `sync`
+
+- `chamados sync --check`: mostra o backend, se ele suporta escrita condicional e se a chave existe, sem sincronizar.
+- `chamados sync --dry-run`: mostra o que mudaria, sem gravar nada (nem local, nem na nuvem).
+- `chamados sync --only <perfil>`: restringe a rodada a um perfil.
+- `chamados sync --quiet`: não imprime nada em caso de sucesso (para automação). O código de saída é diferente de zero em falha.
+
+Duas execuções ao mesmo tempo não se atrapalham: a segunda vê o bloqueio (`sync.lock`) e sai sem erro.
+
+### Como as cópias se juntam
+
+Cada título e cada bloco de configurações carrega o instante da última alteração (em milissegundos) e **o mais novo vence**, entrada por entrada; em empate de instante, vence o conteúdo maior (sempre o mesmo resultado, em qualquer ordem). Remover um título deixa uma marca de remoção, para a remoção também chegar aos outros dispositivos. Se alguém gravar na nuvem durante a sua rodada, ela recomeça do download (até 5 tentativas). Backends sem escrita condicional gravam e **releem para confirmar**.
+
+Limites desta versão: remover um perfil (`profile remove`) **não** o remove da nuvem, e um perfil que existe na nuvem é recriado no próximo `sync`; a pasta (`directory`) é o único backend, e o S3-compatível (Cloudflare R2) vem na sequência (#42).
+
+### Automatizar (a cada 5 minutos)
+
+Com a chave em `file` ou `env`. No Linux, um **timer do systemd de usuário** (`~/.config/systemd/user/chamados-sync.service` e `.timer`):
+
+```ini
+# chamados-sync.service
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/chamados sync --quiet
+
+# chamados-sync.timer
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+Persistent=true
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+systemctl --user enable --now chamados-sync.timer
+```
+
+Com `cron`: `*/5 * * * * flock -n ~/.cache/chamados-sync.lock chamados sync --quiet`. No Windows, o Agendador de Tarefas (`schtasks /create /sc minute /mo 5 /tn chamados-sync /tr "chamados sync --quiet"`).
+
 ## Requisitos de software
 
 - **RS-01 — Cobertura de testes de 100%.** Os testes automatizados do workspace devem cobrir 100% das linhas de código. A verificação roda no CI (`ci.yml`) e o build falha se a cobertura ficar abaixo disso. O ponto de entrada `main.rs` de cada binário deve conter apenas o encadeamento mínimo e é excluído da medição; toda a lógica fica em `lib.rs`, onde é testada.

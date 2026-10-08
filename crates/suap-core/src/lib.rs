@@ -93,6 +93,16 @@ impl AppPaths {
         self.data_dir.join(format!("titles-{}.json", self.profile))
     }
 
+    /// Lock file that keeps two `chamados sync` runs from overlapping.
+    pub fn sync_lock_file(&self) -> PathBuf {
+        self.data_dir.join("sync.lock")
+    }
+
+    /// Default location of the encryption key file (`file` key source).
+    pub fn default_key_file(&self) -> PathBuf {
+        self.config_dir.join("sync.key")
+    }
+
     pub fn ensure_dirs(&self) -> Result<(), SuapError> {
         fs::create_dir_all(&self.config_dir)?;
         fs::create_dir_all(&self.data_dir)?;
@@ -122,9 +132,43 @@ fn config_dir_in(home: &Path) -> PathBuf {
 pub struct SuapConfig {
     pub base_url: Url,
     pub username: Option<String>,
+    /// Whether this profile takes part in the cloud synchronization (off unless asked for).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sync: bool,
+    /// Unix time in milliseconds of the last change made to this profile; the newest copy wins when syncing.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub updated_at: u64,
     /// Defaults for `chamados open`, kept per profile.
     #[serde(default, skip_serializing_if = "OpenDefaults::is_empty")]
     pub open: OpenDefaults,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+/// Global (not per-profile) synchronization settings, kept in the `[sync]` table of `config.toml`.
+///
+/// They stay on this machine: they are never part of the synchronized document. Secrets (the
+/// encryption key, cloud credentials) do not belong here either.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncSettings {
+    /// Storage backend: `directory` (a folder) for now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    /// Folder of the `directory` backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Where the encryption key lives: `keyring`, `file` or `env`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_source: Option<String>,
+    /// Key file of the `file` key source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_file: Option<String>,
 }
 
 /// Per-profile defaults used when opening tickets; every explicit option overrides them.
@@ -155,6 +199,8 @@ impl Default for SuapConfig {
         Self {
             base_url: Url::parse("https://suap.ifrn.edu.br/").expect("default URL is valid"),
             username: None,
+            sync: false,
+            updated_at: 0,
             open: OpenDefaults::default(),
         }
     }
@@ -170,6 +216,8 @@ struct ConfigFile {
     username: Option<String>,
     #[serde(default)]
     profiles: BTreeMap<String, SuapConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sync: Option<SyncSettings>,
 }
 
 impl ConfigFile {
@@ -218,6 +266,19 @@ pub fn save_config(paths: &AppPaths, config: &SuapConfig) -> Result<(), SuapErro
     file.migrate_legacy();
     file.profiles
         .insert(paths.profile().to_owned(), config.clone());
+    write_config_file(paths, &file)
+}
+
+/// The global synchronization settings (empty when never configured).
+pub fn load_sync_settings(paths: &AppPaths) -> Result<SyncSettings, SuapError> {
+    Ok(ConfigFile::read(paths)?.sync.unwrap_or_default())
+}
+
+/// Saves the global synchronization settings, keeping the profiles.
+pub fn save_sync_settings(paths: &AppPaths, settings: &SyncSettings) -> Result<(), SuapError> {
+    let mut file = ConfigFile::read(paths)?;
+    file.migrate_legacy();
+    file.sync = Some(settings.clone());
     write_config_file(paths, &file)
 }
 
@@ -488,6 +549,8 @@ fn restrict_permissions(path: &Path) -> Result<(), SuapError> {
         permissions.set_mode(0o600);
         fs::set_permissions(path, permissions)?;
     }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -663,6 +726,45 @@ mod tests {
             Some(SuapConfig::default())
         );
         assert!(!remove_config(&local_paths).unwrap());
+    }
+
+    #[test]
+    fn sync_flags_and_global_settings_are_stored_without_cluttering_plain_profiles() {
+        let (_dir, paths) = paths();
+        save_config(&paths, &SuapConfig::default()).unwrap();
+        let plain = fs::read_to_string(paths.config_file()).unwrap();
+        assert!(!plain.contains("sync") && !plain.contains("updated_at"));
+        assert_eq!(load_sync_settings(&paths).unwrap(), SyncSettings::default());
+
+        let config = SuapConfig {
+            sync: true,
+            updated_at: 1_700_000_000,
+            open: OpenDefaults {
+                service: Some(7),
+                ..OpenDefaults::default()
+            },
+            ..SuapConfig::default()
+        };
+        save_config(&paths, &config).unwrap();
+        let settings = SyncSettings {
+            backend: Some("directory".to_owned()),
+            path: Some("/nuvem".to_owned()),
+            key_source: Some("file".to_owned()),
+            key_file: Some("/chave".to_owned()),
+        };
+        save_sync_settings(&paths, &settings).unwrap();
+        assert_eq!(load_config(&paths).unwrap(), Some(config.clone()));
+        assert_eq!(load_sync_settings(&paths).unwrap(), settings);
+        let saved = fs::read_to_string(paths.config_file()).unwrap();
+        assert!(saved.contains("[sync]") && saved.contains("updated_at = 1700000000"));
+
+        // Saving a profile or removing one keeps the global settings.
+        save_config(&paths, &SuapConfig::default()).unwrap();
+        assert_eq!(load_sync_settings(&paths).unwrap(), settings);
+        assert!(remove_config(&paths).unwrap());
+        assert_eq!(load_sync_settings(&paths).unwrap(), settings);
+        assert!(paths.sync_lock_file().ends_with("sync.lock"));
+        assert!(paths.default_key_file().ends_with("sync.key"));
     }
 
     #[test]

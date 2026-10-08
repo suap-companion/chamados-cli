@@ -15,10 +15,14 @@ use chamados_core::{
     validate_title, Attachment, Message, NewTicket, Resolution, SuapTicketSource, TicketDetails,
     TicketError, TicketQueue, TicketSource, TitleStore,
 };
+use chamados_sync::{
+    backend_from, key_source_from, load_key, store_key, sync_once, Key, KeySource, SyncBackend,
+    SyncLock, SyncOptions, DIRECTORY_BACKEND,
+};
 use clap::{Args, Parser, Subcommand};
 use suap_core::{
-    list_profiles, load_config, remove_config, save_config, AppPaths, SuapClient, SuapConfig,
-    SuapError, DEFAULT_PROFILE,
+    list_profiles, load_config, load_sync_settings, remove_config, save_config, save_sync_settings,
+    AppPaths, SuapClient, SuapConfig, SuapError, SyncSettings, DEFAULT_PROFILE,
 };
 
 #[derive(Debug, Parser)]
@@ -73,6 +77,8 @@ enum Command {
     Suspend(MessageArgs),
     /// Resolve um chamado (situação "Resolvido"), com a mensagem de resolução.
     Resolve(ResolveArgs),
+    /// Sincroniza, cifrados, os títulos e as configurações dos perfis com `sync` ligado.
+    Sync(SyncArgs),
     /// Define, exibe ou remove o título local de um chamado (o SUAP não tem título; fica só nesta máquina).
     Title {
         /// Número do chamado.
@@ -138,6 +144,75 @@ struct ProfileArgs {
     /// Centro de atendimento padrão do `open` neste perfil.
     #[arg(long)]
     center: Option<String>,
+    /// Inclui (true) ou não (false) este perfil na sincronização em nuvem; começa desligado.
+    #[arg(long)]
+    sync: Option<bool>,
+}
+
+#[derive(Debug, Args)]
+#[command(args_conflicts_with_subcommands = true)]
+struct SyncArgs {
+    #[command(subcommand)]
+    action: Option<SyncAction>,
+    /// Sincroniza só este perfil (por padrão, todos os que têm `sync` ligado).
+    #[arg(long)]
+    only: Option<String>,
+    /// Não imprime nada em caso de sucesso (para `cron`/timers).
+    #[arg(long, short)]
+    quiet: bool,
+    /// Mostra o que mudaria, sem gravar nada (nem local, nem na nuvem).
+    #[arg(long)]
+    dry_run: bool,
+    /// Confere o backend (escrita condicional) e a chave, sem sincronizar.
+    #[arg(long)]
+    check: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum SyncAction {
+    /// Configura onde e como sincronizar (configuração global, fica só nesta máquina).
+    Setup(SyncSetupArgs),
+    /// Gerencia a chave de criptografia.
+    Key {
+        #[command(subcommand)]
+        command: KeyCommand,
+    },
+}
+
+#[derive(Debug, Args)]
+struct SyncSetupArgs {
+    /// Backend de armazenamento: por ora, `directory` (uma pasta).
+    #[arg(long, default_value = DIRECTORY_BACKEND)]
+    backend: String,
+    /// Pasta do backend `directory` (ex.: uma pasta sincronizada ou um disco de rede).
+    #[arg(long)]
+    path: Option<PathBuf>,
+    /// Onde fica a chave: `keyring` (padrão), `file` ou `env`.
+    #[arg(long)]
+    key_source: Option<String>,
+    /// Arquivo da chave, para `--key-source file` (padrão: ~/.config/suap/sync.key).
+    #[arg(long)]
+    key_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Subcommand)]
+enum KeyCommand {
+    /// Gera uma chave aleatória e a guarda na fonte configurada.
+    Generate {
+        /// Substitui a chave existente (o que foi cifrado com ela fica ilegível).
+        #[arg(long)]
+        force: bool,
+    },
+    /// Imprime a chave em hexadecimal, para levá-la a outro dispositivo. Guarde-a em segredo.
+    Export,
+    /// Guarda a chave lida da entrada padrão (hexadecimal), vinda de `key export`.
+    Import {
+        /// Substitui a chave existente.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Informa a fonte da chave e se ela existe.
+    Status,
 }
 
 #[derive(Debug, Args)]
@@ -276,6 +351,7 @@ fn execute(
         Some(Command::Open(args)) => open(paths, args, input, out),
         Some(Command::Comment(args)) => send_message(paths, args, Message::Comment, input, out),
         Some(Command::Note(args)) => send_message(paths, args, Message::InternalNote, input, out),
+        Some(Command::Sync(args)) => sync(paths, args, input, out),
         Some(Command::Suspend(args)) => suspend(paths, args, input, out),
         Some(Command::Resolve(args)) => resolve(paths, args, input, out),
         Some(Command::Title { id, text, remove }) => title(paths, id, text, remove, out),
@@ -345,6 +421,8 @@ fn print_profile(
     {
         writeln!(out, "open.{name}: {value}")?;
     }
+    let sync = if config.sync { "ligado" } else { "desligado" };
+    writeln!(out, "sync: {sync}")?;
     let session = if paths.session_file().exists() {
         "salva"
     } else {
@@ -399,6 +477,10 @@ fn apply_profile_args(config: &mut SuapConfig, args: ProfileArgs) -> Result<(), 
     if args.username.is_some() {
         config.username = args.username;
     }
+    if let Some(sync) = args.sync {
+        config.sync = sync;
+    }
+    config.updated_at = unix_now();
     let open = &mut config.open;
     open.service = args.service.or(open.service);
     open.interested = args.interested.or(open.interested.take());
@@ -447,7 +529,8 @@ fn profile_update(
     ]
     .iter()
     .all(|option| option.is_none())
-        && args.service.is_none();
+        && args.service.is_none()
+        && args.sync.is_none();
     if unchanged {
         return Err("nada a alterar: informe ao menos uma opção (ex.: --base-url)".into());
     }
@@ -659,10 +742,156 @@ fn resolve(
     Ok(())
 }
 
+fn key_source(paths: &AppPaths) -> Result<(SyncSettings, KeySource), Box<dyn Error>> {
+    let settings = load_sync_settings(paths)?;
+    let source = key_source_from(&settings, paths)?;
+    Ok((settings, source))
+}
+
+fn sync(
+    paths: &AppPaths,
+    args: SyncArgs,
+    input: &mut dyn Read,
+    out: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    match args.action {
+        Some(SyncAction::Setup(setup)) => sync_setup(paths, setup, out),
+        Some(SyncAction::Key { command }) => sync_key(paths, command, input, out),
+        None => sync_run(paths, &args, out),
+    }
+}
+
+fn sync_setup(
+    paths: &AppPaths,
+    args: SyncSetupArgs,
+    out: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    let mut settings = load_sync_settings(paths)?;
+    settings.backend = Some(args.backend);
+    settings.path = args
+        .path
+        .or_else(|| settings.path.take().map(PathBuf::from))
+        .map(|path| path.display().to_string());
+    settings.key_source = args.key_source.or(settings.key_source.take());
+    settings.key_file = args
+        .key_file
+        .map(|file| file.display().to_string())
+        .or(settings.key_file.take());
+    // Validate before saving, so a bad setup never replaces a working one.
+    backend_from(&settings)?;
+    key_source_from(&settings, paths)?;
+    save_sync_settings(paths, &settings)?;
+    let file = paths.config_file();
+    writeln!(out, "Sincronização configurada em {}.", file.display())?;
+    Ok(())
+}
+
+fn sync_key(
+    paths: &AppPaths,
+    command: KeyCommand,
+    input: &mut dyn Read,
+    out: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    let (_, source) = key_source(paths)?;
+    match command {
+        KeyCommand::Generate { force } => {
+            store_key(&source, &Key::generate(), force)?;
+            writeln!(out, "Chave criada ({}).", source.name())?;
+        }
+        KeyCommand::Export => {
+            let key = load_key(&source)?.ok_or_else(|| no_key(&source))?;
+            writeln!(out, "{}", key.to_hex())?;
+        }
+        KeyCommand::Import { force } => {
+            let key = Key::from_hex(&read_text(None, input)?)?;
+            store_key(&source, &key, force)?;
+            writeln!(out, "Chave importada ({}).", source.name())?;
+        }
+        KeyCommand::Status => {
+            let present = if load_key(&source)?.is_some() {
+                "sim"
+            } else {
+                "não"
+            };
+            writeln!(out, "fonte: {}", source.name())?;
+            writeln!(out, "chave presente: {present}")?;
+        }
+    }
+    Ok(())
+}
+
+const LOCK_HELD_NOTE: &str = "Outra sincronização já está em andamento; nada a fazer.";
+
+fn support_text(supported: bool) -> &'static str {
+    if supported {
+        "suportada"
+    } else {
+        "não suportada"
+    }
+}
+
+fn no_key(source: &KeySource) -> Box<dyn Error> {
+    format!(
+        "nenhuma chave de criptografia ({}): execute `chamados sync key generate` (ou `key import`)",
+        source.name()
+    )
+    .into()
+}
+
+fn sync_run(paths: &AppPaths, args: &SyncArgs, out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
+    let (settings, source) = key_source(paths)?;
+    if settings.backend.is_none() {
+        return Err("sincronização não configurada: execute `chamados sync setup`".into());
+    }
+    let backend = backend_from(&settings)?;
+    let key = load_key(&source)?.ok_or_else(|| no_key(&source))?;
+    let Some(_lock) = SyncLock::acquire(&paths.sync_lock_file())? else {
+        if !args.quiet {
+            writeln!(out, "{LOCK_HELD_NOTE}")?;
+        }
+        return Ok(());
+    };
+    if args.check {
+        let conditional = support_text(backend.supports_conditional_writes());
+        let name = settings.backend.as_deref().unwrap_or_default();
+        writeln!(out, "backend: {name}")?;
+        writeln!(out, "escrita condicional: {conditional}")?;
+        writeln!(out, "chave: {} (presente)", source.name())?;
+        return Ok(());
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let options = SyncOptions {
+        only: args.only.as_deref(),
+        dry_run: args.dry_run,
+    };
+    let report = runtime.block_on(sync_once(paths, &backend, &key, &options))?;
+    if args.quiet {
+        return Ok(());
+    }
+    let cloud = match (report.uploaded, args.dry_run) {
+        (true, true) => "seria atualizada",
+        (true, false) => "atualizada",
+        (false, _) => "já estava em dia",
+    };
+    let prefix = if args.dry_run {
+        "Simulação"
+    } else {
+        "Sincronização concluída"
+    };
+    let message = format!(
+        "{prefix}: {} perfil(is), {} alteração(ões) local(is), nuvem {cloud}.",
+        report.profiles, report.local_changes
+    );
+    writeln!(out, "{message}")?;
+    Ok(())
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs())
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
 fn title(
@@ -1642,7 +1871,8 @@ mod tests {
 
     /// Commands without free text. A new command must be added to one of the two lists, which forces
     /// a decision about RS-02 (and a test for it) whenever a command is created.
-    const NON_TEXT_COMMANDS: [&str; 8] = [
+    const NON_TEXT_COMMANDS: [&str; 9] = [
+        "sync",
         "paths",
         "profile",
         "session-status",
@@ -1739,6 +1969,235 @@ mod tests {
                 "{command:?}"
             );
         }
+    }
+
+    /// Configures `paths` to sync to `cloud` with the key in `key_file`.
+    fn setup_sync(paths: &AppPaths, cloud: &std::path::Path, key_file: &std::path::Path) {
+        let args = [
+            "sync",
+            "setup",
+            "--path",
+            cloud.to_str().unwrap(),
+            "--key-source",
+            "file",
+            "--key-file",
+            key_file.to_str().unwrap(),
+        ];
+        let (code, _, err) = run_args(&args, paths);
+        assert_eq!((code, err.as_str()), (0, ""));
+    }
+
+    #[test]
+    fn two_machines_sync_titles_and_profiles_through_an_encrypted_folder() {
+        let root = tempdir().unwrap();
+        let cloud = root.path().join("nuvem");
+        let (_dir_a, a) = paths();
+        let (_dir_b, b) = paths();
+        setup_sync(&a, &cloud, &root.path().join("a.key"));
+        setup_sync(&b, &cloud, &root.path().join("b.key"));
+
+        // Machine A creates the key and a synced profile with a title.
+        let (code, out, _) = run_args(&["sync", "key", "generate"], &a);
+        assert_eq!((code, out.as_str()), (0, "Chave criada (file).\n"));
+        let (code, _, _) = run_args(
+            &["profile", "init", "--username", "ana", "--sync", "true"],
+            &a,
+        );
+        assert_eq!(code, 0);
+        run_args(&["title", "5", "Moodle 5.3"], &a);
+        let (code, out, err) = run_args(&["sync"], &a);
+        assert_eq!((code, err.as_str()), (0, ""));
+        assert_eq!(out, "Sincronização concluída: 1 perfil(is), 0 alteração(ões) local(is), nuvem atualizada.\n");
+        let stored = std::fs::read(cloud.join("chamados-sync-v1.bin")).unwrap();
+        assert!(!String::from_utf8_lossy(&stored).contains("Moodle"));
+
+        // Machine B gets the key (never through the cloud), then the profile and the title.
+        let (_, key, _) = run_args(&["sync", "key", "export"], &a);
+        assert_eq!(key.trim().len(), 64);
+        let (code, out, _) = run_with_input(&["sync", "key", "import"], &b, &key);
+        assert_eq!((code, out.as_str()), (0, "Chave importada (file).\n"));
+        let (code, out, _) = run_args(&["sync"], &b);
+        assert_eq!(code, 0);
+        assert!(
+            out.contains("2 alteração(ões) local(is), nuvem já estava em dia"),
+            "{out}"
+        );
+        let (_, shown, _) = run_args(&["profile", "show"], &b);
+        assert!(shown.contains("username: ana") && shown.contains("sync: ligado"));
+        let (_, title, _) = run_args(&["title", "5"], &b);
+        assert_eq!(title, "Moodle 5.3\n");
+
+        // B changes the title; A receives it.
+        run_args(&["title", "5", "Moodle 5.3 (feito)"], &b);
+        run_args(&["sync", "--quiet"], &b);
+        let (_, out, _) = run_args(&["sync"], &a);
+        assert!(out.contains("1 alteração(ões) local(is)"), "{out}");
+        let (_, title, _) = run_args(&["title", "5"], &a);
+        assert_eq!(title, "Moodle 5.3 (feito)\n");
+    }
+
+    #[test]
+    fn sync_flags_check_quiet_dry_run_only_and_lock() {
+        let root = tempdir().unwrap();
+        let cloud = root.path().join("nuvem");
+        let (_dir, paths) = paths();
+        setup_sync(&paths, &cloud, &root.path().join("k"));
+        run_args(&["sync", "key", "generate"], &paths);
+        run_args(&["profile", "init", "--sync", "true"], &paths);
+        run_args(&["profile", "init", "local", "--sync", "true"], &paths);
+
+        let (code, out, _) = run_args(&["sync", "--check"], &paths);
+        assert_eq!(code, 0);
+        assert!(
+            out.contains("backend: directory") && out.contains("escrita condicional: suportada")
+        );
+        assert!(out.contains("chave: file (presente)"));
+
+        let (code, out, _) = run_args(&["sync", "--dry-run"], &paths);
+        assert_eq!(code, 0);
+        assert!(
+            out.starts_with("Simulação: 2 perfil(is)") && out.contains("nuvem seria atualizada"),
+            "{out}"
+        );
+        assert!(!cloud.exists(), "a dry run writes nothing");
+
+        let (code, out, _) = run_args(&["sync", "--only", "local", "--quiet"], &paths);
+        assert_eq!((code, out.as_str()), (0, ""));
+        let (_, out, _) = run_args(&["sync", "--dry-run"], &paths);
+        assert!(
+            out.contains("nuvem seria atualizada"),
+            "default is still pending: {out}"
+        );
+
+        // A run that finds the lock taken does nothing, quietly or not.
+        paths.ensure_dirs().unwrap();
+        std::fs::write(paths.sync_lock_file(), "").unwrap();
+        let (code, out, _) = run_args(&["sync"], &paths);
+        assert!(code == 0 && out.contains("Outra sincronização já está em andamento"));
+        let (code, out, _) = run_args(&["sync", "--quiet"], &paths);
+        assert_eq!((code, out.as_str()), (0, ""));
+        std::fs::remove_file(paths.sync_lock_file()).unwrap();
+
+        let (_, out, _) = run_args(&["sync"], &paths);
+        assert!(out.contains("nuvem atualizada"));
+        let (_, out, _) = run_args(&["sync"], &paths);
+        assert!(out.contains("nuvem já estava em dia"));
+    }
+
+    #[test]
+    fn sync_reports_missing_setup_keys_and_bad_settings() {
+        let root = tempdir().unwrap();
+        let (_dir, paths) = paths();
+        let (code, _, err) = run_args(&["sync"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("sincronização não configurada"));
+
+        let bad = [
+            (vec!["--backend", "s3", "--path", "/x"], "unknown backend"),
+            (vec![], "needs a path"),
+            (
+                vec!["--path", "/x", "--key-source", "nuvem"],
+                "unknown key source",
+            ),
+        ];
+        for (extra, expected) in bad {
+            let mut args = vec!["sync", "setup"];
+            args.extend(extra);
+            let (code, _, err) = run_args(&args, &paths);
+            assert_eq!(code, 1, "{expected}");
+            assert!(err.contains(expected), "{expected}: {err}");
+        }
+        assert!(!paths.config_file().exists(), "a bad setup saves nothing");
+
+        let cloud = root.path().join("nuvem");
+        let key_file = root.path().join("k");
+        setup_sync(&paths, &cloud, &key_file);
+        let (code, _, err) = run_args(&["sync"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("nenhuma chave de criptografia"));
+        let (code, _, err) = run_args(&["sync", "key", "export"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("sync key generate"));
+        let (_, out, _) = run_args(&["sync", "key", "status"], &paths);
+        assert_eq!(out, "fonte: file\nchave presente: não\n");
+
+        run_args(&["sync", "key", "generate"], &paths);
+        let (_, out, _) = run_args(&["sync", "key", "status"], &paths);
+        assert!(out.contains("chave presente: sim"));
+        let (code, _, err) = run_args(&["sync", "key", "generate"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("already exists"));
+        assert_eq!(
+            run_args(&["sync", "key", "generate", "--force"], &paths).0,
+            0
+        );
+
+        let (code, _, err) = run_with_input(&["sync", "key", "import"], &paths, "curta");
+        assert_eq!(code, 1);
+        assert!(err.contains("hexadecimal"));
+        let (code, _, err) = run_with_input(&["sync", "key", "import"], &paths, "\n");
+        assert_eq!(code, 1);
+        assert!(err.contains("texto não informado"));
+
+        // The environment key source is read only.
+        run_args(
+            &[
+                "sync",
+                "setup",
+                "--path",
+                cloud.to_str().unwrap(),
+                "--key-source",
+                "env",
+            ],
+            &paths,
+        );
+        let (code, _, err) = run_args(&["sync", "key", "generate"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("read only"));
+        let (_, out, _) = run_args(&["sync", "key", "status"], &paths);
+        assert!(out.starts_with("fonte: env"));
+    }
+
+    #[test]
+    fn the_key_can_live_in_the_system_keyring() {
+        keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
+        let root = tempdir().unwrap();
+        let (_dir, paths) = paths();
+        let args = ["sync", "setup", "--path", root.path().to_str().unwrap()];
+        assert_eq!(run_args(&args, &paths).0, 0);
+        let (_, out, _) = run_args(&["sync", "key", "status"], &paths);
+        assert_eq!(out, "fonte: keyring\nchave presente: não\n");
+        assert_eq!(run_args(&["sync", "key", "generate"], &paths).0, 0);
+        let (_, key, _) = run_args(&["sync", "key", "export"], &paths);
+        assert_eq!(key.trim().len(), 64);
+        let (code, _, _) = run_args(&["sync", "key", "generate"], &paths);
+        assert_eq!(code, 1);
+        assert_eq!(
+            run_with_input(&["sync", "key", "import", "--force"], &paths, &key).0,
+            0
+        );
+    }
+
+    #[test]
+    fn sync_check_words_cover_both_answers() {
+        assert_eq!(support_text(true), "suportada");
+        assert_eq!(support_text(false), "não suportada");
+    }
+
+    #[test]
+    fn profiles_track_when_they_changed_and_whether_they_sync() {
+        let (_dir, paths) = paths();
+        run_args(&["profile", "init"], &paths);
+        let created = load_config(&paths).unwrap().unwrap();
+        assert!(!created.sync && created.updated_at > 0);
+        let (_, out, _) = run_args(&["profile", "show"], &paths);
+        assert!(out.contains("sync: desligado"));
+
+        let (code, _, _) = run_args(&["profile", "update", "--sync", "true"], &paths);
+        assert_eq!(code, 0, "--sync alone is a change");
+        assert!(load_config(&paths).unwrap().unwrap().sync);
+        run_args(&["profile", "update", "--sync", "false"], &paths);
+        assert!(!load_config(&paths).unwrap().unwrap().sync);
     }
 
     #[test]
