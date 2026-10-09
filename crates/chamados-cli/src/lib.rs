@@ -111,6 +111,17 @@ enum Command {
         #[arg(long)]
         assume: bool,
     },
+    /// Anexa arquivos a um chamado que já está aberto (tipos aceitos pelo SUAP: xlsx, xls, csv, docx, doc, pdf, jpg, jpeg, png).
+    Attach {
+        /// Número do chamado.
+        id: u64,
+        /// Arquivos a anexar (um envio por arquivo).
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+        /// Descrição (uma linha, até 80 caracteres), igual para todos os arquivos; por padrão, o nome do arquivo.
+        #[arg(long)]
+        descricao: Option<String>,
+    },
     /// Passa o chamado para outro atendente do mesmo grupo de atendimento.
     Assign {
         /// Número do chamado.
@@ -738,6 +749,11 @@ fn dispatch(
             saida,
             force,
         }) => download(paths, id, &anexo, saida, force, out),
+        Some(Command::Attach {
+            id,
+            files,
+            descricao,
+        }) => attach(paths, id, &files, descricao.as_deref(), out),
         Some(Command::Assign { id, para }) => assign(paths, id, &para, out),
         Some(Command::Escalate(args)) => hand_off(paths, args, Direction::Escalate, input, out),
         Some(Command::Return(args)) => hand_off(paths, args, Direction::Return, input, out),
@@ -1216,6 +1232,20 @@ fn safe_file_name(name: &str, fallback: &str) -> String {
     cleaned
 }
 
+/// `name` with the extension of the stored file added when it does not already end with it. The
+/// name SUAP shows for an attachment is the description given to it, which may have no extension.
+fn with_stored_extension(name: &str, stored_name: &str) -> String {
+    let extension = match stored_name.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() && !extension.is_empty() => extension,
+        _ => return name.to_owned(),
+    };
+    let suffix = format!(".{}", extension.to_lowercase());
+    if name.to_lowercase().ends_with(&suffix) {
+        return name.to_owned();
+    }
+    format!("{name}.{extension}")
+}
+
 /// `name` made different from every name in `taken` by adding " (2)", " (3)"... before the extension.
 fn unique_name(name: &str, taken: &[String]) -> String {
     let (stem, extension) = match name.rfind('.') {
@@ -1263,13 +1293,23 @@ fn download(
         return Err(format!("o anexo {bad} não existe: o chamado #{id} tem {total}").into());
     }
 
-    // Decide every destination first, so nothing is downloaded if a file would be overwritten.
+    // Download everything first: the name SUAP shows may only be a description, and the kind of
+    // file is known from the name it is stored under. Nothing is written to disk before every
+    // destination is checked.
     let folder = folder.unwrap_or(PathBuf::from("."));
-    let mut names: Vec<String> = Vec::new();
+    let mut files = Vec::new();
     for number in &numbers {
         let link = &details.attachments[number - 1];
+        let file = runtime
+            .block_on(source.download_attachment(link))
+            .map_err(explain)?;
+        files.push(file);
+    }
+    let mut names: Vec<String> = Vec::new();
+    for (number, file) in numbers.iter().zip(&files) {
+        let link = &details.attachments[number - 1];
         let safe = safe_file_name(&link.name, &format!("anexo-{number}"));
-        let name = unique_name(&safe, &names);
+        let name = unique_name(&with_stored_extension(&safe, &file.stored_name), &names);
         names.push(name);
     }
     let existing: Vec<String> = names
@@ -1286,15 +1326,33 @@ fn download(
         .into());
     }
     fs::create_dir_all(&folder)?;
-    for (number, name) in numbers.iter().zip(&names) {
-        let link = &details.attachments[number - 1];
-        let bytes = runtime
-            .block_on(source.download_attachment(link))
-            .map_err(explain)?;
+    for ((number, name), file) in numbers.iter().zip(&names).zip(&files) {
         let target = folder.join(name);
-        fs::write(&target, &bytes)?;
-        let size = bytes.len();
+        fs::write(&target, &file.bytes)?;
+        let size = file.bytes.len();
         writeln!(out, "Anexo {number}: {} ({size} bytes)", target.display())?;
+    }
+    Ok(())
+}
+
+fn attach(
+    paths: &AppPaths,
+    id: u64,
+    files: &[PathBuf],
+    description: Option<&str>,
+    out: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    // Read every file before sending any, so a typo does not leave the ticket half attached.
+    let attachments = read_attachments(files)?;
+    let (runtime, client) = connect(paths)?;
+    let source = SuapTicketSource::new(&client, TicketQueue::Support);
+    let id = id.to_string();
+    for attachment in &attachments {
+        runtime
+            .block_on(source.attach_file(&id, attachment, description))
+            .map_err(explain)?;
+        let message = format!("Chamado #{id}: anexo {} enviado.", attachment.file_name);
+        writeln!(out, "{message}")?;
     }
     Ok(())
 }
@@ -2967,6 +3025,24 @@ mod tests {
             MAX_FILE_NAME_CHARS
         );
 
+        for (name, stored, expected) in [
+            ("Tela do erro", "foto-3f2a.png", "Tela do erro.png"),
+            ("dados.csv", "dados-3f2a.csv", "dados.csv"),
+            ("DADOS.CSV", "dados-3f2a.csv", "DADOS.CSV"),
+            ("Versão 1.2", "relatorio.pdf", "Versão 1.2.pdf"),
+            ("relatorio.pdf", "relatorio.docx", "relatorio.pdf.docx"),
+            ("sem extensão", "anexo", "sem extensão"),
+            ("sem extensão", "", "sem extensão"),
+            ("sem extensão", ".oculto", "sem extensão"),
+            ("sem extensão", "arquivo.", "sem extensão"),
+        ] {
+            assert_eq!(
+                with_stored_extension(name, stored),
+                expected,
+                "{name} {stored}"
+            );
+        }
+
         let taken = [
             "a.csv".to_owned(),
             "a (2).csv".to_owned(),
@@ -2992,6 +3068,10 @@ mod tests {
     const VANISHED_TICKET: &str = r#"<main id="content"><div class="title-container"><h2>Sumiu</h2></div>
         <div data-tab="linha_tempo"><ul class="timeline"><li><div class="timeline-date">1</div>
         <div class="timeline-content"><a href="/djtools/arquivo/centralservicos/chamadoanexo/99/anexo/">x.pdf</a></div></li></ul></div></main>"#;
+
+    const DESCRIBED_TICKET: &str = r#"<main id="content"><div class="title-container"><h2>Descrito</h2></div>
+        <div data-tab="linha_tempo"><ul class="timeline"><li><div class="timeline-date">1</div>
+        <div class="timeline-content"><a href="/djtools/arquivo/centralservicos/chamadoanexo/20/anexo/">Tela do erro</a></div></li></ul></div></main>"#;
 
     const PLAIN_TICKET: &str =
         r#"<main id="content"><div class="title-container"><h2>Sem anexos</h2></div></main>"#;
@@ -3023,6 +3103,28 @@ mod tests {
                 ResponseTemplate::new(200).set_body_bytes(content.as_bytes().to_vec()),
             );
         }
+        // An attachment shown by its description is named after the stored file's extension.
+        mount_text(
+            &runtime,
+            &server,
+            "GET",
+            "/centralservicos/chamado/10/",
+            ResponseTemplate::new(200).set_body_string(DESCRIBED_TICKET),
+        );
+        mount_text(
+            &runtime,
+            &server,
+            "GET",
+            "/djtools/arquivo/centralservicos/chamadoanexo/20/anexo/",
+            ResponseTemplate::new(302).insert_header("location", "/media/foto-3f2a.png"),
+        );
+        mount_text(
+            &runtime,
+            &server,
+            "GET",
+            "/media/foto-3f2a.png",
+            ResponseTemplate::new(200).set_body_bytes(b"imagem".to_vec()),
+        );
 
         let (_, shown, _) = run_args(&["show", "5"], &paths);
         let listed = "Anexos (baixe com `chamados download 5`):\n  1. dados.csv\n  2. ../foto.png\n  3. dados.csv\n";
@@ -3063,13 +3165,22 @@ mod tests {
             std::fs::read_to_string(target.join("dados.csv")).unwrap(),
             "meu"
         );
+        // The files were fetched (their stored names matter), but none was written.
         let after = runtime.block_on(server.received_requests()).unwrap().len();
-        assert_eq!(after, before + 1, "only the ticket page was read");
+        assert_eq!(after, before + 1 + 3, "the ticket page and its three files");
+        assert!(!target.join("dados (2).csv.tmp").exists());
         let (code, _, _) = run_args(&["download", "5", "-o", target_text, "--force"], &paths);
         assert_eq!(code, 0);
         assert_eq!(
             std::fs::read_to_string(target.join("dados.csv")).unwrap(),
             "um"
+        );
+
+        let (code, out, _) = run_args(&["download", "10", "-o", target_text], &paths);
+        assert_eq!(code, 0, "{out}");
+        assert_eq!(
+            std::fs::read_to_string(target.join("Tela do erro.png")).unwrap(),
+            "imagem"
         );
 
         // Chosen attachments only (repeated numbers count once).
@@ -3363,8 +3474,9 @@ mod tests {
 
     /// Commands without free text. A new command must be added to one of the two lists, which forces
     /// a decision about RS-02 (and a test for it) whenever a command is created.
-    const NON_TEXT_COMMANDS: [&str; 16] = [
+    const NON_TEXT_COMMANDS: [&str; 17] = [
         "sync",
+        "attach",
         "watch",
         "assign",
         "tag",
@@ -4002,6 +4114,76 @@ mod tests {
         let (code, _, err) = run_args(&["watch", "--rodadas", "1"], &paths);
         assert_eq!(code, 1);
         assert!(err.contains("watch state"), "{err}");
+    }
+
+    #[test]
+    fn attach_sends_each_file_and_stops_at_the_first_problem() {
+        let (dir, paths) = paths();
+        let (runtime, server) = bare_server();
+        run_args(&["profile", "init", "--base-url", &server.uri()], &paths);
+        let form = r#"<form method="POST"><input type="hidden" name="csrfmiddlewaretoken" value="tok">
+            <input name="descricao"><input type="file" name="anexo"></form>"#;
+        for (verb, at, body, status) in [
+            ("GET", "/centralservicos/adicionar_anexo/5/", form, 200),
+            ("POST", "/centralservicos/adicionar_anexo/5/", "ok", 200),
+            ("GET", "/centralservicos/adicionar_anexo/9/", "", 403),
+        ] {
+            mount_text(
+                &runtime,
+                &server,
+                verb,
+                at,
+                ResponseTemplate::new(status).set_body_string(body),
+            );
+        }
+        let csv = dir.path().join("dados.csv");
+        let pdf = dir.path().join("relatório.pdf");
+        std::fs::write(&csv, "a,b\n").unwrap();
+        std::fs::write(&pdf, "%PDF").unwrap();
+        let (csv_text, pdf_text) = (csv.to_str().unwrap(), pdf.to_str().unwrap());
+
+        let (code, out, err) = run_args(
+            &[
+                "attach",
+                "5",
+                csv_text,
+                pdf_text,
+                "--descricao",
+                "Anexos do teste",
+            ],
+            &paths,
+        );
+        assert_eq!((code, err.as_str()), (0, ""));
+        assert_eq!(
+            out,
+            "Chamado #5: anexo dados.csv enviado.\nChamado #5: anexo relatório.pdf enviado.\n"
+        );
+        let bodies = posts_to(&runtime, &server, "/centralservicos/adicionar_anexo/5/");
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies.iter().all(|body| body.contains("Anexos do teste")));
+
+        // Nothing is sent when a file cannot be read or has a type SUAP refuses.
+        let missing = dir.path().join("nao-existe.pdf");
+        let (code, _, err) = run_args(
+            &["attach", "5", csv_text, missing.to_str().unwrap()],
+            &paths,
+        );
+        assert_eq!(code, 1);
+        assert!(err.contains("não foi possível ler o anexo"), "{err}");
+        let exe = dir.path().join("programa.exe");
+        std::fs::write(&exe, "MZ").unwrap();
+        let (code, _, err) = run_args(&["attach", "5", exe.to_str().unwrap()], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("unsupported type"), "{err}");
+        assert_eq!(
+            posts_to(&runtime, &server, "/centralservicos/adicionar_anexo/5/").len(),
+            2
+        );
+
+        let (code, _, err) = run_args(&["attach", "9", csv_text], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("ticket 9 cannot be attached"), "{err}");
+        assert_eq!(run_args(&["attach", "5"], &paths).0, 2);
     }
 
     #[test]

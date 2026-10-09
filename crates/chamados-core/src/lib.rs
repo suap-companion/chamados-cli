@@ -73,6 +73,15 @@ pub struct AttachmentLink {
     pub path: String,
 }
 
+/// A downloaded attachment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Downloaded {
+    pub bytes: Vec<u8>,
+    /// Name of the file as SUAP stores it (last part of the address it was served from); its
+    /// extension tells what kind of file it is when the name SUAP shows is only a description.
+    pub stored_name: String,
+}
+
 /// Full details of a ticket, as shown on its SUAP page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketDetails {
@@ -181,7 +190,7 @@ pub trait TicketSource {
     async fn list_filtered(&self, filter: &TicketFilter) -> Result<Vec<RemoteTicket>, TicketError>;
     async fn get_ticket(&self, id: &str) -> Result<TicketDetails, TicketError>;
     /// Downloads the content of an attachment listed in the ticket details.
-    async fn download_attachment(&self, link: &AttachmentLink) -> Result<Vec<u8>, TicketError>;
+    async fn download_attachment(&self, link: &AttachmentLink) -> Result<Downloaded, TicketError>;
     /// Opens a new ticket and returns its id.
     async fn open_ticket(&self, ticket: &NewTicket) -> Result<String, TicketError>;
     /// Adds a comment or an internal note (multi-line text) to the ticket.
@@ -271,22 +280,20 @@ impl<'a> SuapTicketSource<'a> {
         fields: &[(String, String)],
         what: &str,
     ) -> Result<(), TicketError> {
-        let response = match self.client.submit_form(path, fields).await {
-            Err(SuapError::Transport(status)) => {
-                return Err(TicketError::Source(format!(
-                    "SUAP refused {what} ({status}): the ticket may already be in that situation, or you lack permission"
-                )));
-            }
-            other => other?,
-        };
-        let errors = page_errors(&response.body);
-        if errors.is_empty() {
-            return Ok(());
-        }
-        Err(TicketError::Source(format!(
-            "SUAP rejected {what}: {}",
-            errors.join("; ")
-        )))
+        let sent = self.client.submit_form(path, fields).await;
+        check_form_response(sent, what)
+    }
+
+    /// Like [`Self::send_status_form`], uploading `files` as `multipart/form-data`.
+    async fn send_form_with_files(
+        &self,
+        path: &str,
+        fields: &[(String, String)],
+        files: &[FormFile],
+        what: &str,
+    ) -> Result<(), TicketError> {
+        let sent = self.client.submit_multipart(path, fields, files).await;
+        check_form_response(sent, what)
     }
 
     /// Calls a SUAP ticket action (a GET) and surfaces the error flash message, if any.
@@ -309,6 +316,30 @@ impl<'a> SuapTicketSource<'a> {
             errors.join("; ")
         )))
     }
+}
+
+/// What SUAP answered to a posted form: an error status or the errors shown on the page it
+/// returned become a [`TicketError`] saying what was being done.
+fn check_form_response(
+    sent: Result<suap_core::FormResponse, SuapError>,
+    what: &str,
+) -> Result<(), TicketError> {
+    let response = match sent {
+        Err(SuapError::Transport(status)) => {
+            return Err(TicketError::Source(format!(
+                "SUAP refused {what} ({status}): the ticket may already be in that situation, or you lack permission"
+            )));
+        }
+        other => other?,
+    };
+    let errors = page_errors(&response.body);
+    if errors.is_empty() {
+        return Ok(());
+    }
+    Err(TicketError::Source(format!(
+        "SUAP rejected {what}: {}",
+        errors.join("; ")
+    )))
 }
 
 /// The message without its trailing line break; an error if nothing is left.
@@ -407,7 +438,7 @@ impl TicketSource for SuapTicketSource<'_> {
             .ok_or_else(|| TicketError::Source(format!("could not parse ticket {id}")))
     }
 
-    async fn download_attachment(&self, link: &AttachmentLink) -> Result<Vec<u8>, TicketError> {
+    async fn download_attachment(&self, link: &AttachmentLink) -> Result<Downloaded, TicketError> {
         if !link.path.starts_with(ATTACHMENT_PATH_PREFIX) {
             // Only files SUAP serves for tickets: never an arbitrary address found in a page.
             return Err(TicketError::Source(format!(
@@ -415,7 +446,12 @@ impl TicketSource for SuapTicketSource<'_> {
                 link.path
             )));
         }
-        Ok(self.client.fetch_bytes(&link.path).await?)
+        let (bytes, served_from) = self.client.fetch_file(&link.path).await?;
+        let stored_name = served_from.rsplit('/').find(|part| !part.is_empty());
+        Ok(Downloaded {
+            bytes,
+            stored_name: stored_name.unwrap_or_default().to_owned(),
+        })
     }
 
     async fn add_message(&self, id: &str, kind: Message, text: &str) -> Result<(), TicketError> {
@@ -2197,8 +2233,9 @@ mod tests {
             ))
             .await
             .unwrap();
+        assert_eq!(bytes.stored_name, "x.csv");
         assert_eq!(
-            bytes,
+            bytes.bytes,
             [0, 159, 146, 150, 10],
             "binary content is kept as is"
         );

@@ -10,11 +10,15 @@ use scraper::{node::Node, ElementRef, Html};
 use serde::Deserialize;
 use url::form_urlencoded::Serializer;
 
+use suap_core::FormFile;
+
 use crate::{
-    flat_text, parse_form_by_action, selector, set_field, SuapTicketSource, TicketError,
-    CAMPUS_PATH_PREFIX, CENTERS_PATH_PREFIX, TICKET_PATH_PREFIX,
+    flat_text, parse_form_by_action, selector, set_field, validate_attachments, Attachment,
+    SuapTicketSource, TicketError, ATTACHMENT_DESCRIPTION_MAX, CAMPUS_PATH_PREFIX,
+    CENTERS_PATH_PREFIX, TICKET_PATH_PREFIX,
 };
 
+const ATTACH_PATH_PREFIX: &str = "/centralservicos/adicionar_anexo/";
 const ASSIGN_PATH_PREFIX: &str = "/centralservicos/atribuir_chamado/";
 const ESCALATE_PATH_PREFIX: &str = "/centralservicos/escalar_atendimento_chamado/";
 const RETURN_PATH_PREFIX: &str = "/centralservicos/retornar_atendimento_chamado/";
@@ -248,6 +252,36 @@ fn removal_label(around: ElementRef<'_>, container: &str) -> String {
 }
 
 impl SuapTicketSource<'_> {
+    /// Attaches one file to a ticket that is already open. `description` (at most 80 characters)
+    /// defaults to the file name. SUAP accepts one file per request, and only for services that
+    /// allow attachments, so several files are several calls.
+    pub async fn attach_file(
+        &self,
+        id: &str,
+        attachment: &Attachment,
+        description: Option<&str>,
+    ) -> Result<(), TicketError> {
+        validate_attachments(std::slice::from_ref(attachment))?;
+        let (path, _, mut fields) = self
+            .open_status_form(ATTACH_PATH_PREFIX, id, "attached", "descricao")
+            .await?;
+        let description: String = description
+            .unwrap_or(&attachment.file_name)
+            .trim()
+            .chars()
+            .take(ATTACHMENT_DESCRIPTION_MAX)
+            .collect();
+        fields.retain(|(name, _)| name != "anexo");
+        set_field(&mut fields, "descricao", &description);
+        let file = FormFile {
+            field: "anexo".to_owned(),
+            file_name: attachment.file_name.clone(),
+            bytes: attachment.bytes.clone(),
+        };
+        self.send_form_with_files(&path, &fields, &[file], "the attachment")
+            .await
+    }
+
     /// Hands the ticket to another attendant of its group; returns who got it.
     pub async fn assign_ticket(&self, id: &str, to: &str) -> Result<String, TicketError> {
         let (path, html, mut fields) = self

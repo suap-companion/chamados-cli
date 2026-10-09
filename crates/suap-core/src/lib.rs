@@ -493,9 +493,12 @@ impl SuapClient {
         Ok(self.get_checked(path).await?.text().await?)
     }
 
-    /// Downloads the raw bytes at `path` (a file), with the same session and checks as a page.
-    pub async fn fetch_bytes(&self, path: &str) -> Result<Vec<u8>, SuapError> {
-        Ok(self.get_checked(path).await?.bytes().await?.to_vec())
+    /// Downloads the file at `path`, with the same session and checks as a page. Returns its raw
+    /// bytes and the path it was finally served from (after redirects), which names the stored file.
+    pub async fn fetch_file(&self, path: &str) -> Result<(Vec<u8>, String), SuapError> {
+        let response = self.get_checked(path).await?;
+        let served_from = response.url().path().to_owned();
+        Ok((response.bytes().await?.to_vec(), served_from))
     }
 
     /// A successful GET that did not end at the login page.
@@ -1093,13 +1096,16 @@ mod tests {
         let client = SuapClient::open(&paths, &config_for(&server)).unwrap();
         assert_eq!(client.base_url().as_str(), format!("{}/", server.uri()));
         assert_eq!(client.fetch_page("/ok/").await.unwrap(), "corpo");
-        assert_eq!(client.fetch_bytes("/ok/").await.unwrap(), b"corpo");
+        assert_eq!(
+            client.fetch_file("/ok/").await.unwrap(),
+            (b"corpo".to_vec(), "/ok/".to_owned())
+        );
         assert!(matches!(
-            client.fetch_bytes("/erro/").await,
+            client.fetch_file("/erro/").await,
             Err(SuapError::Transport(_))
         ));
         assert!(matches!(
-            client.fetch_bytes("/protegido/").await,
+            client.fetch_file("/protegido/").await,
             Err(SuapError::NotAuthenticated)
         ));
         assert!(matches!(
