@@ -164,9 +164,12 @@ chamados comment 559298 -m "Já fiz o build da imagem base.
 Agora estou testando os plugins."          # comentário (visível ao interessado)
 chamados note 559298 -m "Senha do servidor está no cofre"   # nota interna (só a equipe de atendimento)
 cat comentario.txt | chamados comment 559298                # texto pela entrada padrão
+chamados comment 559298 559300 559301 -m "Janela de manutenção às 22h."   # o mesmo texto em vários chamados
 ```
 
 O texto pode ter várias linhas e vem de `-m`, de `-m -` ou, se `-m` for omitido, da entrada padrão (nunca se espera digitação no terminal). O comando abre a página do chamado, usa o formulário que o SUAP oferece (com o token CSRF) e envia o texto; se o SUAP recusar (sem permissão, chamado fechado, texto inválido), mostra a mensagem dele. Confira o resultado com `chamados show <id>`.
+
+**Vários chamados de uma vez:** `comment` e `note` aceitam mais de um número (repetidos contam uma vez). O texto é lido e validado uma só vez, antes de tocar em qualquer chamado, e é enviado a cada um em sequência. Um chamado que recusa não impede os outros: no fim vem o `Resumo: X de Y enviados.` e, se houve falhas, o comando termina com erro listando cada chamado que falhou e o motivo. Sem sessão válida nada funcionaria, então esse caso para no primeiro chamado e pede `chamados login`.
 
 ### Suspender e resolver um chamado
 

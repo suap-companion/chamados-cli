@@ -76,10 +76,10 @@ enum Command {
     Watch(WatchArgs),
     /// Abre um novo chamado no SUAP usando a sessão salva por `login`.
     Open(OpenArgs),
-    /// Adiciona um comentário (visível ao interessado) a um chamado, usando a sessão salva por `login`.
-    Comment(MessageArgs),
-    /// Adiciona uma nota interna (visível só à equipe de atendimento) a um chamado.
-    Note(MessageArgs),
+    /// Adiciona um comentário (visível ao interessado) a um ou mais chamados, usando a sessão salva por `login`.
+    Comment(BatchMessageArgs),
+    /// Adiciona uma nota interna (visível só à equipe de atendimento) a um ou mais chamados.
+    Note(BatchMessageArgs),
     /// Suspende um chamado (situação "Suspenso"), com a mensagem de suspensão.
     Suspend(MessageArgs),
     /// Resolve um chamado (situação "Resolvido"), com a mensagem de resolução.
@@ -382,6 +382,16 @@ enum KeyCommand {
     },
     /// Informa a fonte da chave e se ela existe.
     Status,
+}
+
+#[derive(Debug, Args)]
+struct BatchMessageArgs {
+    /// Números dos chamados (um ou mais); o mesmo texto é enviado a cada um.
+    #[arg(required = true)]
+    ids: Vec<u64>,
+    /// Texto (pode ter várias linhas). Com `-` ou omitido, é lido da entrada padrão.
+    #[arg(long, short = 'm')]
+    message: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1146,30 +1156,64 @@ fn show(paths: &AppPaths, id: u64, json: bool, out: &mut dyn Write) -> Result<()
     Ok(())
 }
 
+/// Sends the same comment or internal note to each ticket, one after the other. A ticket that
+/// refuses it does not stop the others; the failures are reported together at the end (and make
+/// the command fail). Without a session nothing can work, so that stops at the first ticket.
 fn send_message(
     paths: &AppPaths,
-    args: MessageArgs,
+    args: BatchMessageArgs,
     kind: Message,
     input: &mut dyn Read,
     out: &mut dyn Write,
 ) -> Result<(), Box<dyn Error>> {
-    let config = profile_config(paths)?;
     let text = read_text(args.message, input)?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    let client = SuapClient::open(paths, &config)?;
+    let (runtime, client) = connect(paths)?;
     let source = SuapTicketSource::new(&client, TicketQueue::Support);
-    let id = args.id.to_string();
-    runtime
-        .block_on(source.add_message(&id, kind, &text))
-        .map_err(explain)?;
-    let message = match kind {
-        Message::Comment => format!("Comentário adicionado ao chamado #{id}."),
-        Message::InternalNote => format!("Nota interna adicionada ao chamado #{id}."),
-    };
-    writeln!(out, "{message}")?;
-    Ok(())
+    let mut ids = Vec::new();
+    for id in args.ids {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    let mut failures = Vec::new();
+    for id in &ids {
+        let id = id.to_string();
+        match runtime.block_on(source.add_message(&id, kind, &text)) {
+            Ok(()) => {
+                let message = match kind {
+                    Message::Comment => format!("Comentário adicionado ao chamado #{id}."),
+                    Message::InternalNote => format!("Nota interna adicionada ao chamado #{id}."),
+                };
+                writeln!(out, "{message}")?;
+            }
+            Err(error @ TicketError::Suap(SuapError::NotAuthenticated)) => {
+                return Err(explain(error));
+            }
+            Err(error) => failures.push((id, explain(error).to_string())),
+        }
+    }
+    if ids.len() == 1 && !failures.is_empty() {
+        return Err(failures.remove(0).1.into());
+    }
+    if ids.len() > 1 {
+        let sent = ids.len() - failures.len();
+        let summary = format!("Resumo: {sent} de {} enviados.", ids.len());
+        writeln!(out, "{summary}")?;
+    }
+    if failures.is_empty() {
+        return Ok(());
+    }
+    let details: Vec<String> = failures
+        .iter()
+        .map(|(id, error)| format!("  #{id}: {error}"))
+        .collect();
+    Err(format!(
+        "falhou em {} de {} chamados:\n{}",
+        failures.len(),
+        ids.len(),
+        details.join("\n")
+    )
+    .into())
 }
 
 /// Runtime and client for the selected profile.
@@ -4184,6 +4228,140 @@ mod tests {
         assert_eq!(code, 1);
         assert!(err.contains("ticket 9 cannot be attached"), "{err}");
         assert_eq!(run_args(&["attach", "5"], &paths).0, 2);
+    }
+
+    #[test]
+    fn one_comment_or_note_can_go_to_several_tickets_and_failures_do_not_stop_the_rest() {
+        let (_dir, paths) = paths();
+        let (runtime, server) = bare_server();
+        run_args(&["profile", "init", "--base-url", &server.uri()], &paths);
+        for id in ["5", "6", "8"] {
+            let page = THREAD_PAGE.replace("/5/", &format!("/{id}/"));
+            mount_text(
+                &runtime,
+                &server,
+                "GET",
+                &format!("/centralservicos/chamado/{id}/"),
+                ResponseTemplate::new(200).set_body_string(page),
+            );
+            for action in ["adicionar_comentario", "adicionar_nota_interna"] {
+                mount_text(
+                    &runtime,
+                    &server,
+                    "POST",
+                    &format!("/centralservicos/{action}/{id}/"),
+                    ResponseTemplate::new(200),
+                );
+            }
+        }
+        // #7 is not there, and #9 refuses.
+        mount_text(
+            &runtime,
+            &server,
+            "GET",
+            "/centralservicos/chamado/9/",
+            ResponseTemplate::new(200).set_body_string("<p>sem formulário</p>"),
+        );
+
+        let (code, out, err) = run_args(&["comment", "5", "6", "-m", "aviso\npara todos"], &paths);
+        assert_eq!((code, err.as_str()), (0, ""));
+        assert_eq!(
+            out,
+            "Comentário adicionado ao chamado #5.\nComentário adicionado ao chamado #6.\nResumo: 2 de 2 enviados.\n"
+        );
+        for id in ["5", "6"] {
+            let bodies = posts_to(
+                &runtime,
+                &server,
+                &format!("/centralservicos/adicionar_comentario/{id}/"),
+            );
+            assert_eq!(bodies.len(), 1);
+            let carries_text = bodies[0].contains("texto=aviso%0Apara+todos");
+            assert!(carries_text);
+        }
+        // The text is read once, from standard input too; repeated numbers count once.
+        let (code, out, _) =
+            run_with_input(&["note", "5", "5", "8", "-m", "-"], &paths, "pelo stdin\n");
+        assert_eq!(code, 0);
+        assert_eq!(
+            out,
+            "Nota interna adicionada ao chamado #5.\nNota interna adicionada ao chamado #8.\nResumo: 2 de 2 enviados.\n"
+        );
+
+        // Failures are listed at the end, the others still get the text, and the command fails.
+        let (code, out, err) = run_args(&["comment", "5", "7", "9", "8", "-m", "x"], &paths);
+        assert_eq!(code, 1);
+        assert_eq!(
+            out,
+            "Comentário adicionado ao chamado #5.\nComentário adicionado ao chamado #8.\nResumo: 2 de 4 enviados.\n"
+        );
+        assert!(err.contains("falhou em 2 de 4 chamados:"), "{err}");
+        assert!(err.contains("  #7: ") && err.contains("404"), "{err}");
+        assert!(
+            err.contains("  #9: ") && err.contains("no comment form"),
+            "{err}"
+        );
+        assert_eq!(
+            posts_to(
+                &runtime,
+                &server,
+                "/centralservicos/adicionar_comentario/8/"
+            )
+            .len(),
+            1
+        );
+        // A single ticket keeps its plain error, without the summary.
+        let (code, out, err) = run_args(&["comment", "7", "-m", "x"], &paths);
+        assert_eq!((code, out.as_str()), (1, ""));
+        assert!(
+            err.starts_with("erro: ") && !err.contains("falhou em"),
+            "{err}"
+        );
+
+        // The text is checked before any ticket is touched; at least one ticket is required.
+        let before = runtime.block_on(server.received_requests()).unwrap().len();
+        let (code, _, err) = run_with_input(&["comment", "5", "6"], &paths, " \n");
+        assert_eq!(code, 1);
+        assert!(err.contains("texto não informado"), "{err}");
+        assert_eq!(
+            runtime.block_on(server.received_requests()).unwrap().len(),
+            before
+        );
+        assert_eq!(run_args(&["comment", "-m", "x"], &paths).0, 2);
+        assert_eq!(run_args(&["note", "5", "x", "-m", "x"], &paths).0, 2);
+    }
+
+    #[test]
+    fn a_missing_session_stops_a_batch_at_the_first_ticket() {
+        let (_dir, paths) = paths();
+        let (runtime, server) = bare_server();
+        run_args(&["profile", "init", "--base-url", &server.uri()], &paths);
+        mount_text(
+            &runtime,
+            &server,
+            "GET",
+            "/centralservicos/chamado/5/",
+            ResponseTemplate::new(302).insert_header("location", "/accounts/login/"),
+        );
+        mount_text(
+            &runtime,
+            &server,
+            "GET",
+            "/accounts/login/",
+            ResponseTemplate::new(200),
+        );
+        let (code, out, err) = run_args(&["comment", "5", "6", "7", "-m", "x"], &paths);
+        assert_eq!((code, out.as_str()), (1, ""));
+        assert!(
+            err.contains("chamados login") && !err.contains("falhou em"),
+            "{err}"
+        );
+        let requests = runtime.block_on(server.received_requests()).unwrap();
+        let tickets = requests
+            .iter()
+            .filter(|r| r.url.path().starts_with("/centralservicos/chamado/"))
+            .count();
+        assert_eq!(tickets, 1, "the other tickets were not tried");
     }
 
     #[test]
