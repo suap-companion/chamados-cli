@@ -51,10 +51,14 @@ with transaction.atomic():
     )
     servico, criado = Servico.objects.get_or_create(
         nome=f"{PREFIXO} - Serviço de teste",
-        defaults={"tipo": Servico.TIPO_REQUISICAO, "area": area, "grupo_servico": grupo_servico},
+        defaults={"tipo": Servico.TIPO_REQUISICAO, "area": area, "grupo_servico": grupo_servico, "permite_anexos": True},
     )
     if criado:
         servico.centros_atendimento.add(centro)
+    if not servico.permite_anexos:
+        # O `open --attach` e o `download` precisam de um serviço que aceite anexos.
+        servico.permite_anexos = True
+        servico.save()
 
     grupo_atendimento, _ = GrupoAtendimento.objects.get_or_create(
         nome=f"{PREFIXO} - Grupo de atendimento",
