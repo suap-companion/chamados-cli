@@ -223,7 +223,7 @@ impl S3Backend {
             .collect();
         let hint = match status {
             StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED => {
-                " (check the credentials and the token's permissions on the bucket)"
+                " (check the credentials and the token's permissions on the bucket; the secret must be the whole Secret Access Key, without spaces, not the token value)"
             }
             _ => "",
         };

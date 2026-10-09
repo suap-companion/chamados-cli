@@ -74,6 +74,23 @@ impl S3Credentials {
         Ok(keyring_entry_named(KEYRING_USER)?.set_secret(text.as_bytes())?)
     }
 
+    /// A description that is safe to print: the length of each value and whether it looks malformed
+    /// (anything but visible ASCII, or quotes), never the values themselves.
+    pub fn describe(&self) -> String {
+        let suspicious = |value: &str| {
+            !value.chars().all(|c| c.is_ascii_graphic()) || value.contains(['"', '\''])
+        };
+        let mut text = format!(
+            "Access Key ID: {} caracteres; Secret: {} caracteres",
+            self.access_key_id.chars().count(),
+            self.secret_access_key.chars().count()
+        );
+        if suspicious(&self.access_key_id) || suspicious(&self.secret_access_key) {
+            text.push_str("; atenção: há espaços, aspas ou caracteres não ASCII nos valores");
+        }
+        text
+    }
+
     /// `text` with both values hidden, so error messages can echo what a server said safely.
     pub fn redact(&self, text: &str) -> String {
         text.replace(&self.secret_access_key, "***")
@@ -104,6 +121,20 @@ mod tests {
         );
         for bad in ["", "so-uma-linha", "a\nb\nc"] {
             assert!(S3Credentials::parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn describes_the_credentials_without_revealing_them() {
+        let text = credentials().describe();
+        assert_eq!(text, "Access Key ID: 7 caracteres; Secret: 12 caracteres");
+        assert!(!text.contains("AKIA") && !text.contains("s3cr3t"));
+        for (id, secret) in [("AKIA 1", "ok"), ("ok", "\"quoted\""), ("ok", "açúcar")] {
+            let odd = S3Credentials {
+                access_key_id: id.to_owned(),
+                secret_access_key: secret.to_owned(),
+            };
+            assert!(odd.describe().contains("atenção"), "{id} {secret}");
         }
     }
 

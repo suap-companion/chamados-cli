@@ -873,10 +873,9 @@ fn sync_credentials(
             writeln!(out, "Credenciais guardadas no chaveiro.")?;
         }
         CredentialsCommand::Status => {
-            let present = if S3Credentials::load()?.is_some() {
-                "sim"
-            } else {
-                "não"
+            let present = match S3Credentials::load()? {
+                Some(found) => format!("sim ({})", found.describe()),
+                None => "não".to_owned(),
             };
             writeln!(out, "credenciais presentes: {present}")?;
         }
@@ -2349,7 +2348,10 @@ mod tests {
         assert_eq!(out, "Credenciais guardadas no chaveiro.\n");
         assert!(!out.contains("segredo") && !out.contains("AKIA"));
         let (_, out, _) = run_args(&["sync", "credentials", "status"], &paths);
-        assert_eq!(out, "credenciais presentes: sim\n");
+        assert_eq!(
+            out,
+            "credenciais presentes: sim (Access Key ID: 11 caracteres; Secret: 23 caracteres)\n"
+        );
     }
 
     /// A terminal that answers from a script and remembers what it was asked.
@@ -2409,7 +2411,11 @@ mod tests {
         );
         assert!(!out.contains("segredo-digitado"));
         let (_, status, _) = run_args(&["sync", "credentials", "status"], &paths);
-        assert_eq!(status, "credenciais presentes: sim\n");
+        assert!(
+            status.starts_with("credenciais presentes: sim ("),
+            "{status}"
+        );
+        assert!(!status.contains("segredo-digitado"), "{status}");
 
         // Cancelled or failing prompts are reported, and nothing is stored.
         terminal.secret = None;
