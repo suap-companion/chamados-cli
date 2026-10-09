@@ -78,6 +78,27 @@ enum Command {
     Suspend(MessageArgs),
     /// Resolve um chamado (situação "Resolvido"), com a mensagem de resolução.
     Resolve(ResolveArgs),
+    /// Assume um chamado que já existe (atribui a você).
+    Assume {
+        /// Número do chamado.
+        id: u64,
+    },
+    /// Coloca um chamado em atendimento (situação "Em atendimento").
+    Start {
+        /// Número do chamado.
+        id: u64,
+        /// Assume o chamado antes, se ele ainda não for seu.
+        #[arg(long)]
+        assume: bool,
+    },
+    /// Cancela um chamado (situação "Cancelado"), com o motivo. Não pode ser desfeito.
+    Cancel {
+        #[command(flatten)]
+        message: MessageArgs,
+        /// Confirma o cancelamento (irreversível).
+        #[arg(long)]
+        yes: bool,
+    },
     /// Sincroniza, cifrados, os títulos e as configurações dos perfis com `sync` ligado.
     Sync(SyncArgs),
     /// Define, exibe ou remove o título local de um chamado (o SUAP não tem título; fica só nesta máquina).
@@ -496,6 +517,9 @@ fn dispatch(
         Some(Command::Sync(args)) => sync(paths, args, input, prompt, out),
         Some(Command::Suspend(args)) => suspend(paths, args, input, out),
         Some(Command::Resolve(args)) => resolve(paths, args, input, out),
+        Some(Command::Assume { id }) => assume(paths, id, out),
+        Some(Command::Start { id, assume }) => start(paths, id, assume, out),
+        Some(Command::Cancel { message, yes }) => cancel(paths, message, yes, input, out),
         Some(Command::Title { id, text, remove }) => title(paths, id, text, remove, out),
         Some(Command::Status) => {
             writeln!(
@@ -856,6 +880,64 @@ fn suspend(
         .block_on(source.suspend_ticket(&id, &text))
         .map_err(explain)?;
     writeln!(out, "Chamado #{id} suspenso.")?;
+    Ok(())
+}
+
+fn assume(paths: &AppPaths, id: u64, out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
+    let (runtime, client) = connect(paths)?;
+    let source = SuapTicketSource::new(&client, TicketQueue::Support);
+    let id = id.to_string();
+    runtime
+        .block_on(source.assume_ticket(&id))
+        .map_err(explain)?;
+    writeln!(out, "Chamado #{id} assumido.")?;
+    Ok(())
+}
+
+fn start(
+    paths: &AppPaths,
+    id: u64,
+    assume: bool,
+    out: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    let (runtime, client) = connect(paths)?;
+    let source = SuapTicketSource::new(&client, TicketQueue::Support);
+    let id = id.to_string();
+    if assume {
+        runtime
+            .block_on(source.assume_ticket(&id))
+            .map_err(explain)?;
+        writeln!(out, "Chamado #{id} assumido.")?;
+    }
+    runtime
+        .block_on(source.start_service(&id))
+        .map_err(explain)?;
+    writeln!(out, "Chamado #{id} em atendimento.")?;
+    Ok(())
+}
+
+fn cancel(
+    paths: &AppPaths,
+    args: MessageArgs,
+    yes: bool,
+    input: &mut dyn Read,
+    out: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    if !yes {
+        return Err(format!(
+            "o cancelamento do chamado #{} não pode ser desfeito: confirme com --yes",
+            args.id
+        )
+        .into());
+    }
+    let text = read_text(args.message, input)?;
+    let (runtime, client) = connect(paths)?;
+    let source = SuapTicketSource::new(&client, TicketQueue::Support);
+    let id = args.id.to_string();
+    runtime
+        .block_on(source.cancel_ticket(&id, &text))
+        .map_err(explain)?;
+    writeln!(out, "Chamado #{id} cancelado.")?;
     Ok(())
 }
 
@@ -2077,6 +2159,117 @@ mod tests {
     }
 
     #[test]
+    fn assume_and_start_work_on_existing_tickets() {
+        let (_dir, paths) = paths();
+        let (runtime, server) = bare_server();
+        run_args(&["profile", "init", "--base-url", &server.uri()], &paths);
+        for (prefix, id, body) in [
+            ("auto_atribuir_chamado", "5", "ok"),
+            ("colocar_em_atendimento", "5", "ok"),
+            (
+                "colocar_em_atendimento",
+                "6",
+                "<p class='alert-error'>Assuma antes</p>",
+            ),
+        ] {
+            mount_text(
+                &runtime,
+                &server,
+                "GET",
+                &format!("/centralservicos/{prefix}/{id}/"),
+                ResponseTemplate::new(200).set_body_string(body),
+            );
+        }
+
+        let (code, out, err) = run_args(&["assume", "5"], &paths);
+        assert_eq!(
+            (code, err.as_str(), out.as_str()),
+            (0, "", "Chamado #5 assumido.\n")
+        );
+        let (code, out, err) = run_args(&["start", "5"], &paths);
+        assert_eq!(
+            (code, err.as_str(), out.as_str()),
+            (0, "", "Chamado #5 em atendimento.\n")
+        );
+        let (code, out, err) = run_args(&["start", "5", "--assume"], &paths);
+        assert_eq!(
+            (code, err.as_str(), out.as_str()),
+            (0, "", "Chamado #5 assumido.\nChamado #5 em atendimento.\n")
+        );
+
+        // The SUAP's refusal is reported, and nothing else is claimed.
+        let (code, out, err) = run_args(&["start", "6"], &paths);
+        assert_eq!((code, out.as_str()), (1, ""));
+        assert!(err.contains("Assuma antes"), "{err}");
+        let (code, _, err) = run_args(&["assume", "9"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("404"), "{err}");
+        let (code, out, _) = run_args(&["start", "9", "--assume"], &paths);
+        assert_eq!((code, out.as_str()), (1, ""));
+    }
+
+    #[test]
+    fn cancel_needs_confirmation_and_sends_the_reason() {
+        let (_dir, paths) = paths();
+        let (runtime, server) = bare_server();
+        run_args(&["profile", "init", "--base-url", &server.uri()], &paths);
+        let form = r#"<form action="" method="POST"><input type="hidden" name="csrfmiddlewaretoken" value="tok">
+            <textarea name="observacao"></textarea></form>"#;
+        mount_text(
+            &runtime,
+            &server,
+            "GET",
+            "/centralservicos/cancelar_chamado/5/",
+            ResponseTemplate::new(200).set_body_string(form),
+        );
+        mount_text(
+            &runtime,
+            &server,
+            "POST",
+            "/centralservicos/cancelar_chamado/5/",
+            ResponseTemplate::new(200),
+        );
+
+        // Without --yes nothing is read or sent.
+        let (code, _, err) = run_args(&["cancel", "5", "-m", "x"], &paths);
+        assert_eq!(code, 1);
+        assert!(
+            err.contains("não pode ser desfeito") && err.contains("--yes"),
+            "{err}"
+        );
+        assert!(runtime
+            .block_on(server.received_requests())
+            .unwrap()
+            .is_empty());
+
+        let (code, out, err) = run_args(
+            &["cancel", "5", "--yes", "-m", "aberto por engano\ndesculpe"],
+            &paths,
+        );
+        assert_eq!(
+            (code, err.as_str(), out.as_str()),
+            (0, "", "Chamado #5 cancelado.\n")
+        );
+        let (code, _, _) = run_with_input(&["cancel", "5", "--yes"], &paths, "pelo stdin\n");
+        assert_eq!(code, 0);
+        let requests = runtime.block_on(server.received_requests()).unwrap();
+        let bodies: Vec<String> = requests
+            .iter()
+            .filter(|request| request.method == wiremock::http::Method::POST)
+            .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+            .collect();
+        assert!(bodies[0].contains("observacao=aberto+por+engano%0Adesculpe"));
+        assert!(bodies[1].contains("observacao=pelo+stdin"));
+
+        let (code, _, err) = run_with_input(&["cancel", "5", "--yes"], &paths, "\n");
+        assert_eq!(code, 1);
+        assert!(err.contains("texto não informado"));
+        let (code, _, err) = run_args(&["cancel", "9", "--yes", "-m", "x"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("ticket 9 cannot be cancelled"));
+    }
+
+    #[test]
     fn resolve_sends_the_message_articles_and_other_tickets() {
         let (_dir, paths) = paths();
         let (runtime, server) = bare_server();
@@ -2147,7 +2340,7 @@ mod tests {
 
     /// Commands that take free text, with the option that carries it, the form field SUAP receives
     /// it in and the path it is posted to. Each must satisfy requirement RS-02.
-    const TEXT_COMMANDS: [(&[&str], &str, &str, &str); 5] = [
+    const TEXT_COMMANDS: [(&[&str], &str, &str, &str); 6] = [
         (
             &["open"],
             "-d",
@@ -2178,12 +2371,20 @@ mod tests {
             "comentario",
             "/centralservicos/resolver_chamado/5/",
         ),
+        (
+            &["cancel", "5", "--yes"],
+            "-m",
+            "observacao",
+            "/centralservicos/cancelar_chamado/5/",
+        ),
     ];
 
     /// Commands without free text. A new command must be added to one of the two lists, which forces
     /// a decision about RS-02 (and a test for it) whenever a command is created.
-    const NON_TEXT_COMMANDS: [&str; 9] = [
+    const NON_TEXT_COMMANDS: [&str; 11] = [
         "sync",
+        "assume",
+        "start",
         "paths",
         "profile",
         "session-status",
@@ -2224,11 +2425,13 @@ mod tests {
             &field("observacao"),
         );
         get("/centralservicos/resolver_chamado/5/", &field("comentario"));
+        get("/centralservicos/cancelar_chamado/5/", &field("observacao"));
         for path in [
             "/centralservicos/adicionar_comentario/5/",
             "/centralservicos/adicionar_nota_interna/5/",
             "/centralservicos/suspender_chamado/5/",
             "/centralservicos/resolver_chamado/5/",
+            "/centralservicos/cancelar_chamado/5/",
         ] {
             let accepted = ResponseTemplate::new(200).set_body_string("ok");
             mount_text(&runtime, &server, "POST", path, accepted);
