@@ -172,6 +172,20 @@ impl TicketFilter {
                 }
                 "/centralservicos/listar_chamados_suporte/"
             }
+            TicketQueue::ToClose => {
+                let paging_only = TicketFilter {
+                    page: self.page,
+                    all_pages: self.all_pages,
+                    ..TicketFilter::default()
+                };
+                if *self != paging_only {
+                    return Err(TicketError::Source(
+                        "no filter applies to the list of tickets to close (only paging)"
+                            .to_owned(),
+                    ));
+                }
+                "/centralservicos/listar_chamados_a_fechar/"
+            }
             TicketQueue::Mine => {
                 if let Some(what) = self.support_only() {
                     return Err(TicketError::Source(format!(
@@ -244,6 +258,46 @@ mod tests {
         );
         assert!(support(&filter(), 3).ends_with("/?page=3"));
         assert!(mine(&filter(), 2).ends_with("?tab=ativos&page=2"));
+    }
+
+    #[test]
+    fn the_list_to_close_takes_no_filters_but_paging() {
+        let plain = filter();
+        assert_eq!(
+            plain.path(TicketQueue::ToClose, 1).unwrap(),
+            "/centralservicos/listar_chamados_a_fechar/"
+        );
+        assert_eq!(
+            plain.path(TicketQueue::ToClose, 3).unwrap(),
+            "/centralservicos/listar_chamados_a_fechar/?page=3"
+        );
+        let paged = TicketFilter {
+            page: Some(2),
+            all_pages: true,
+            ..filter()
+        };
+        assert!(paged.path(TicketQueue::ToClose, 1).is_ok());
+        for filtered in [
+            TicketFilter {
+                id: Some(1),
+                ..filter()
+            },
+            TicketFilter {
+                all_statuses: true,
+                ..filter()
+            },
+            TicketFilter {
+                text: Some("x".to_owned()),
+                ..filter()
+            },
+            TicketFilter {
+                since: Some("2026-01-01".to_owned()),
+                ..filter()
+            },
+        ] {
+            let message = error(filtered.path(TicketQueue::ToClose, 1));
+            assert!(message.contains("only paging"), "{message}");
+        }
     }
 
     #[test]

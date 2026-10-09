@@ -25,6 +25,8 @@ const SUSPEND_PATH_PREFIX: &str = "/centralservicos/suspender_chamado/";
 const RESOLVE_PATH_PREFIX: &str = "/centralservicos/resolver_chamado/";
 const ATTACHMENT_PATH_PREFIX: &str = "/djtools/arquivo/centralservicos/chamadoanexo/";
 const CANCEL_PATH_PREFIX: &str = "/centralservicos/cancelar_chamado/";
+const REOPEN_PATH_PREFIX: &str = "/centralservicos/reabrir_chamado/";
+const CLOSE_PATH_PREFIX: &str = "/centralservicos/fechar_chamado/";
 
 /// File types SUAP accepts as ticket attachments (it rejects any other).
 pub const ALLOWED_ATTACHMENT_EXTENSIONS: [&str; 9] = [
@@ -155,6 +157,8 @@ pub enum TicketQueue {
     Support,
     /// Active tickets the user takes part in ("Meus chamados" menu).
     Mine,
+    /// Resolved tickets the user may close.
+    ToClose,
 }
 
 impl TicketQueue {
@@ -162,6 +166,7 @@ impl TicketQueue {
         match self {
             Self::Support => "/centralservicos/listar_chamados_suporte/",
             Self::Mine => "/centralservicos/meus_chamados/?tab=ativos",
+            Self::ToClose => "/centralservicos/listar_chamados_a_fechar/",
         }
     }
 }
@@ -182,6 +187,16 @@ pub trait TicketSource {
     async fn suspend_ticket(&self, id: &str, text: &str) -> Result<(), TicketError>;
     /// Moves the ticket to "Cancelado", with the reason. It cannot be undone.
     async fn cancel_ticket(&self, id: &str, text: &str) -> Result<(), TicketError>;
+    /// Moves a resolved ticket back to "Reaberto", with the reason.
+    async fn reopen_ticket(&self, id: &str, text: &str) -> Result<(), TicketError>;
+    /// Moves a resolved ticket to "Fechado". Only the interested person's `rating` (1 to 5) and
+    /// `comment` are used by SUAP: they evaluate the service.
+    async fn close_ticket(
+        &self,
+        id: &str,
+        rating: Option<u8>,
+        comment: Option<&str>,
+    ) -> Result<(), TicketError>;
     /// Moves the ticket to "Resolvido".
     async fn resolve_ticket(&self, id: &str, resolution: &Resolution) -> Result<(), TicketError>;
     /// Assigns the ticket to the logged user ("assumir").
@@ -442,6 +457,39 @@ impl TicketSource for SuapTicketSource<'_> {
         set_field(&mut fields, "observacao", text);
         self.send_status_form(&path, &fields, "the cancellation")
             .await
+    }
+
+    async fn reopen_ticket(&self, id: &str, text: &str) -> Result<(), TicketError> {
+        let text = non_empty_text(text, "reopening")?;
+        let (path, _, mut fields) = self
+            .open_status_form(REOPEN_PATH_PREFIX, id, "reopened", "observacao")
+            .await?;
+        set_field(&mut fields, "observacao", text);
+        self.send_status_form(&path, &fields, "the reopening").await
+    }
+
+    async fn close_ticket(
+        &self,
+        id: &str,
+        rating: Option<u8>,
+        comment: Option<&str>,
+    ) -> Result<(), TicketError> {
+        if rating.is_some_and(|rating| !(1..=5).contains(&rating)) {
+            return Err(TicketError::Source(
+                "the rating must be from 1 to 5".to_owned(),
+            ));
+        }
+        let (path, _, mut fields) = self
+            .open_status_form(CLOSE_PATH_PREFIX, id, "closed", "comentario")
+            .await?;
+        if let Some(rating) = rating {
+            set_field(&mut fields, "nota_avaliacao", &rating.to_string());
+        }
+        if let Some(comment) = comment {
+            let comment = comment.trim_end_matches(['\r', '\n']);
+            set_field(&mut fields, "comentario", comment);
+        }
+        self.send_status_form(&path, &fields, "the closing").await
     }
 
     async fn resolve_ticket(&self, id: &str, resolution: &Resolution) -> Result<(), TicketError> {
@@ -1577,6 +1625,137 @@ mod tests {
         assert!(source.cancel_ticket("x", "x").await.is_err());
     }
 
+    const CLOSE_FORM: &str = r#"<form action="" method="POST" name="fechareavaliarchamado_form">
+        <input type="hidden" name="csrfmiddlewaretoken" value="tok">
+        <input type="radio" name="nota_avaliacao" value="1"><input type="radio" name="nota_avaliacao" value="5">
+        <textarea name="comentario"></textarea>
+        <input type="submit" name="fechareavaliarchamado_form"></form>"#;
+
+    #[tokio::test]
+    async fn reopens_a_ticket_with_a_multiline_reason() {
+        let server = MockServer::start().await;
+        mount_text(
+            &server,
+            "GET",
+            "/centralservicos/reabrir_chamado/5/",
+            SUSPEND_FORM,
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/centralservicos/reabrir_chamado/5/"))
+            .and(body_string_contains("csrfmiddlewaretoken=tok"))
+            .and(body_string_contains(
+                "observacao=ainda+falha%0Anao+resolveu",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&server)
+            .await;
+        mount_text(
+            &server,
+            "GET",
+            "/centralservicos/reabrir_chamado/6/",
+            "<p>sem formulário</p>",
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path("/centralservicos/reabrir_chamado/7/"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let (_dir, client) = client_for(&server).await;
+        let source = SuapTicketSource::new(&client, TicketQueue::Support);
+        source
+            .reopen_ticket("5", "ainda falha\nnao resolveu\n")
+            .await
+            .unwrap();
+        let no_form = source.reopen_ticket("6", "x").await.unwrap_err();
+        assert!(no_form
+            .to_string()
+            .contains("ticket 6 has no reopened form"));
+        let forbidden = source.reopen_ticket("7", "x").await.unwrap_err();
+        assert!(forbidden
+            .to_string()
+            .contains("ticket 7 cannot be reopened (unexpected status 403 Forbidden)"));
+        let empty = source.reopen_ticket("5", " ").await.unwrap_err();
+        assert!(empty.to_string().contains("the reopening text is empty"));
+        assert!(source.reopen_ticket("x", "x").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn closes_a_ticket_with_an_optional_rating_and_comment() {
+        let server = MockServer::start().await;
+        mount_text(
+            &server,
+            "GET",
+            "/centralservicos/fechar_chamado/5/",
+            CLOSE_FORM,
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/centralservicos/fechar_chamado/5/"))
+            .and(body_string_contains("csrfmiddlewaretoken=tok"))
+            .and(body_string_contains("nota_avaliacao=4"))
+            .and(body_string_contains("comentario=otimo%0Aobrigado"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&server)
+            .await;
+        mount_text(
+            &server,
+            "GET",
+            "/centralservicos/fechar_chamado/8/",
+            CLOSE_FORM,
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/centralservicos/fechar_chamado/8/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&server)
+            .await;
+        mount_text(
+            &server,
+            "GET",
+            "/centralservicos/fechar_chamado/6/",
+            "<p>sem formulário</p>",
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path("/centralservicos/fechar_chamado/7/"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let (_dir, client) = client_for(&server).await;
+        let source = SuapTicketSource::new(&client, TicketQueue::Support);
+        source
+            .close_ticket("5", Some(4), Some("otimo\nobrigado\n"))
+            .await
+            .unwrap();
+        // Without a rating or comment, the form goes back as SUAP offered it.
+        source.close_ticket("8", None, None).await.unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let body = |ticket: &str| {
+            let wanted = format!("/centralservicos/fechar_chamado/{ticket}/");
+            let post = requests
+                .iter()
+                .find(|request| request.method.as_str() == "POST" && request.url.path() == wanted);
+            String::from_utf8_lossy(&post.unwrap().body).into_owned()
+        };
+        assert!(
+            !body("8").contains("nota_avaliacao") && body("8").contains("csrfmiddlewaretoken=tok")
+        );
+
+        let no_form = source.close_ticket("6", None, None).await.unwrap_err();
+        assert!(no_form.to_string().contains("ticket 6 has no closed form"));
+        let forbidden = source.close_ticket("7", None, None).await.unwrap_err();
+        assert!(forbidden
+            .to_string()
+            .contains("ticket 7 cannot be closed (unexpected status 403 Forbidden)"));
+        for bad in [0, 6, 255] {
+            let refused = source.close_ticket("5", Some(bad), None).await.unwrap_err();
+            assert!(refused.to_string().contains("from 1 to 5"), "{bad}");
+        }
+        assert!(source.close_ticket("x", None, None).await.is_err());
+    }
+
     #[test]
     fn extracts_flash_errors_without_button_text() {
         let page = r#"<p class="x alert-error">Não pode. <button>Fechar</button></p>
@@ -2044,6 +2223,9 @@ mod tests {
             .path()
             .contains("listar_chamados_suporte"));
         assert!(TicketQueue::Mine.path().contains("meus_chamados"));
+        assert!(TicketQueue::ToClose
+            .path()
+            .contains("listar_chamados_a_fechar"));
     }
 
     #[test]
