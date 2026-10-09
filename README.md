@@ -209,6 +209,28 @@ chamados download 559298 --force               # sobrescreve arquivos que já ex
 
 O nome do arquivo vem do SUAP, mas é saneado antes de gravar: pastas e `..` são descartados, caracteres que o sistema de arquivos recusa viram `_`, nomes reservados do Windows (`CON`, `NUL`...) ganham um `_` na frente e nomes repetidos viram `nome (2).ext`. Nada é sobrescrito sem `--force`, e a checagem acontece antes de baixar qualquer arquivo. Só são baixados os arquivos que o SUAP serve para chamados (`/djtools/arquivo/centralservicos/chamadoanexo/...`), nunca um endereço qualquer encontrado na página.
 
+### Passar o chamado adiante, reclassificar, tags e outros interessados
+
+```bash
+chamados assign 559298 --para 2080883                    # outro atendente do mesmo grupo
+chamados escalate 559298 -m "Preciso do nível 2." --para 2080883   # grupo de atendimento acima
+chamados return 559298 -m "Voltou para o nível 1."       # grupo abaixo
+chamados reclassify 559298 --servico 12 -m "Era outro serviço."
+chamados reclassify 559298 --centro 4 --campus 3 -m "Atendimento local."
+
+chamados tag add 559298 moodle rede                      # nome (ou parte dele) ou id
+chamados tag remove 559298 moodle
+chamados interested add 559298 2080883 "Ana Souza"       # matrícula ou nome
+chamados interested remove 559298 2080883
+```
+
+Como nos outros comandos, o `chamados` abre o formulário do SUAP, preenche o que você escolheu e o envia de volta, então valem as regras de permissão do SUAP (por exemplo, `assign` só para o responsável pelo grupo, e nunca para si mesmo: para isso use `assume`). Pessoas, tags e centros são escolhidos pelas palavras que você conhece: valor exato, nome inteiro ou um pedaço que só uma opção contenha; se não achar ou houver mais de uma, o comando lista as opções em vez de adivinhar.
+
+- **`escalate`/`return`**: a nota é interna (obrigatória, várias linhas ou entrada padrão). `--para` já atribui a um atendente do outro grupo; sem ele o chamado fica sem atendente. O SUAP só escala quando há grupo superior e só devolve quando há grupo inferior.
+- **`reclassify`**: informe ao menos um entre `--servico`, `--campus` e `--centro`; o que não for informado fica como está (o campus padrão é o do chamado e o centro atual é mantido enquanto o SUAP o oferecer para o novo serviço/campus; senão, escolha com `--centro`). O SUAP recusa quando nada muda e volta o chamado para "Aberto". Não existe "prioridade" na Central de Serviços: trocar o serviço é por aqui.
+- **`tag`**: as tags oferecidas dependem da área dos grupos de atendimento do seu usuário.
+- **`interested`**: a busca de pessoas é a do próprio SUAP (matrícula ou nome); para remover, vale a matrícula, o nome ou o id do usuário.
+
 ### Ver detalhes de um chamado
 
 ```bash

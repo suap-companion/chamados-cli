@@ -9,9 +9,11 @@ use thiserror::Error;
 use url::Url;
 
 pub mod filter;
+pub mod manage;
 pub mod titles;
 
 pub use filter::{suap_date, TicketFilter, ASSIGNMENTS, MAX_PAGES, ORDERS, RELATIONS, STATUSES};
+pub use manage::{pick_choice, Choice, Direction, Reclassification};
 pub use titles::{validate_title, TitleEntry, TitleStore, MAX_TITLE_CHARS};
 
 const TICKET_PATH_PREFIX: &str = "/centralservicos/chamado/";
@@ -247,8 +249,17 @@ impl<'a> SuapTicketSource<'a> {
             }
             other => other?,
         };
-        let fields = parse_form_with_field(&html, field)
-            .ok_or_else(|| TicketError::Source(format!("ticket {id} has no {what} form")))?;
+        let Some(fields) = parse_form_with_field(&html, field) else {
+            // SUAP answers a refused action with a message on the page it redirects to.
+            let refused = flash_errors(&html);
+            let reason = match refused.is_empty() {
+                true => String::new(),
+                false => format!(": {}", refused.join("; ")),
+            };
+            return Err(TicketError::Source(format!(
+                "ticket {id} has no {what} form{reason}"
+            )));
+        };
         Ok((path, html, fields))
     }
 
@@ -816,6 +827,17 @@ fn default_campus(json: &str) -> Result<String, TicketError> {
     chosen
         .map(|campus| campus.0.to_string())
         .ok_or_else(|| TicketError::Source("no campus available for this service".to_owned()))
+}
+
+/// Whether SUAP's list of service centers offers the one with id `wanted`.
+fn center_offered(json: &str, wanted: &str) -> bool {
+    let reply: Result<CentersReply, _> = serde_json::from_str(json);
+    reply.is_ok_and(|reply| {
+        reply
+            .centros
+            .iter()
+            .any(|center| center.0.to_string() == wanted)
+    })
 }
 
 /// Picks the only service center available; asks for an explicit one when there are several.
