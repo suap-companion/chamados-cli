@@ -1,13 +1,40 @@
 use std::io::{stderr, stdin, stdout, IsTerminal, Read, Write};
 
-use chamados_cli::{NoPrompt, Prompt};
+use chamados_cli::Prompt;
 use suap_core::AppPaths;
 
-/// Asks questions on the terminal; the secret is read without echo.
-struct TerminalPrompt;
+/// What the process knows about its terminals: it asks questions only when standard input is a
+/// terminal (the secret is read without echo), and styles tables only when standard output is one.
+struct Console {
+    interactive: bool,
+    ansi_output: bool,
+}
 
-impl Prompt for TerminalPrompt {
+impl Console {
+    fn detect() -> Self {
+        Self {
+            interactive: stdin().is_terminal(),
+            ansi_output: stdout().is_terminal() && understands_ansi(),
+        }
+    }
+}
+
+/// The classic Windows console shows escape sequences as garbage; the modern terminals announce
+/// themselves through these variables (everywhere else a terminal is assumed to understand ANSI).
+fn understands_ansi() -> bool {
+    if !cfg!(windows) {
+        return true;
+    }
+    ["WT_SESSION", "TERM_PROGRAM", "TERM", "ConEmuANSI"]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+}
+
+impl Prompt for Console {
     fn line(&mut self, label: &str) -> std::io::Result<String> {
+        if !self.interactive {
+            return Err(std::io::Error::other("no interactive terminal"));
+        }
         print!("{label}");
         stdout().flush()?;
         let mut answer = String::new();
@@ -16,7 +43,14 @@ impl Prompt for TerminalPrompt {
     }
 
     fn secret(&mut self, label: &str) -> std::io::Result<String> {
+        if !self.interactive {
+            return Err(std::io::Error::other("no interactive terminal"));
+        }
         rpassword::prompt_password(label)
+    }
+
+    fn styled_output(&self) -> bool {
+        self.ansi_output
     }
 }
 
@@ -27,23 +61,18 @@ fn main() {
             let password = std::env::var(chamados_cli::PASSWORD_ENV).ok();
             // Only piped/redirected input is read as text; an interactive terminal is never waited on,
             // except when a command explicitly asks a question (see `Prompt`).
-            let interactive = stdin().is_terminal();
-            let mut input: Box<dyn Read> = if interactive {
+            let mut console = Console::detect();
+            let mut input: Box<dyn Read> = if console.interactive {
                 Box::new(std::io::empty())
             } else {
                 Box::new(stdin())
-            };
-            let mut prompt: Box<dyn Prompt> = if interactive {
-                Box::new(TerminalPrompt)
-            } else {
-                Box::new(NoPrompt)
             };
             chamados_cli::run(
                 std::env::args_os(),
                 &paths,
                 password,
                 &mut input,
-                &mut *prompt,
+                &mut console,
                 &mut stdout(),
                 &mut stderr(),
             )

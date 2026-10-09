@@ -96,6 +96,18 @@ cargo run -p chamados-cli -- list --meus    # "Meus chamados" ativos
 
 Se a sessão estiver ausente ou expirada, o comando orienta a executar `chamados login`.
 
+#### Aparência da tabela (`--color`)
+
+Num terminal, `list` e `profile list` saem **alinhados em colunas** (pela largura dos caracteres mostrados, então acentos não desalinham), com **uma cor por coluna** (a da situação varia: Aberto verde, Em atendimento azul, Suspenso amarelo, Resolvido verde-claro, Fechado cinza, Cancelado vermelho, Reaberto vermelho-claro) e o `#id` como **link** para a página do chamado, nos terminais que aceitam hiperlinks (OSC 8). Em pipe ou redirecionamento a saída continua sendo o texto separado por tabulação de sempre, sem cores nem links, para não quebrar scripts.
+
+| `--color` | Comportamento |
+|-----------|---------------|
+| `auto` (padrão) | alinhado, colorido e com links só quando a saída é um terminal que entende ANSI; com a variável `NO_COLOR` definida fica alinhado, sem cores nem links |
+| `always` | alinhado, colorido e com links mesmo em pipe (vence o `NO_COLOR`) |
+| `never` | texto separado por tabulação, sem nada de ANSI |
+
+`--json` nunca é estilizado. Textos vindos do SUAP têm os caracteres de controle trocados por espaço antes de irem ao terminal. No Windows o modo `auto` só liga o estilo em terminais modernos (Windows Terminal, VS Code, ConEmu...); no console clássico o texto sai simples. A largura conta caracteres, então ideogramas e emojis (que ocupam duas colunas) podem desalinhar.
+
 #### Filtros, busca e páginas
 
 Quem filtra é o próprio SUAP (os mesmos filtros do formulário da tela); só `--titulo` e `--limite` são aplicados aqui.
