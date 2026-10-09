@@ -199,6 +199,15 @@ chamados list --a-fechar                        # os resolvidos que você pode f
 
 São as mesmas ações do `open --assume` / `open --start`, agora para chamados que já existem. O SUAP só deixa colocar em atendimento quem já assumiu o chamado; sem `--assume`, a recusa dele é mostrada. O `reopen` e o `close` só valem para chamados **Resolvidos**, a pedido do requisitante, do interessado ou do responsável pelo grupo de atendimento; o motivo do `reopen` é obrigatório (mesmo padrão dos demais textos). No `close`, `--nota` (1 a 5) e o comentário são a **avaliação do atendimento** e só valem quando quem fecha é o **interessado** (para os demais o SUAP ignora os dois); ambos são opcionais, e o comentário só lê a entrada padrão com `-m -` (omitido, fecha sem comentário). O `list --a-fechar` aceita só `--pagina`/`--todas-paginas`. O `cancel` **não pode ser desfeito**, por isso exige `--yes`; o motivo segue o padrão dos demais textos (várias linhas; `-m`, `-m -` ou entrada padrão) e o SUAP só cancela chamados abertos, reabertos, em atendimento ou suspensos, a pedido do requisitante, do interessado ou de um atendente.
 
+### Anexar arquivos a um chamado que já existe
+
+```bash
+chamados attach 559298 relatorio.pdf planilha.xlsx
+chamados attach 559298 foto.png --descricao "Tela do erro"
+```
+
+Cada arquivo é um envio ao SUAP (o formulário dele aceita um por vez), com os mesmos tipos do `open --attach` (xlsx, xls, csv, docx, doc, pdf, jpg, jpeg, png). Todos os arquivos são lidos antes do primeiro envio, então um nome errado não deixa o chamado pela metade. A descrição (uma linha, até 80 caracteres) vale para todos os arquivos do comando e, sem ela, é o nome do arquivo. O SUAP só aceita anexo em chamados de serviços que permitem anexos e a quem pode ver o chamado; senão a recusa dele é mostrada. Para ver e baixar o que já está anexado, use `show` e `download`.
+
 ### Baixar anexos
 
 O `show` lista os anexos do chamado, numerados na ordem da linha do tempo. O `download` os grava no disco:
@@ -209,7 +218,7 @@ chamados download 559298 --anexo 2 -o baixados # só o anexo 2, na pasta "baixad
 chamados download 559298 --force               # sobrescreve arquivos que já existam
 ```
 
-O nome do arquivo vem do SUAP, mas é saneado antes de gravar: pastas e `..` são descartados, caracteres que o sistema de arquivos recusa viram `_`, nomes reservados do Windows (`CON`, `NUL`...) ganham um `_` na frente e nomes repetidos viram `nome (2).ext`. Nada é sobrescrito sem `--force`, e a checagem acontece antes de baixar qualquer arquivo. Só são baixados os arquivos que o SUAP serve para chamados (`/djtools/arquivo/centralservicos/chamadoanexo/...`), nunca um endereço qualquer encontrado na página.
+O nome do arquivo vem do SUAP, mas é saneado antes de gravar: pastas e `..` são descartados, caracteres que o sistema de arquivos recusa viram `_`, nomes reservados do Windows (`CON`, `NUL`...) ganham um `_` na frente e nomes repetidos viram `nome (2).ext`. O nome que o SUAP mostra pode ser só a descrição do anexo (por exemplo "Tela do erro"): nesse caso o `download` acrescenta a extensão do arquivo guardado (`Tela do erro.png`). Nada é sobrescrito sem `--force`, e a checagem acontece depois de baixar e antes de gravar qualquer arquivo. Só são baixados os arquivos que o SUAP serve para chamados (`/djtools/arquivo/centralservicos/chamadoanexo/...`), nunca um endereço qualquer encontrado na página.
 
 ### Passar o chamado adiante, reclassificar, tags e outros interessados
 

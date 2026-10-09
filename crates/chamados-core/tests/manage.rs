@@ -1,7 +1,7 @@
 //! The ticket management actions (assign, escalate/return, reclassify, tags, other interested
 //! people) against a mock SUAP that serves the same forms the real one does.
 
-use chamados_core::{Direction, Reclassification, SuapTicketSource, TicketQueue};
+use chamados_core::{Attachment, Direction, Reclassification, SuapTicketSource, TicketQueue};
 use suap_core::{AppPaths, SuapClient, SuapConfig};
 use tempfile::{tempdir, TempDir};
 use url::Url;
@@ -696,4 +696,146 @@ async fn adds_and_removes_other_interested_people() {
         "{absent}"
     );
     assert!(source.remove_interested("x", &names(&["a"])).await.is_err());
+}
+
+#[tokio::test]
+async fn attaches_a_file_to_an_open_ticket_with_a_description() {
+    let server = MockServer::start().await;
+    let form = format!(
+        r#"<form method="POST" enctype="multipart/form-data">{TOKEN}
+        <input name="descricao" maxlength="80"><input type="file" name="anexo"></form>"#
+    );
+    page(
+        &server,
+        "GET",
+        "/centralservicos/adicionar_anexo/5/",
+        200,
+        &form,
+    )
+    .await;
+    page(
+        &server,
+        "POST",
+        "/centralservicos/adicionar_anexo/5/",
+        200,
+        "ok",
+    )
+    .await;
+    page(
+        &server,
+        "GET",
+        "/centralservicos/adicionar_anexo/6/",
+        200,
+        "<p>sem formulário</p>",
+    )
+    .await;
+    page(
+        &server,
+        "GET",
+        "/centralservicos/adicionar_anexo/7/",
+        403,
+        "",
+    )
+    .await;
+    page(
+        &server,
+        "GET",
+        "/centralservicos/adicionar_anexo/8/",
+        200,
+        &form,
+    )
+    .await;
+    page(
+        &server,
+        "POST",
+        "/centralservicos/adicionar_anexo/8/",
+        200,
+        r#"<ul class="errorlist"><li>Extensão não permitida</li></ul>"#,
+    )
+    .await;
+    let (_dir, client) = client_for(&server).await;
+    let source = SuapTicketSource::new(&client, TicketQueue::Support);
+    let file = |name: &str| Attachment {
+        file_name: name.to_owned(),
+        bytes: b"a,b\n1,2\n".to_vec(),
+    };
+
+    source
+        .attach_file("5", &file("dados.csv"), Some("  Planilha de dados  "))
+        .await
+        .unwrap();
+    source
+        .attach_file("5", &file("relatorio.pdf"), None)
+        .await
+        .unwrap();
+    let long = "x".repeat(200);
+    source
+        .attach_file("5", &file("grande.pdf"), Some(&long))
+        .await
+        .unwrap();
+    let bodies = posted(&server, "/centralservicos/adicionar_anexo/5/").await;
+    assert_eq!(bodies.len(), 3);
+    assert!(
+        bodies[0].contains("name=\"anexo\"; filename=\"dados.csv\""),
+        "{}",
+        bodies[0]
+    );
+    assert!(
+        bodies[0].contains("a,b\n1,2\n") && bodies[0].contains("Planilha de dados"),
+        "{}",
+        bodies[0]
+    );
+    assert!(bodies[0].contains("name=\"csrfmiddlewaretoken\"") && bodies[0].contains("tok"));
+    assert!(
+        bodies[1].contains("name=\"descricao\"") && bodies[1].contains("relatorio.pdf\r\n--"),
+        "{}",
+        bodies[1]
+    );
+    assert!(bodies[2].contains(&"x".repeat(80)) && !bodies[2].contains(&"x".repeat(81)));
+
+    let wrong_type = source
+        .attach_file("5", &file("programa.exe"), None)
+        .await
+        .unwrap_err();
+    assert!(
+        wrong_type.to_string().contains("unsupported type"),
+        "{wrong_type}"
+    );
+    let no_form = source
+        .attach_file("6", &file("a.pdf"), None)
+        .await
+        .unwrap_err();
+    assert!(
+        no_form
+            .to_string()
+            .contains("ticket 6 has no attached form"),
+        "{no_form}"
+    );
+    let forbidden = source
+        .attach_file("7", &file("a.pdf"), None)
+        .await
+        .unwrap_err();
+    assert!(
+        forbidden
+            .to_string()
+            .contains("ticket 7 cannot be attached"),
+        "{forbidden}"
+    );
+    let rejected = source
+        .attach_file("8", &file("a.pdf"), None)
+        .await
+        .unwrap_err();
+    assert!(
+        rejected
+            .to_string()
+            .contains("SUAP rejected the attachment: Extensão não permitida"),
+        "{rejected}"
+    );
+    assert!(source.attach_file("x", &file("a.pdf"), None).await.is_err());
+    assert_eq!(
+        posted(&server, "/centralservicos/adicionar_anexo/5/")
+            .await
+            .len(),
+        3
+    );
 }
