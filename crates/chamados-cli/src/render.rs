@@ -5,8 +5,156 @@
 //! Adding keys is allowed; renaming or removing them is not.
 
 use chamados_core::{watch::WatchEvent, RemoteTicket, TicketDetails};
+use clap::ValueEnum;
 use serde_json::{json, Value};
 use suap_core::{AppPaths, SuapConfig};
+
+/// When the tables of `list` and `profile list` are aligned, colored and linked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ColorMode {
+    /// On a terminal that understands ANSI, unless `NO_COLOR` is set; plain tab-separated text otherwise.
+    Auto,
+    /// Always aligned, colored and linked, even in a pipe.
+    Always,
+    /// Never: plain tab-separated text, the format for scripts.
+    Never,
+}
+
+/// How a table is printed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Style {
+    /// Columns padded to the widest value, separated by spaces (instead of tabs).
+    pub aligned: bool,
+    /// ANSI colors and hyperlinks.
+    pub color: bool,
+}
+
+impl Style {
+    /// Tab-separated text without escape sequences: what scripts get.
+    pub const PLAIN: Self = Self {
+        aligned: false,
+        color: false,
+    };
+}
+
+/// The style for `mode`, given whether standard output is a terminal that understands ANSI
+/// escape sequences and whether `NO_COLOR` asks for no colors (which only matters in `auto`).
+pub fn resolve_style(mode: ColorMode, ansi_terminal: bool, no_color: bool) -> Style {
+    match (mode, ansi_terminal) {
+        (ColorMode::Never, _) | (ColorMode::Auto, false) => Style::PLAIN,
+        (ColorMode::Always, _) => Style {
+            aligned: true,
+            color: true,
+        },
+        (ColorMode::Auto, true) => Style {
+            aligned: true,
+            color: !no_color,
+        },
+    }
+}
+
+/// One cell of a table: its text and how it may be dressed up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cell {
+    text: String,
+    color: Option<&'static str>,
+    link: Option<String>,
+}
+
+impl Cell {
+    pub fn plain(text: &str) -> Self {
+        // Text comes from SUAP or the user: a control character (even an escape sequence) must
+        // never reach the terminal, and a tab would break the columns.
+        let text = text
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        Self {
+            text,
+            color: None,
+            link: None,
+        }
+    }
+
+    /// `text` in the ANSI color `code` (the number of an SGR sequence, such as `"32"`).
+    pub fn colored(text: &str, code: &'static str) -> Self {
+        Self {
+            color: Some(code),
+            ..Self::plain(text)
+        }
+    }
+
+    /// The same cell, a hyperlink to `url` where hyperlinks are used.
+    pub fn linked(self, url: &str) -> Self {
+        let link = Some(url.chars().filter(|c| !c.is_control()).collect());
+        Self { link, ..self }
+    }
+
+    /// Characters shown (accents composed of a separate mark do not take a column of their own).
+    fn width(&self) -> usize {
+        self.text
+            .chars()
+            .filter(|c| !('\u{300}'..='\u{36f}').contains(c))
+            .count()
+    }
+
+    fn dressed(&self, style: Style) -> String {
+        if !style.color {
+            return self.text.clone();
+        }
+        let mut shown = self.text.clone();
+        if let Some(code) = self.color {
+            shown = format!("\x1b[{code}m{shown}\x1b[0m");
+        }
+        if let Some(url) = &self.link {
+            shown = format!("\x1b]8;;{url}\x1b\\{shown}\x1b]8;;\x1b\\");
+        }
+        shown
+    }
+}
+
+/// The lines of a table. Plain style joins the cells with tabs; the aligned style pads every
+/// column but the last to the width of its widest cell (by characters shown, not bytes) and
+/// separates columns with two spaces.
+pub fn render_table(rows: &[Vec<Cell>], style: Style) -> Vec<String> {
+    let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let widths: Vec<usize> = (0..columns)
+        .map(|column| {
+            let cells = rows.iter().filter_map(|row| row.get(column));
+            cells.map(Cell::width).max().unwrap_or(0)
+        })
+        .collect();
+    rows.iter()
+        .map(|row| {
+            let mut line = String::new();
+            for (column, cell) in row.iter().enumerate() {
+                if column > 0 {
+                    line.push_str(if style.aligned { "  " } else { "\t" });
+                }
+                line.push_str(&cell.dressed(style));
+                let last = column + 1 == row.len();
+                if style.aligned && !last {
+                    line.push_str(&" ".repeat(widths[column] - cell.width()));
+                }
+            }
+            line
+        })
+        .collect()
+}
+
+/// The color of a ticket situation, by name.
+pub fn status_color(status: &str) -> &'static str {
+    match status {
+        "Aberto" => "32",
+        "Em atendimento" => "34",
+        "Suspenso" => "33",
+        "Resolvido" => "92",
+        "Fechado" => "90",
+        "Cancelado" => "31",
+        "Reaberto" => "91",
+        _ => "0",
+    }
+}
 
 /// A ticket id as a JSON number (SUAP's ids are), or the text itself when it is not one.
 pub fn id_json(id: &str) -> Value {
@@ -184,6 +332,128 @@ pub fn watch_line(event: &WatchEvent, time: u64, local_title: Option<&str>) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ALIGNED: Style = Style {
+        aligned: true,
+        color: false,
+    };
+    const COLORED: Style = Style {
+        aligned: true,
+        color: true,
+    };
+
+    fn row(cells: &[&str]) -> Vec<Cell> {
+        cells.iter().map(|text| Cell::plain(text)).collect()
+    }
+
+    #[test]
+    fn the_style_follows_the_mode_the_terminal_and_no_color() {
+        use ColorMode::{Always, Auto, Never};
+        assert_eq!(resolve_style(Auto, false, false), Style::PLAIN);
+        assert_eq!(resolve_style(Auto, false, true), Style::PLAIN);
+        assert_eq!(resolve_style(Auto, true, false), COLORED);
+        // NO_COLOR keeps the alignment but drops colors and links.
+        assert_eq!(resolve_style(Auto, true, true), ALIGNED);
+        assert_eq!(resolve_style(Always, false, false), COLORED);
+        assert_eq!(
+            resolve_style(Always, true, true),
+            COLORED,
+            "a flag beats NO_COLOR"
+        );
+        assert_eq!(resolve_style(Never, true, false), Style::PLAIN);
+        assert_eq!(resolve_style(Never, false, true), Style::PLAIN);
+    }
+
+    #[test]
+    fn plain_tables_are_tab_separated_and_aligned_ones_are_padded_by_characters() {
+        let rows = vec![
+            row(&["#7", "Em atendimento", "Título", "Assunto A"]),
+            row(&["#12345", "Aberto", "-", "Assunto com acentuação"]),
+            row(&["#9", "Suspenso"]),
+        ];
+        assert_eq!(
+            render_table(&rows, Style::PLAIN),
+            [
+                "#7\tEm atendimento\tTítulo\tAssunto A",
+                "#12345\tAberto\t-\tAssunto com acentuação",
+                "#9\tSuspenso",
+            ]
+        );
+        assert_eq!(
+            render_table(&rows, ALIGNED),
+            [
+                "#7      Em atendimento  Título  Assunto A",
+                "#12345  Aberto          -       Assunto com acentuação",
+                "#9      Suspenso",
+            ]
+        );
+        assert!(render_table(&[], ALIGNED).is_empty());
+        // Accents count as one column, composed or not; a separate mark takes none.
+        let accents = vec![
+            row(&["ação", "x"]),
+            row(&["a\u{303}cao", "y"]),
+            row(&["acao", "z"]),
+        ];
+        let lines = render_table(&accents, ALIGNED);
+        assert!(lines
+            .iter()
+            .all(|line| line.chars().filter(|c| *c != '\u{303}').count() == 7));
+    }
+
+    #[test]
+    fn colors_and_links_wrap_the_text_without_changing_the_widths() {
+        let rows = vec![
+            vec![
+                Cell::colored("#7", "36").linked("https://suap.example/chamado/7/"),
+                Cell::colored("Aberto", "32"),
+                Cell::plain("fim"),
+            ],
+            vec![
+                Cell::plain("#123"),
+                Cell::plain("Em atendimento"),
+                Cell::plain("fim"),
+            ],
+        ];
+        let lines = render_table(&rows, COLORED);
+        assert_eq!(
+            lines[0],
+            "\x1b]8;;https://suap.example/chamado/7/\x1b\\\x1b[36m#7\x1b[0m\x1b]8;;\x1b\\    \
+             \x1b[32mAberto\x1b[0m          fim"
+        );
+        assert_eq!(lines[1], "#123  Em atendimento  fim");
+        // Without colors the same cells print as plain text.
+        assert_eq!(render_table(&rows, ALIGNED)[0], "#7    Aberto          fim");
+        assert_eq!(render_table(&rows, Style::PLAIN)[0], "#7\tAberto\tfim");
+    }
+
+    #[test]
+    fn control_characters_from_suap_never_reach_the_terminal() {
+        let hostile = Cell::plain("ok\x1b[2J\tx\ny\u{7}");
+        assert_eq!(hostile.text, "ok [2J x y ");
+        let link = Cell::plain("a").linked("https://x/\x1b]0;título\x07");
+        let rows = vec![vec![link, hostile]];
+        let line = &render_table(&rows, COLORED)[0];
+        assert!(
+            !line.contains("\x07") && !line.contains("\x1b[2J"),
+            "{line:?}"
+        );
+    }
+
+    #[test]
+    fn each_situation_has_its_color() {
+        for (status, code) in [
+            ("Aberto", "32"),
+            ("Em atendimento", "34"),
+            ("Suspenso", "33"),
+            ("Resolvido", "92"),
+            ("Fechado", "90"),
+            ("Cancelado", "31"),
+            ("Reaberto", "91"),
+            ("Outra", "0"),
+        ] {
+            assert_eq!(status_color(status), code, "{status}");
+        }
+    }
 
     #[test]
     fn timestamps_are_utc_dates() {

@@ -4,6 +4,8 @@
 
 mod render;
 
+use render::{Cell, ColorMode, Style};
+
 use std::{
     error::Error,
     ffi::OsString,
@@ -41,6 +43,10 @@ struct Cli {
     /// Perfil (ambiente) a usar; cada perfil tem sua configuração e sua sessão.
     #[arg(long, global = true, default_value = DEFAULT_PROFILE)]
     profile: String,
+    /// Tabelas (`list`, `profile list`) alinhadas, coloridas e com links: `auto` (só em terminal e sem
+    /// `NO_COLOR`), `always` (mesmo em pipe) ou `never` (texto com tabulação, para scripts).
+    #[arg(long, global = true, value_enum, default_value_t = ColorMode::Auto)]
+    color: ColorMode,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -598,6 +604,11 @@ pub trait Prompt {
     fn line(&mut self, label: &str) -> std::io::Result<String>;
     /// Asks for a secret, without echoing it.
     fn secret(&mut self, label: &str) -> std::io::Result<String>;
+    /// Whether standard output is a terminal that understands ANSI escape sequences (colors and
+    /// hyperlinks). Only the real console knows; the default is no.
+    fn styled_output(&self) -> bool {
+        false
+    }
 }
 
 /// The prompt used when there is no interactive terminal: every question fails.
@@ -733,6 +744,8 @@ fn dispatch(
     prompt: &mut dyn Prompt,
     out: &mut dyn Write,
 ) -> Result<(), Box<dyn Error>> {
+    let no_color = !std::env::var("NO_COLOR").unwrap_or_default().is_empty();
+    let style = render::resolve_style(cli.color, prompt.styled_output(), no_color);
     match cli.command {
         Some(Command::Paths) => show_paths(paths, out),
         Some(Command::Profile { command }) => match command {
@@ -740,11 +753,11 @@ fn dispatch(
             ProfileCommand::Update(args) => profile_update(paths, args, out),
             ProfileCommand::Remove { name, yes } => profile_remove(paths, &name, yes, out),
             ProfileCommand::Show { name, json } => profile_show(paths, name.as_deref(), json, out),
-            ProfileCommand::List { json } => profile_list(paths, json, out),
+            ProfileCommand::List { json } => profile_list(paths, json, style, out),
         },
         Some(Command::SessionStatus) => session_status(paths, out),
         Some(Command::Login { username }) => login(paths, username, password, out),
-        Some(Command::List(args)) => list(paths, *args, out),
+        Some(Command::List(args)) => list(paths, *args, style, out),
         Some(Command::Show { id, json }) => show(paths, id, json, out),
         Some(Command::Watch(args)) => watch(paths, &args, out),
         Some(Command::Open(args)) => open(paths, args, input, out),
@@ -897,7 +910,12 @@ fn missing_profile(name: &str) -> Box<dyn Error> {
     format!("o perfil {name:?} não existe: crie-o com `chamados profile init {name}`").into()
 }
 
-fn profile_list(paths: &AppPaths, json: bool, out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
+fn profile_list(
+    paths: &AppPaths,
+    json: bool,
+    style: Style,
+    out: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
     let profiles = list_profiles(paths)?;
     if json {
         let profiles = render::profiles_json(&profiles, DEFAULT_PROFILE);
@@ -907,14 +925,23 @@ fn profile_list(paths: &AppPaths, json: bool, out: &mut dyn Write) -> Result<(),
     if profiles.is_empty() {
         writeln!(out, "{NO_PROFILES_HINT}")?;
     }
-    for (name, config) in profiles {
-        let marker = if name == DEFAULT_PROFILE {
-            "\t(padrão)"
-        } else {
-            ""
-        };
-        let username = config.username.as_deref().unwrap_or("-");
-        writeln!(out, "{name}\t{}\t{username}{marker}", config.base_url)?;
+    let rows: Vec<Vec<Cell>> = profiles
+        .iter()
+        .map(|(name, config)| {
+            let username = config.username.as_deref().unwrap_or("-");
+            let mut row = vec![
+                Cell::colored(name, "36"),
+                Cell::plain(config.base_url.as_str()),
+                Cell::colored(username, "35"),
+            ];
+            if name == DEFAULT_PROFILE {
+                row.push(Cell::colored("(padrão)", "90"));
+            }
+            row
+        })
+        .collect();
+    for line in render::render_table(&rows, style) {
+        writeln!(out, "{line}")?;
     }
     Ok(())
 }
@@ -1071,7 +1098,12 @@ fn login(
     Ok(())
 }
 
-fn list(paths: &AppPaths, args: ListArgs, out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
+fn list(
+    paths: &AppPaths,
+    args: ListArgs,
+    style: Style,
+    out: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
     let config = profile_config(paths)?;
     let queue = match (args.meus, args.a_fechar) {
         (true, _) => TicketQueue::Mine,
@@ -1126,11 +1158,29 @@ fn list(paths: &AppPaths, args: ListArgs, out: &mut dyn Write) -> Result<(), Box
     if tickets.is_empty() {
         writeln!(out, "Nenhum chamado encontrado.")?;
     }
-    for ticket in tickets {
-        let status = ticket.status.as_deref().unwrap_or("-");
-        let subject = ticket.subject.as_deref().unwrap_or("-");
-        let title = titles.get(&ticket.id).unwrap_or("-");
-        writeln!(out, "#{}\t{status}\t{title}\t{subject}", ticket.id)?;
+    // A missing value is a dim "-"; the id links to the ticket's page where hyperlinks are used.
+    let or_dash = |value: Option<&str>, color: &'static str| match value {
+        Some(text) => Cell::colored(text, color),
+        None => Cell::colored("-", "90"),
+    };
+    let rows: Vec<Vec<Cell>> = tickets
+        .iter()
+        .map(|ticket| {
+            let status = ticket.status.as_deref();
+            let status_cell = or_dash(status, status.map_or("90", render::status_color));
+            vec![
+                Cell::colored(&format!("#{}", ticket.id), "36").linked(&ticket.details_url),
+                status_cell,
+                or_dash(titles.get(&ticket.id), "35"),
+                ticket
+                    .subject
+                    .as_deref()
+                    .map_or_else(|| or_dash(None, "90"), Cell::plain),
+            ]
+        })
+        .collect();
+    for line in render::render_table(&rows, style) {
+        writeln!(out, "{line}")?;
     }
     Ok(())
 }
@@ -4362,6 +4412,117 @@ mod tests {
             .filter(|r| r.url.path().starts_with("/centralservicos/chamado/"))
             .count();
         assert_eq!(tickets, 1, "the other tickets were not tried");
+    }
+
+    /// A console whose standard output is a terminal that understands ANSI.
+    struct AnsiTerminal;
+
+    impl Prompt for AnsiTerminal {
+        fn line(&mut self, _label: &str) -> std::io::Result<String> {
+            Err(std::io::Error::other("no interactive terminal"))
+        }
+
+        fn secret(&mut self, _label: &str) -> std::io::Result<String> {
+            Err(std::io::Error::other("no interactive terminal"))
+        }
+
+        fn styled_output(&self) -> bool {
+            true
+        }
+    }
+
+    fn run_on_terminal(args: &[&str], paths: &AppPaths) -> (i32, String) {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run(
+            std::iter::once("chamados").chain(args.iter().copied()),
+            paths,
+            None,
+            &mut std::io::empty(),
+            &mut AnsiTerminal,
+            &mut out,
+            &mut err,
+        );
+        (code, String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn list_and_profile_list_are_aligned_colored_and_linked_on_a_terminal() {
+        let mut console = AnsiTerminal;
+        assert!(console.line("?").is_err() && console.secret("?").is_err());
+        let (_dir, paths) = paths();
+        let (runtime, server) = bare_server();
+        run_args(
+            &[
+                "profile",
+                "init",
+                "--base-url",
+                &server.uri(),
+                "--username",
+                "ana",
+            ],
+            &paths,
+        );
+        run_args(&["profile", "init", "outro"], &paths);
+        let listing = r#"<div class="general-box"><span class="status">Em atendimento</span>
+            <h4><a href="/centralservicos/chamado/7/">REQ #7 <strong>Ação urgente</strong></a></h4></div>
+            <div class="general-box"><span class="status">Aberto</span>
+            <h4><a href="/centralservicos/chamado/12345/">REQ #12345</a></h4></div>"#;
+        mount_text(
+            &runtime,
+            &server,
+            "GET",
+            "/centralservicos/listar_chamados_suporte/",
+            ResponseTemplate::new(200).set_body_string(listing),
+        );
+        run_args(&["title", "7", "Meu título"], &paths);
+        let url = |id: &str| format!("{}/centralservicos/chamado/{id}/", server.uri());
+
+        // Not a terminal (a pipe, a file): the tab-separated text scripts rely on, even if asked for nothing.
+        let tsv = "#7\tEm atendimento\tMeu título\tAção urgente\n#12345\tAberto\t-\t-\n";
+        assert_eq!(run_args(&["list"], &paths).1, tsv);
+        assert_eq!(run_args(&["list", "--color", "never"], &paths).1, tsv);
+        assert_eq!(run_args(&["list", "--color", "auto"], &paths).1, tsv);
+        assert_eq!(
+            run_on_terminal(&["list", "--color", "never"], &paths).1,
+            tsv
+        );
+
+        // On a terminal: aligned by the characters shown (the accents), colored, with the id linked.
+        let (code, out) = run_on_terminal(&["list"], &paths);
+        assert_eq!(code, 0);
+        let first = format!(
+            "\x1b]8;;{}\x1b\\\x1b[36m#7\x1b[0m\x1b]8;;\x1b\\      \x1b[34mEm atendimento\x1b[0m  \x1b[35mMeu título\x1b[0m  Ação urgente",
+            url("7")
+        );
+        let second = format!(
+            "\x1b]8;;{}\x1b\\\x1b[36m#12345\x1b[0m\x1b]8;;\x1b\\  \x1b[32mAberto\x1b[0m          \x1b[90m-\x1b[0m           \x1b[90m-\x1b[0m",
+            url("12345")
+        );
+        assert_eq!(out, format!("{first}\n{second}\n"));
+
+        // --color always does the same in a pipe; NO_COLOR-style "aligned only" is covered by the unit tests.
+        let piped = run_args(&["list", "--color", "always"], &paths).1;
+        assert_eq!(piped, out);
+        // JSON is never styled.
+        let (_, json) = run_on_terminal(&["list", "--json"], &paths);
+        assert!(json.starts_with("[{") && !json.contains('\x1b'), "{json}");
+        let (_, empty) = run_on_terminal(&["list", "--titulo", "nada"], &paths);
+        assert_eq!(empty, "Nenhum chamado encontrado.\n");
+
+        // profile list: the "(padrão)" marker is a column of its own.
+        let (_, plain, _) = run_args(&["profile", "list"], &paths);
+        assert!(
+            plain.lines().next().unwrap().starts_with("default\t"),
+            "{plain}"
+        );
+        let (_, styled) = run_on_terminal(&["profile", "list"], &paths);
+        let lines: Vec<&str> = styled.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[0].starts_with("\x1b[36mdefault\x1b[0m  ")
+                && lines[0].contains("\x1b[90m(padrão)\x1b[0m")
+        );
+        assert!(lines[1].starts_with("\x1b[36moutro\x1b[0m    ") && !lines[1].contains("padrão"));
     }
 
     #[test]
