@@ -93,6 +93,14 @@ impl AppPaths {
         self.data_dir.join(format!("titles-{}.json", self.profile))
     }
 
+    /// What `chamados watch` last saw, per profile (`watch.json`, else `watch-<profile>.json`).
+    pub fn watch_file(&self) -> PathBuf {
+        if self.profile == DEFAULT_PROFILE {
+            return self.data_dir.join("watch.json");
+        }
+        self.data_dir.join(format!("watch-{}.json", self.profile))
+    }
+
     /// Lock file that keeps two `chamados sync` runs from overlapping.
     pub fn sync_lock_file(&self) -> PathBuf {
         self.data_dir.join("sync.lock")
@@ -718,6 +726,8 @@ mod tests {
             .ends_with("session-local-1.cookies"));
         assert!(default_paths.titles_file().ends_with("titles.json"));
         assert!(local_paths.titles_file().ends_with("titles-local-1.json"));
+        assert!(default_paths.watch_file().ends_with("watch.json"));
+        assert!(local_paths.watch_file().ends_with("watch-local-1.json"));
 
         let local = SuapConfig {
             base_url: Url::parse("http://localhost:8000/").unwrap(),
