@@ -12,6 +12,8 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive"] }
 chamados-core = { path = "../chamados-core" }
 chamados-sync = { path = "../chamados-sync" }
+# Reads a secret from the terminal without echoing it (credentials prompt).
+rpassword = "7"
 suap-core = { path = "../suap-core" }
 tokio = { version = "1", features = ["rt"] }
 
