@@ -183,16 +183,19 @@ No `resolve`:
 - `--also <id>` (repetível) resolve outros chamados junto com este.
 - `--standard-reply <id>` usa uma resposta padrão.
 
-### Assumir, colocar em atendimento e cancelar
+### Assumir, colocar em atendimento, cancelar, reabrir e fechar
 
 ```bash
 chamados assume 559298                  # atribui o chamado a você
 chamados start 559298                   # situação "Em atendimento"
 chamados start 559298 --assume          # assume e coloca em atendimento, de uma vez
 chamados cancel 559298 --yes -m "Aberto por engano."
+chamados reopen 559298 -m "O erro voltou."      # chamado Resolvido -> Reaberto
+chamados close 559298 --nota 5 -m "Atendimento excelente."   # Resolvido -> Fechado, avaliando
+chamados list --a-fechar                        # os resolvidos que você pode fechar
 ```
 
-São as mesmas ações do `open --assume` / `open --start`, agora para chamados que já existem. O SUAP só deixa colocar em atendimento quem já assumiu o chamado; sem `--assume`, a recusa dele é mostrada. O `cancel` **não pode ser desfeito**, por isso exige `--yes`; o motivo segue o padrão dos demais textos (várias linhas; `-m`, `-m -` ou entrada padrão) e o SUAP só cancela chamados abertos, reabertos, em atendimento ou suspensos, a pedido do requisitante, do interessado ou de um atendente.
+São as mesmas ações do `open --assume` / `open --start`, agora para chamados que já existem. O SUAP só deixa colocar em atendimento quem já assumiu o chamado; sem `--assume`, a recusa dele é mostrada. O `reopen` e o `close` só valem para chamados **Resolvidos**, a pedido do requisitante, do interessado ou do responsável pelo grupo de atendimento; o motivo do `reopen` é obrigatório (mesmo padrão dos demais textos). No `close`, `--nota` (1 a 5) e o comentário são a **avaliação do atendimento** e só valem quando quem fecha é o **interessado** (para os demais o SUAP ignora os dois); ambos são opcionais, e o comentário só lê a entrada padrão com `-m -` (omitido, fecha sem comentário). O `list --a-fechar` aceita só `--pagina`/`--todas-paginas`. O `cancel` **não pode ser desfeito**, por isso exige `--yes`; o motivo segue o padrão dos demais textos (várias linhas; `-m`, `-m -` ou entrada padrão) e o SUAP só cancela chamados abertos, reabertos, em atendimento ou suspensos, a pedido do requisitante, do interessado ou de um atendente.
 
 ### Baixar anexos
 

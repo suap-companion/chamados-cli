@@ -102,6 +102,19 @@ enum Command {
         #[arg(long)]
         assume: bool,
     },
+    /// Reabre um chamado resolvido (situação "Reaberto"), com o motivo.
+    Reopen(MessageArgs),
+    /// Fecha um chamado resolvido (situação "Fechado"); o interessado pode avaliar o atendimento.
+    Close {
+        /// Número do chamado.
+        id: u64,
+        /// Nota do atendimento, de 1 a 5 (só vale quando quem fecha é o interessado).
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
+        nota: Option<u8>,
+        /// Comentário sobre a avaliação (várias linhas). Com `-`, lê a entrada padrão; omitido, fecha sem comentário.
+        #[arg(long, short = 'm')]
+        message: Option<String>,
+    },
     /// Cancela um chamado (situação "Cancelado"), com o motivo. Não pode ser desfeito.
     Cancel {
         #[command(flatten)]
@@ -324,6 +337,9 @@ struct ListArgs {
     /// Lista os "Meus chamados" ativos em vez da fila de suporte.
     #[arg(long)]
     meus: bool,
+    /// Lista os chamados resolvidos que você pode fechar (só aceita --pagina e --todas-paginas).
+    #[arg(long, conflicts_with = "meus")]
+    a_fechar: bool,
     /// Só este número de chamado.
     #[arg(long)]
     id: Option<u64>,
@@ -591,6 +607,8 @@ fn dispatch(
             saida,
             force,
         }) => download(paths, id, &anexo, saida, force, out),
+        Some(Command::Reopen(args)) => reopen(paths, args, input, out),
+        Some(Command::Close { id, nota, message }) => close(paths, id, nota, message, input, out),
         Some(Command::Assume { id }) => assume(paths, id, out),
         Some(Command::Start { id, assume }) => start(paths, id, assume, out),
         Some(Command::Cancel { message, yes }) => cancel(paths, message, yes, input, out),
@@ -864,10 +882,10 @@ fn login(
 
 fn list(paths: &AppPaths, args: ListArgs, out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
     let config = profile_config(paths)?;
-    let queue = if args.meus {
-        TicketQueue::Mine
-    } else {
-        TicketQueue::Support
+    let queue = match (args.meus, args.a_fechar) {
+        (true, _) => TicketQueue::Mine,
+        (false, true) => TicketQueue::ToClose,
+        (false, false) => TicketQueue::Support,
     };
     let filter = TicketFilter {
         id: args.id,
@@ -1101,6 +1119,42 @@ fn download(
         let size = bytes.len();
         writeln!(out, "Anexo {number}: {} ({size} bytes)", target.display())?;
     }
+    Ok(())
+}
+
+fn reopen(
+    paths: &AppPaths,
+    args: MessageArgs,
+    input: &mut dyn Read,
+    out: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    let text = read_text(args.message, input)?;
+    let (runtime, client) = connect(paths)?;
+    let source = SuapTicketSource::new(&client, TicketQueue::Support);
+    let id = args.id.to_string();
+    runtime
+        .block_on(source.reopen_ticket(&id, &text))
+        .map_err(explain)?;
+    writeln!(out, "Chamado #{id} reaberto.")?;
+    Ok(())
+}
+
+fn close(
+    paths: &AppPaths,
+    id: u64,
+    rating: Option<u8>,
+    message: Option<String>,
+    input: &mut dyn Read,
+    out: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    let comment = read_optional_text(message, input)?;
+    let (runtime, client) = connect(paths)?;
+    let source = SuapTicketSource::new(&client, TicketQueue::Support);
+    let id = id.to_string();
+    runtime
+        .block_on(source.close_ticket(&id, rating, comment.as_deref()))
+        .map_err(explain)?;
+    writeln!(out, "Chamado #{id} fechado.")?;
     Ok(())
 }
 
@@ -1538,10 +1592,9 @@ fn title(
     Ok(())
 }
 
-/// Text given as an option value, or read from `input` when the value is `-` or missing.
-///
-/// Newlines inside the text are kept (multi-line); only the trailing line break is removed.
-fn read_text(value: Option<String>, input: &mut dyn Read) -> Result<String, Box<dyn Error>> {
+/// Text given as an option value, or read from `input` when the value is `-` or missing, without
+/// the trailing line break (newlines inside the text are kept: multi-line).
+fn raw_text(value: Option<String>, input: &mut dyn Read) -> Result<String, Box<dyn Error>> {
     let text = match value {
         Some(text) if text != "-" => text,
         _ => {
@@ -1550,7 +1603,27 @@ fn read_text(value: Option<String>, input: &mut dyn Read) -> Result<String, Box<
             piped
         }
     };
-    let text = text.trim_end_matches(['\r', '\n']).to_owned();
+    Ok(text.trim_end_matches(['\r', '\n']).to_owned())
+}
+
+/// Like [`read_text`], but the text is optional: when omitted there is none (standard input is not
+/// read, so a script that leaves it open never hangs); `-` reads it, and blank text means "none".
+fn read_optional_text(
+    value: Option<String>,
+    input: &mut dyn Read,
+) -> Result<Option<String>, Box<dyn Error>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let text = raw_text(Some(value), input)?;
+    Ok((!text.trim().is_empty()).then_some(text))
+}
+
+/// Text given as an option value, or read from `input` when the value is `-` or missing.
+///
+/// Newlines inside the text are kept (multi-line); only the trailing line break is removed.
+fn read_text(value: Option<String>, input: &mut dyn Read) -> Result<String, Box<dyn Error>> {
+    let text = raw_text(value, input)?;
     if text.trim().is_empty() {
         return Err(
             "texto não informado: passe o valor na opção, use `-` ou envie pela entrada padrão"
@@ -2854,7 +2927,7 @@ mod tests {
 
     /// Commands that take free text, with the option that carries it, the form field SUAP receives
     /// it in and the path it is posted to. Each must satisfy requirement RS-02.
-    const TEXT_COMMANDS: [(&[&str], &str, &str, &str); 6] = [
+    const TEXT_COMMANDS: [(&[&str], &str, &str, &str); 7] = [
         (
             &["open"],
             "-d",
@@ -2891,7 +2964,22 @@ mod tests {
             "observacao",
             "/centralservicos/cancelar_chamado/5/",
         ),
+        (
+            &["reopen", "5"],
+            "-m",
+            "observacao",
+            "/centralservicos/reabrir_chamado/5/",
+        ),
     ];
+
+    /// Commands whose text is optional: the same multi-line and `-` (standard input) rules apply, but
+    /// omitted or blank text means "no text" instead of an error.
+    const OPTIONAL_TEXT_COMMANDS: [(&[&str], &str, &str, &str); 1] = [(
+        &["close", "5"],
+        "-m",
+        "comentario",
+        "/centralservicos/fechar_chamado/5/",
+    )];
 
     /// Commands without free text. A new command must be added to one of the two lists, which forces
     /// a decision about RS-02 (and a test for it) whenever a command is created.
@@ -2913,6 +3001,7 @@ mod tests {
     #[test]
     fn every_command_is_classified_for_the_text_input_requirement() {
         let mut declared: Vec<&str> = TEXT_COMMANDS.iter().map(|command| command.0[0]).collect();
+        declared.extend(OPTIONAL_TEXT_COMMANDS.iter().map(|command| command.0[0]));
         declared.extend(NON_TEXT_COMMANDS);
         declared.sort_unstable();
         let command = Cli::command();
@@ -2941,12 +3030,16 @@ mod tests {
         );
         get("/centralservicos/resolver_chamado/5/", &field("comentario"));
         get("/centralservicos/cancelar_chamado/5/", &field("observacao"));
+        get("/centralservicos/reabrir_chamado/5/", &field("observacao"));
+        get("/centralservicos/fechar_chamado/5/", &field("comentario"));
         for path in [
             "/centralservicos/adicionar_comentario/5/",
             "/centralservicos/adicionar_nota_interna/5/",
             "/centralservicos/suspender_chamado/5/",
             "/centralservicos/resolver_chamado/5/",
             "/centralservicos/cancelar_chamado/5/",
+            "/centralservicos/reabrir_chamado/5/",
+            "/centralservicos/fechar_chamado/5/",
         ] {
             let accepted = ResponseTemplate::new(200).set_body_string("ok");
             mount_text(&runtime, &server, "POST", path, accepted);
@@ -2998,6 +3091,95 @@ mod tests {
                 "{command:?}"
             );
         }
+    }
+
+    #[test]
+    fn rs02_optional_texts_follow_the_same_rules_and_may_be_blank() {
+        let (_dir, paths, runtime, server) = text_requirement_setup();
+        for (command, flag, field, post_path) in OPTIONAL_TEXT_COMMANDS {
+            let expected = format!("{field}=linha+1%0Alinha+2");
+            let with_flag = |value: &'static str| [command, &[flag, value]].concat();
+            let (code, _, err) = run_args(&with_flag("linha 1\nlinha 2"), &paths);
+            assert_eq!((code, err.as_str()), (0, ""), "{command:?} option");
+            let (code, _, err) = run_with_input(&with_flag("-"), &paths, "linha 1\nlinha 2\n");
+            assert_eq!((code, err.as_str()), (0, ""), "{command:?} dash");
+            let posts = posts_to(&runtime, &server, post_path);
+            assert_eq!(posts.len(), 2, "{command:?}");
+            for body in &posts {
+                let encoded = body.split('&').any(|pair| pair == expected);
+                assert!(encoded, "{command:?} sent {body}");
+            }
+
+            // Omitted: there is no text, and standard input is left alone (never read).
+            let (code, _, err) = run_with_input(command, &paths, "linha 1\nlinha 2\r\n");
+            assert_eq!((code, err.as_str()), (0, ""), "{command:?} omitted");
+            // Blank text is not an error either: it is sent without the comment.
+            let (code, _, err) = run_with_input(&with_flag("-"), &paths, " \n");
+            assert_eq!((code, err.as_str()), (0, ""), "{command:?} blank");
+            let posts = posts_to(&runtime, &server, post_path);
+            assert_eq!(posts.len(), 4, "{command:?}");
+            let sent_text = |body: &String| body.contains(&format!("{field}=linha"));
+            assert!(!posts[2..].iter().any(sent_text));
+        }
+    }
+
+    #[test]
+    fn reopen_and_close_report_what_they_did() {
+        let (_dir, paths, runtime, server) = text_requirement_setup();
+        let (code, out, err) = run_args(&["reopen", "5", "-m", "ainda falha"], &paths);
+        assert_eq!(
+            (code, err.as_str(), out.as_str()),
+            (0, "", "Chamado #5 reaberto.\n")
+        );
+        let (code, out, err) = run_args(&["close", "5"], &paths);
+        assert_eq!(
+            (code, err.as_str(), out.as_str()),
+            (0, "", "Chamado #5 fechado.\n")
+        );
+        let (code, out, _) = run_args(&["close", "5", "--nota", "5", "-m", "obrigado"], &paths);
+        assert_eq!((code, out.as_str()), (0, "Chamado #5 fechado.\n"));
+        let posts = posts_to(&runtime, &server, "/centralservicos/fechar_chamado/5/");
+        assert!(!posts[0].contains("nota_avaliacao"), "{}", posts[0]);
+        assert!(posts[1].contains("nota_avaliacao=5") && posts[1].contains("comentario=obrigado"));
+
+        // The rating is checked by clap (1 to 5); SUAP's refusals are shown as they are.
+        for bad in ["0", "6", "x"] {
+            let (code, _, err) = run_args(&["close", "5", "--nota", bad], &paths);
+            assert_eq!(code, 2, "{bad}");
+            assert!(err.contains("--nota"), "{err}");
+        }
+        let (code, _, err) = run_args(&["close", "9"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("ticket 9 cannot be closed"), "{err}");
+        let (code, _, err) = run_args(&["reopen", "9", "-m", "x"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("ticket 9 cannot be reopened"), "{err}");
+    }
+
+    #[test]
+    fn list_can_show_the_tickets_the_user_may_close() {
+        let (_dir, paths) = paths();
+        let (runtime, server) = mock_server(true);
+        run_args(&["profile", "init", "--base-url", &server.uri()], &paths);
+        let html = r#"<div class="general-box"><span class="status">Resolvido</span>
+            <h4><a href="/centralservicos/chamado/7/">REQ #7 <strong>Pronto</strong></a></h4></div>"#;
+        mount_listing(
+            &runtime,
+            &server,
+            "/centralservicos/listar_chamados_a_fechar/",
+            ResponseTemplate::new(200).set_body_string(html),
+        );
+        let (code, out, err) = run_args(&["list", "--a-fechar"], &paths);
+        assert_eq!((code, err.as_str()), (0, ""));
+        assert_eq!(out, "#7\tResolvido\t-\tPronto\n");
+        let (code, _, err) = run_args(&["list", "--a-fechar", "--todas-paginas"], &paths);
+        assert_eq!((code, err.as_str()), (0, ""));
+        let (code, _, err) = run_args(&["list", "--a-fechar", "--busca", "x"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("only paging"), "{err}");
+        let (code, _, err) = run_args(&["list", "--a-fechar", "--meus"], &paths);
+        assert_eq!(code, 2);
+        assert!(err.contains("cannot be used"), "{err}");
     }
 
     /// Configures `paths` to sync to `cloud` with the key in `key_file`.
