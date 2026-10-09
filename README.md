@@ -2,6 +2,8 @@
 
 Cliente local para acompanhar chamados do SUAP, inicialmente como uma CLI em Rust e futuramente com aplicativo Android.
 
+> **Nota:** Este NÃO é um projeto oficial do IFRN, é um projeto pessoal.
+
 ## Arquitetura
 
 O projeto é um workspace Cargo com três crates:
