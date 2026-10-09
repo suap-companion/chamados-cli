@@ -94,6 +94,37 @@ cargo run -p chamados-cli -- list --meus    # "Meus chamados" ativos
 
 Se a sessão estiver ausente ou expirada, o comando orienta a executar `chamados login`.
 
+#### Filtros, busca e páginas
+
+Quem filtra é o próprio SUAP (os mesmos filtros do formulário da tela); só `--titulo` e `--limite` são aplicados aqui.
+
+```bash
+chamados list --busca moodle --status aberto --status atendimento
+chamados list --desde 2026-09-01 --ate 2026-09-30 --todos          # inclui resolvidos, fechados e cancelados
+chamados list --atribuidos mim --ordenar limite --sla-estourado
+chamados list --id 559298
+chamados list --titulo "plugin" --limite 10                          # filtra pelo título local
+chamados list --todas-paginas                                        # o SUAP mostra 15 por página
+chamados list --pagina 2
+chamados list --meus --todos --relacao interessado --desde 2026-01-01
+```
+
+| Opção | Vale para | O que faz |
+|-------|-----------|-----------|
+| `--id N` | os dois | só este chamado |
+| `--desde`/`--ate AAAA-MM-DD` | os dois | período de abertura |
+| `--busca TEXTO` | suporte | procura em descrições, comentários e notas internas |
+| `--status` (repetível), `--todos` | suporte; `--todos` também em `--meus` | situação: `aberto`, `atendimento`, `resolvido`, `fechado`, `reaberto`, `suspenso`, `cancelado`; sem elas o SUAP esconde os encerrados |
+| `--atribuidos` | suporte | `mim`, `outros`, `ninguem`, `mim-ou-ninguem`, `alguem` |
+| `--ordenar` (+ `--desc`) | suporte | `limite`, `interacao`, `abertura`, `situacao`, `servico`, `aberto-por`, `interessado` |
+| `--sla-estourado` | suporte | só com SLA estourado |
+| `--relacao` | `--meus` | `requisitante`, `interessado`, `outro`, `algum` |
+| `--pagina N` / `--todas-paginas` | os dois | uma página, ou todas (para quando uma página não traz nada novo; no máximo 200) |
+| `--titulo TEXTO` | os dois | só os que têm este texto no título local (sem diferenciar maiúsculas) |
+| `--limite N` | os dois | no máximo N linhas |
+
+Uma opção que não vale para a lista escolhida é recusada antes de qualquer requisição.
+
 ### Abrir um chamado
 
 Guarde os padrões no perfil uma vez e abra chamados só com a descrição:

@@ -8,8 +8,10 @@ use suap_core::{FormFile, SuapClient, SuapError};
 use thiserror::Error;
 use url::Url;
 
+pub mod filter;
 pub mod titles;
 
+pub use filter::{suap_date, TicketFilter, ASSIGNMENTS, MAX_PAGES, ORDERS, RELATIONS, STATUSES};
 pub use titles::{validate_title, TitleEntry, TitleStore, MAX_TITLE_CHARS};
 
 const TICKET_PATH_PREFIX: &str = "/centralservicos/chamado/";
@@ -155,6 +157,8 @@ impl TicketQueue {
 #[allow(async_fn_in_trait)]
 pub trait TicketSource {
     async fn list_tickets(&self) -> Result<Vec<RemoteTicket>, TicketError>;
+    /// Lists the tickets that match `filter` (the page it asks for, or every page).
+    async fn list_filtered(&self, filter: &TicketFilter) -> Result<Vec<RemoteTicket>, TicketError>;
     async fn get_ticket(&self, id: &str) -> Result<TicketDetails, TicketError>;
     /// Opens a new ticket and returns its id.
     async fn open_ticket(&self, ticket: &NewTicket) -> Result<String, TicketError>;
@@ -181,6 +185,18 @@ pub struct SuapTicketSource<'a> {
 impl<'a> SuapTicketSource<'a> {
     pub fn new(client: &'a SuapClient, queue: TicketQueue) -> Self {
         Self { client, queue }
+    }
+
+    async fn list_page(
+        &self,
+        filter: &TicketFilter,
+        page: u32,
+    ) -> Result<Vec<RemoteTicket>, TicketError> {
+        let html = self
+            .client
+            .fetch_page(&filter.path(self.queue, page)?)
+            .await?;
+        Ok(parse_ticket_list(&html, self.client.base_url()))
     }
 
     /// Loads the SUAP form behind a status change (the one containing `field`); returns its path,
@@ -316,6 +332,28 @@ impl TicketSource for SuapTicketSource<'_> {
     async fn list_tickets(&self) -> Result<Vec<RemoteTicket>, TicketError> {
         let html = self.client.fetch_page(self.queue.path()).await?;
         Ok(parse_ticket_list(&html, self.client.base_url()))
+    }
+
+    async fn list_filtered(&self, filter: &TicketFilter) -> Result<Vec<RemoteTicket>, TicketError> {
+        if !filter.all_pages {
+            return self.list_page(filter, filter.page.unwrap_or(1)).await;
+        }
+        // SUAP paginates; stop at the first page that brings nothing new (it repeats the last one
+        // when asked for a page that does not exist).
+        let mut seen = HashSet::new();
+        let mut tickets = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let before = tickets.len();
+            for ticket in self.list_page(filter, page).await? {
+                if seen.insert(ticket.id.clone()) {
+                    tickets.push(ticket);
+                }
+            }
+            if tickets.len() == before {
+                break;
+            }
+        }
+        Ok(tickets)
     }
 
     async fn get_ticket(&self, id: &str) -> Result<TicketDetails, TicketError> {
@@ -1939,6 +1977,69 @@ mod tests {
         let (_dir, client) = client_for(&server).await;
         let source = SuapTicketSource::new(&client, TicketQueue::Mine);
         assert_eq!(source.list_tickets().await.unwrap().len(), 2);
+    }
+
+    fn listing_of(ids: &[u32]) -> String {
+        let boxes: Vec<String> = ids
+            .iter()
+            .map(|id| {
+                format!(r#"<div class="general-box"><h4><a href="/centralservicos/chamado/{id}/">REQ #{id}</a></h4></div>"#)
+            })
+            .collect();
+        boxes.concat()
+    }
+
+    #[tokio::test]
+    async fn filtered_listings_send_the_options_and_follow_the_pages() {
+        let server = MockServer::start().await;
+        // The most specific mocks first: the first one that matches answers.
+        let pages = [
+            (Some("2"), vec![3]),
+            (Some("3"), vec![3]),
+            (None, vec![1, 2]),
+        ];
+        for (page, ids) in pages {
+            let mut mock = Mock::given(method("GET"))
+                .and(path("/centralservicos/listar_chamados_suporte/"))
+                .and(query_param("status", "1"))
+                .and(query_param("texto", "moodle"));
+            mock = match page {
+                Some(page) => mock.and(query_param("page", page)),
+                None => mock,
+            };
+            mock.respond_with(ResponseTemplate::new(200).set_body_string(listing_of(&ids)))
+                .mount(&server)
+                .await;
+        }
+        let (_dir, client) = client_for(&server).await;
+        let source = SuapTicketSource::new(&client, TicketQueue::Support);
+        let ids = |tickets: Vec<RemoteTicket>| -> Vec<String> {
+            tickets.into_iter().map(|ticket| ticket.id).collect()
+        };
+        let mut filter = TicketFilter {
+            statuses: vec!["aberto".to_owned()],
+            text: Some("moodle".to_owned()),
+            ..TicketFilter::default()
+        };
+        // One page: the first by default, or the one asked for.
+        assert_eq!(
+            ids(source.list_filtered(&filter).await.unwrap()),
+            ["1", "2"]
+        );
+        filter.page = Some(2);
+        assert_eq!(ids(source.list_filtered(&filter).await.unwrap()), ["3"]);
+        // Every page, stopping when a page brings nothing new.
+        filter.all_pages = true;
+        assert_eq!(
+            ids(source.list_filtered(&filter).await.unwrap()),
+            ["1", "2", "3"]
+        );
+        // A filter SUAP cannot take is refused before any request.
+        let wrong = TicketFilter {
+            relation: Some("algum".to_owned()),
+            ..TicketFilter::default()
+        };
+        assert!(source.list_filtered(&wrong).await.is_err());
     }
 
     #[tokio::test]
