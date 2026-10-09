@@ -12,9 +12,9 @@ use std::{
 };
 
 use chamados_core::{
-    validate_title, Attachment, Message, NewTicket, Resolution, SuapTicketSource, TicketDetails,
-    TicketError, TicketFilter, TicketQueue, TicketSource, TitleStore, ASSIGNMENTS, ORDERS,
-    RELATIONS, STATUSES,
+    validate_title, Attachment, Direction, Message, NewTicket, Reclassification, Resolution,
+    SuapTicketSource, TicketDetails, TicketError, TicketFilter, TicketQueue, TicketSource,
+    TitleStore, ASSIGNMENTS, ORDERS, RELATIONS, STATUSES,
 };
 use chamados_sync::{
     backend_from, key_exists, key_source_from, load_key, record_removal, store_key, sync_once,
@@ -101,6 +101,42 @@ enum Command {
         /// Assume o chamado antes, se ele ainda não for seu.
         #[arg(long)]
         assume: bool,
+    },
+    /// Passa o chamado para outro atendente do mesmo grupo de atendimento.
+    Assign {
+        /// Número do chamado.
+        id: u64,
+        /// Quem recebe: matrícula, nome (ou parte dele) ou o id que o SUAP oferece.
+        #[arg(long)]
+        para: String,
+    },
+    /// Escala o chamado para o grupo de atendimento acima, com uma nota interna.
+    Escalate(HandoffArgs),
+    /// Devolve o chamado ao grupo de atendimento abaixo, com uma nota interna.
+    Return(HandoffArgs),
+    /// Troca o serviço, o campus ou o centro de atendimento do chamado, com a justificativa.
+    Reclassify {
+        #[command(flatten)]
+        message: MessageArgs,
+        /// Novo serviço (id do serviço no SUAP).
+        #[arg(long)]
+        servico: Option<String>,
+        /// Novo campus (id da unidade organizacional).
+        #[arg(long)]
+        campus: Option<String>,
+        /// Novo centro de atendimento (id); por padrão, mantém o atual se o SUAP ainda o oferece.
+        #[arg(long)]
+        centro: Option<String>,
+    },
+    /// Adiciona ou remove tags de um chamado.
+    Tag {
+        #[command(subcommand)]
+        command: TagCommand,
+    },
+    /// Adiciona ou remove outros interessados de um chamado.
+    Interested {
+        #[command(subcommand)]
+        command: InterestedCommand,
     },
     /// Reabre um chamado resolvido (situação "Reaberto"), com o motivo.
     Reopen(MessageArgs),
@@ -388,6 +424,55 @@ struct ListArgs {
 }
 
 #[derive(Debug, Args)]
+struct HandoffArgs {
+    #[command(flatten)]
+    message: MessageArgs,
+    /// Já atribui a este atendente do outro grupo (matrícula, nome ou id); sem a opção, o chamado fica sem atendente.
+    #[arg(long)]
+    para: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum TagCommand {
+    /// Adiciona tags ao chamado.
+    Add {
+        /// Número do chamado.
+        id: u64,
+        /// Tags: nome (ou parte dele) ou id, como o SUAP as oferece.
+        #[arg(required = true)]
+        tags: Vec<String>,
+    },
+    /// Remove tags do chamado.
+    Remove {
+        /// Número do chamado.
+        id: u64,
+        /// Tags que o chamado tem: nome (ou parte dele) ou id.
+        #[arg(required = true)]
+        tags: Vec<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum InterestedCommand {
+    /// Adiciona outros interessados ao chamado.
+    Add {
+        /// Número do chamado.
+        id: u64,
+        /// Pessoas: matrícula ou nome, como a busca do SUAP as encontra.
+        #[arg(required = true)]
+        people: Vec<String>,
+    },
+    /// Remove outros interessados do chamado.
+    Remove {
+        /// Número do chamado.
+        id: u64,
+        /// Pessoas que já são interessadas: matrícula, nome (ou parte dele) ou id do usuário.
+        #[arg(required = true)]
+        people: Vec<String>,
+    },
+}
+
+#[derive(Debug, Args)]
 struct ResolveArgs {
     #[command(flatten)]
     message: MessageArgs,
@@ -607,6 +692,24 @@ fn dispatch(
             saida,
             force,
         }) => download(paths, id, &anexo, saida, force, out),
+        Some(Command::Assign { id, para }) => assign(paths, id, &para, out),
+        Some(Command::Escalate(args)) => hand_off(paths, args, Direction::Escalate, input, out),
+        Some(Command::Return(args)) => hand_off(paths, args, Direction::Return, input, out),
+        Some(Command::Reclassify {
+            message,
+            servico,
+            campus,
+            centro,
+        }) => {
+            let change = Reclassification {
+                service: servico,
+                campus,
+                center: centro,
+            };
+            reclassify(paths, message, &change, input, out)
+        }
+        Some(Command::Tag { command }) => tag(paths, command, out),
+        Some(Command::Interested { command }) => interested(paths, command, out),
         Some(Command::Reopen(args)) => reopen(paths, args, input, out),
         Some(Command::Close { id, nota, message }) => close(paths, id, nota, message, input, out),
         Some(Command::Assume { id }) => assume(paths, id, out),
@@ -1119,6 +1222,103 @@ fn download(
         let size = bytes.len();
         writeln!(out, "Anexo {number}: {} ({size} bytes)", target.display())?;
     }
+    Ok(())
+}
+
+fn assign(paths: &AppPaths, id: u64, to: &str, out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
+    let (runtime, client) = connect(paths)?;
+    let source = SuapTicketSource::new(&client, TicketQueue::Support);
+    let id = id.to_string();
+    let who = runtime
+        .block_on(source.assign_ticket(&id, to))
+        .map_err(explain)?;
+    writeln!(out, "Chamado #{id} atribuído a {who}.")?;
+    Ok(())
+}
+
+fn hand_off(
+    paths: &AppPaths,
+    args: HandoffArgs,
+    direction: Direction,
+    input: &mut dyn Read,
+    out: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    let text = read_text(args.message.message, input)?;
+    let (runtime, client) = connect(paths)?;
+    let source = SuapTicketSource::new(&client, TicketQueue::Support);
+    let id = args.message.id.to_string();
+    runtime
+        .block_on(source.move_ticket(&id, direction, &text, args.para.as_deref()))
+        .map_err(explain)?;
+    let done = match direction {
+        Direction::Escalate => "escalado para o grupo acima",
+        Direction::Return => "devolvido ao grupo abaixo",
+    };
+    writeln!(out, "Chamado #{id} {done}.")?;
+    Ok(())
+}
+
+fn reclassify(
+    paths: &AppPaths,
+    args: MessageArgs,
+    change: &Reclassification,
+    input: &mut dyn Read,
+    out: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    let text = read_text(args.message, input)?;
+    let (runtime, client) = connect(paths)?;
+    let source = SuapTicketSource::new(&client, TicketQueue::Support);
+    let id = args.id.to_string();
+    runtime
+        .block_on(source.reclassify_ticket(&id, change, &text))
+        .map_err(explain)?;
+    writeln!(out, "Chamado #{id} reclassificado.")?;
+    Ok(())
+}
+
+fn tag(paths: &AppPaths, command: TagCommand, out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
+    let (runtime, client) = connect(paths)?;
+    let source = SuapTicketSource::new(&client, TicketQueue::Support);
+    let (id, names, done) = match command {
+        TagCommand::Add { id, tags } => {
+            let id = id.to_string();
+            let names = runtime.block_on(source.add_tags(&id, &tags));
+            (id, names.map_err(explain)?, "adicionadas")
+        }
+        TagCommand::Remove { id, tags } => {
+            let id = id.to_string();
+            let names = runtime.block_on(source.remove_tags(&id, &tags));
+            (id, names.map_err(explain)?, "removidas")
+        }
+    };
+    writeln!(out, "Chamado #{id}: tags {done}: {}.", names.join(", "))?;
+    Ok(())
+}
+
+fn interested(
+    paths: &AppPaths,
+    command: InterestedCommand,
+    out: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    let (runtime, client) = connect(paths)?;
+    let source = SuapTicketSource::new(&client, TicketQueue::Support);
+    let (id, names, done) = match command {
+        InterestedCommand::Add { id, people } => {
+            let id = id.to_string();
+            let names = runtime.block_on(source.add_interested(&id, &people));
+            (id, names.map_err(explain)?, "adicionados")
+        }
+        InterestedCommand::Remove { id, people } => {
+            let id = id.to_string();
+            let names = runtime.block_on(source.remove_interested(&id, &people));
+            (id, names.map_err(explain)?, "removidos")
+        }
+    };
+    let message = format!(
+        "Chamado #{id}: outros interessados {done}: {}.",
+        names.join(", ")
+    );
+    writeln!(out, "{message}")?;
     Ok(())
 }
 
@@ -2927,7 +3127,7 @@ mod tests {
 
     /// Commands that take free text, with the option that carries it, the form field SUAP receives
     /// it in and the path it is posted to. Each must satisfy requirement RS-02.
-    const TEXT_COMMANDS: [(&[&str], &str, &str, &str); 7] = [
+    const TEXT_COMMANDS: [(&[&str], &str, &str, &str); 10] = [
         (
             &["open"],
             "-d",
@@ -2970,6 +3170,24 @@ mod tests {
             "observacao",
             "/centralservicos/reabrir_chamado/5/",
         ),
+        (
+            &["escalate", "5"],
+            "-m",
+            "texto",
+            "/centralservicos/escalar_atendimento_chamado/5/",
+        ),
+        (
+            &["return", "5"],
+            "-m",
+            "texto",
+            "/centralservicos/retornar_atendimento_chamado/5/",
+        ),
+        (
+            &["reclassify", "5", "--servico", "2"],
+            "-m",
+            "justificativa",
+            "/centralservicos/reclassificar_chamado/5/",
+        ),
     ];
 
     /// Commands whose text is optional: the same multi-line and `-` (standard input) rules apply, but
@@ -2983,8 +3201,11 @@ mod tests {
 
     /// Commands without free text. A new command must be added to one of the two lists, which forces
     /// a decision about RS-02 (and a test for it) whenever a command is created.
-    const NON_TEXT_COMMANDS: [&str; 12] = [
+    const NON_TEXT_COMMANDS: [&str; 15] = [
         "sync",
+        "assign",
+        "tag",
+        "interested",
         "download",
         "assume",
         "start",
@@ -3031,6 +3252,27 @@ mod tests {
         get("/centralservicos/resolver_chamado/5/", &field("comentario"));
         get("/centralservicos/cancelar_chamado/5/", &field("observacao"));
         get("/centralservicos/reabrir_chamado/5/", &field("observacao"));
+        get(
+            "/centralservicos/escalar_atendimento_chamado/5/",
+            &field("texto"),
+        );
+        get(
+            "/centralservicos/retornar_atendimento_chamado/5/",
+            &field("texto"),
+        );
+        get(
+            "/centralservicos/reclassificar_chamado/5/",
+            r#"<form method="POST"><input type="hidden" name="servico" value="1">
+                <textarea name="justificativa"></textarea></form>"#,
+        );
+        get(
+            "/centralservicos/get_campus_com_centros_atendimento/2/5/",
+            r#"{"campus": [[1, "ZL", true]]}"#,
+        );
+        get(
+            "/centralservicos/get_centros_atendimento_por_servico_e_campus/2/1/",
+            r#"{"centros": [[1, "A", true]]}"#,
+        );
         get("/centralservicos/fechar_chamado/5/", &field("comentario"));
         for path in [
             "/centralservicos/adicionar_comentario/5/",
@@ -3040,6 +3282,9 @@ mod tests {
             "/centralservicos/cancelar_chamado/5/",
             "/centralservicos/reabrir_chamado/5/",
             "/centralservicos/fechar_chamado/5/",
+            "/centralservicos/escalar_atendimento_chamado/5/",
+            "/centralservicos/retornar_atendimento_chamado/5/",
+            "/centralservicos/reclassificar_chamado/5/",
         ] {
             let accepted = ResponseTemplate::new(200).set_body_string("ok");
             mount_text(&runtime, &server, "POST", path, accepted);
@@ -3120,6 +3365,115 @@ mod tests {
             assert_eq!(posts.len(), 4, "{command:?}");
             let sent_text = |body: &String| body.contains(&format!("{field}=linha"));
             assert!(!posts[2..].iter().any(sent_text));
+        }
+    }
+
+    const MANAGE_TICKET: &str = r#"<main id="content"><ul class="tags">
+        <li>Rede <form method="post" action="/centralservicos/remover_tag_do_chamado/5/1/"></form></li></ul>
+        <div class="person"><div class="popup-user"><a href="/rh/servidor/2080883/">Ana Souza</a></div>
+          <form method="post" action="/centralservicos/remover_outros_interessados/5/2/"></form></div></main>"#;
+
+    #[test]
+    fn management_commands_report_what_they_did_and_what_suap_refuses() {
+        let (_dir, paths) = paths();
+        let (runtime, server) = bare_server();
+        run_args(&["profile", "init", "--base-url", &server.uri()], &paths);
+        let ok = |body: &str| ResponseTemplate::new(200).set_body_string(body.to_owned());
+        let people = r#"<select name="atribuido_para"><option value="">-</option>
+            <option value="2">Ana (2080883)</option></select>"#;
+        for (verb, at, body) in [
+            ("GET", "/centralservicos/atribuir_chamado/5/", format!("<form>{people}</form>")),
+            ("POST", "/centralservicos/atribuir_chamado/5/", "ok".to_owned()),
+            ("GET", "/centralservicos/adicionar_tags_ao_chamado/5/", r#"<form><label><input type="checkbox" name="tags" value="1"> Rede</label></form>"#.to_owned()),
+            ("POST", "/centralservicos/adicionar_tags_ao_chamado/5/", "ok".to_owned()),
+            ("GET", "/centralservicos/chamado/5/", MANAGE_TICKET.to_owned()),
+            ("POST", "/centralservicos/remover_tag_do_chamado/5/1/", "ok".to_owned()),
+            ("POST", "/centralservicos/remover_outros_interessados/5/2/", "ok".to_owned()),
+            ("GET", "/centralservicos/adicionar_outros_interessados/5/", r#"<form><select name="outros_interessados"></select><script>control: '{"x": 1}'</script></form>"#.to_owned()),
+            ("POST", "/centralservicos/adicionar_outros_interessados/5/", "ok".to_owned()),
+            ("GET", "/json/comum/vinculo/", r#"{"items": [{"id": 2, "html": "<dd class=\"title\">Ana (Mat. 2080883)</dd>"}]}"#.to_owned()),
+            ("GET", "/centralservicos/escalar_atendimento_chamado/5/", format!("<form><textarea name=\"texto\"></textarea>{people}</form>")),
+            ("POST", "/centralservicos/escalar_atendimento_chamado/5/", "ok".to_owned()),
+            ("GET", "/centralservicos/retornar_atendimento_chamado/5/", "<form><textarea name=\"texto\"></textarea></form>".to_owned()),
+            ("POST", "/centralservicos/retornar_atendimento_chamado/5/", "ok".to_owned()),
+            ("GET", "/centralservicos/reclassificar_chamado/5/", r#"<form><input type="hidden" name="servico" value="1"><textarea name="justificativa"></textarea></form>"#.to_owned()),
+            ("POST", "/centralservicos/reclassificar_chamado/5/", "ok".to_owned()),
+            ("GET", "/centralservicos/get_campus_com_centros_atendimento/3/5/", r#"{"campus": [[1, "ZL", true]]}"#.to_owned()),
+            ("GET", "/centralservicos/get_centros_atendimento_por_servico_e_campus/3/1/", r#"{"centros": [[7, "G", true]]}"#.to_owned()),
+        ] {
+            mount_text(&runtime, &server, verb, at, ok(&body));
+        }
+
+        let expected = [
+            (
+                vec!["assign", "5", "--para", "2080883"],
+                "Chamado #5 atribuído a Ana (2080883).\n",
+            ),
+            (
+                vec!["escalate", "5", "-m", "sobe", "--para", "ana"],
+                "Chamado #5 escalado para o grupo acima.\n",
+            ),
+            (
+                vec!["return", "5", "-m", "volta"],
+                "Chamado #5 devolvido ao grupo abaixo.\n",
+            ),
+            (
+                vec!["reclassify", "5", "--servico", "3", "-m", "outro serviço"],
+                "Chamado #5 reclassificado.\n",
+            ),
+            (
+                vec!["tag", "add", "5", "rede"],
+                "Chamado #5: tags adicionadas: Rede.\n",
+            ),
+            (
+                vec!["tag", "remove", "5", "rede"],
+                "Chamado #5: tags removidas: Rede.\n",
+            ),
+            (
+                vec!["interested", "add", "5", "2080883"],
+                "Chamado #5: outros interessados adicionados: Ana (Mat. 2080883).\n",
+            ),
+            (
+                vec!["interested", "remove", "5", "2080883"],
+                "Chamado #5: outros interessados removidos: Ana Souza (2080883).\n",
+            ),
+        ];
+        for (args, message) in expected {
+            let (code, out, err) = run_args(&args, &paths);
+            assert_eq!(
+                (code, err.as_str(), out.as_str()),
+                (0, "", message),
+                "{args:?}"
+            );
+        }
+        let bodies = posts_to(
+            &runtime,
+            &server,
+            "/centralservicos/reclassificar_chamado/5/",
+        );
+        let sent = bodies[0].contains("servico=3") && bodies[0].contains("centro_atendimento=7");
+        assert!(sent);
+
+        // Mistakes are reported with the options, or by clap before anything is sent.
+        let (code, _, err) = run_args(&["assign", "5", "--para", "zé"], &paths);
+        assert_eq!(code, 1);
+        assert!(
+            err.contains("no attendant matches") && err.contains("2080883"),
+            "{err}"
+        );
+        let (code, _, err) = run_args(&["reclassify", "5", "-m", "x"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("nothing to change"), "{err}");
+        let (code, _, err) = run_args(&["tag", "add", "9", "rede"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("ticket 9 cannot be tagged"), "{err}");
+        for args in [
+            &["tag", "add", "5"][..],
+            &["interested", "remove", "5"],
+            &["assign", "5"],
+        ] {
+            let (code, _, err) = run_args(args, &paths);
+            assert_eq!(code, 2, "{args:?}: {err}");
         }
     }
 
