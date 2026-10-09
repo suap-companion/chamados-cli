@@ -216,13 +216,16 @@ Exibe título, situação, serviço, URL, dados do interessado, descrição e a 
 
 ### SUAP local de desenvolvimento
 
-Para testar `open`, `list` e `show` sem tocar na produção, suba um SUAP local e rode o seed da Central de Serviços (idempotente; cria campus, servidor de teste, catálogo e grupo de atendimento). **Nunca** rode contra homologação ou produção:
+Para testar `open`, `list`, `show`, `download` e os demais comandos sem tocar na produção, suba o SUAP local pelo [workspace](https://github.com/suap-companion/workspace) (seção "3. Inicie o Ambiente Docker do SUAP" do README dele) e crie os dados de teste da Central de Serviços (idempotente; cria campus, o usuário atendente 2080882, catálogo, grupo de atendimento e um artigo da base de conhecimento):
 
 ```bash
-docker exec -i <container-web-do-suap> python manage.py shell < scripts/seed_central_servicos.py
+suap up -d db redis
+suap create_db
+suap launch
+suap manage seed_central_servicos
 ```
 
-O script imprime `servico_id`, `campus_id` e `centro_id`.
+O comando só roda com `DEBUG` ligado, ou seja, numa base local de desenvolvimento: **nunca** use homologação ou produção. Ele imprime `servico_id`, `campus_id` e `centro_id`.
 
 ## Sincronização em nuvem (cifrada)
 
