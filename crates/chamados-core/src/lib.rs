@@ -21,6 +21,7 @@ const ASSUME_PATH_PREFIX: &str = "/centralservicos/auto_atribuir_chamado/";
 const START_PATH_PREFIX: &str = "/centralservicos/colocar_em_atendimento/";
 const SUSPEND_PATH_PREFIX: &str = "/centralservicos/suspender_chamado/";
 const RESOLVE_PATH_PREFIX: &str = "/centralservicos/resolver_chamado/";
+const CANCEL_PATH_PREFIX: &str = "/centralservicos/cancelar_chamado/";
 
 /// File types SUAP accepts as ticket attachments (it rejects any other).
 pub const ALLOWED_ATTACHMENT_EXTENSIONS: [&str; 9] = [
@@ -161,6 +162,8 @@ pub trait TicketSource {
     async fn add_message(&self, id: &str, kind: Message, text: &str) -> Result<(), TicketError>;
     /// Moves the ticket to "Suspenso", with the suspension message (multi-line text).
     async fn suspend_ticket(&self, id: &str, text: &str) -> Result<(), TicketError>;
+    /// Moves the ticket to "Cancelado", with the reason. It cannot be undone.
+    async fn cancel_ticket(&self, id: &str, text: &str) -> Result<(), TicketError>;
     /// Moves the ticket to "Resolvido".
     async fn resolve_ticket(&self, id: &str, resolution: &Resolution) -> Result<(), TicketError>;
     /// Assigns the ticket to the logged user ("assumir").
@@ -232,7 +235,14 @@ impl<'a> SuapTicketSource<'a> {
     /// Calls a SUAP ticket action (a GET) and surfaces the error flash message, if any.
     async fn run_action(&self, prefix: &str, id: &str) -> Result<(), TicketError> {
         check_ticket_id(id)?;
-        let body = self.client.fetch_page(&format!("{prefix}{id}/")).await?;
+        let body = match self.client.fetch_page(&format!("{prefix}{id}/")).await {
+            Err(SuapError::Transport(status)) => {
+                return Err(TicketError::Source(format!(
+                    "SUAP refused the action ({status}): check the ticket's situation (starting needs it assumed first) and your permissions"
+                )));
+            }
+            other => other?,
+        };
         let errors = flash_errors(&body);
         if errors.is_empty() {
             return Ok(());
@@ -358,6 +368,16 @@ impl TicketSource for SuapTicketSource<'_> {
             .await?;
         set_field(&mut fields, "observacao", text);
         self.send_status_form(&path, &fields, "the suspension")
+            .await
+    }
+
+    async fn cancel_ticket(&self, id: &str, text: &str) -> Result<(), TicketError> {
+        let text = non_empty_text(text, "cancellation")?;
+        let (path, _, mut fields) = self
+            .open_status_form(CANCEL_PATH_PREFIX, id, "cancelled", "observacao")
+            .await?;
+        set_field(&mut fields, "observacao", text);
+        self.send_status_form(&path, &fields, "the cancellation")
             .await
     }
 
@@ -1412,6 +1432,74 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn cancels_a_ticket_with_a_multiline_reason() {
+        let server = MockServer::start().await;
+        mount_text(
+            &server,
+            "GET",
+            "/centralservicos/cancelar_chamado/5/",
+            SUSPEND_FORM,
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/centralservicos/cancelar_chamado/5/"))
+            .and(body_string_contains("csrfmiddlewaretoken=tok"))
+            .and(body_string_contains(
+                "observacao=aberto+por+engano%0Adesculpe",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&server)
+            .await;
+        mount_text(
+            &server,
+            "GET",
+            "/centralservicos/cancelar_chamado/6/",
+            "<p>sem formulário</p>",
+        )
+        .await;
+        mount_text(
+            &server,
+            "GET",
+            "/centralservicos/cancelar_chamado/8/",
+            SUSPEND_FORM,
+        )
+        .await;
+        mount_text(
+            &server,
+            "POST",
+            "/centralservicos/cancelar_chamado/8/",
+            "<p class='alert-error'>Não pode cancelar</p>",
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path("/centralservicos/cancelar_chamado/7/"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let (_dir, client) = client_for(&server).await;
+        let source = SuapTicketSource::new(&client, TicketQueue::Support);
+        source
+            .cancel_ticket("5", "aberto por engano\ndesculpe\n")
+            .await
+            .unwrap();
+        let rejected = source.cancel_ticket("8", "x").await.unwrap_err();
+        assert!(rejected
+            .to_string()
+            .contains("SUAP rejected the cancellation: Não pode cancelar"));
+        let no_form = source.cancel_ticket("6", "x").await.unwrap_err();
+        assert!(no_form
+            .to_string()
+            .contains("ticket 6 has no cancelled form"));
+        let forbidden = source.cancel_ticket("7", "x").await.unwrap_err();
+        assert!(forbidden
+            .to_string()
+            .contains("ticket 7 cannot be cancelled (unexpected status 403 Forbidden)"));
+        let empty = source.cancel_ticket("5", "  ").await.unwrap_err();
+        assert!(empty.to_string().contains("the cancellation text is empty"));
+        assert!(source.cancel_ticket("x", "x").await.is_err());
+    }
+
     #[test]
     fn extracts_flash_errors_without_button_text() {
         let page = r#"<p class="x alert-error">Não pode. <button>Fechar</button></p>
@@ -1458,10 +1546,11 @@ mod tests {
             source.start_service("x").await,
             Err(TicketError::Source(_))
         ));
-        assert!(matches!(
-            source.assume_ticket("404").await,
-            Err(TicketError::Suap(SuapError::Transport(_)))
-        ));
+        let missing = source.assume_ticket("404").await.unwrap_err().to_string();
+        assert!(
+            missing.contains("SUAP refused the action (unexpected status 404"),
+            "{missing}"
+        );
     }
 
     #[tokio::test]

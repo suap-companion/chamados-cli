@@ -152,6 +152,17 @@ No `resolve`:
 - `--also <id>` (repetível) resolve outros chamados junto com este.
 - `--standard-reply <id>` usa uma resposta padrão.
 
+### Assumir, colocar em atendimento e cancelar
+
+```bash
+chamados assume 559298                  # atribui o chamado a você
+chamados start 559298                   # situação "Em atendimento"
+chamados start 559298 --assume          # assume e coloca em atendimento, de uma vez
+chamados cancel 559298 --yes -m "Aberto por engano."
+```
+
+São as mesmas ações do `open --assume` / `open --start`, agora para chamados que já existem. O SUAP só deixa colocar em atendimento quem já assumiu o chamado; sem `--assume`, a recusa dele é mostrada. O `cancel` **não pode ser desfeito**, por isso exige `--yes`; o motivo segue o padrão dos demais textos (várias linhas; `-m`, `-m -` ou entrada padrão) e o SUAP só cancela chamados abertos, reabertos, em atendimento ou suspensos, a pedido do requisitante, do interessado ou de um atendente.
+
 ### Ver detalhes de um chamado
 
 ```bash
