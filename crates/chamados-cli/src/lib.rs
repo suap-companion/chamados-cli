@@ -17,7 +17,8 @@ use chamados_core::{
 };
 use chamados_sync::{
     backend_from, key_source_from, load_key, store_key, sync_once, validate_settings, Key,
-    KeySource, S3Credentials, SyncBackend, SyncLock, SyncOptions, DIRECTORY_BACKEND, S3_BACKEND,
+    KeySource, S3Credentials, SyncBackend, SyncLock, SyncOptions, DIRECTORY_BACKEND, R2_BACKEND,
+    S3_BACKEND,
 };
 use clap::{Args, Parser, Subcommand};
 use suap_core::{
@@ -195,7 +196,7 @@ enum CredentialsCommand {
 
 #[derive(Debug, Args)]
 struct SyncSetupArgs {
-    /// Backend de armazenamento: `directory` (uma pasta) ou `s3` (S3-compatível, como o Cloudflare R2).
+    /// Backend de armazenamento: `directory` (uma pasta) ou `s3` (S3-compatível) ou `r2` (Cloudflare R2, o mesmo protocolo do `s3`).
     #[arg(long, default_value = DIRECTORY_BACKEND)]
     backend: String,
     /// Pasta do backend `directory` (ex.: uma pasta sincronizada ou um disco de rede).
@@ -941,7 +942,7 @@ fn sync_run(paths: &AppPaths, args: &SyncArgs, out: &mut dyn Write) -> Result<()
     if settings.backend.is_none() {
         return Err("sincronização não configurada: execute `chamados sync setup`".into());
     }
-    let credentials = if settings.backend.as_deref() == Some(S3_BACKEND) {
+    let credentials = if matches!(settings.backend.as_deref(), Some(S3_BACKEND | R2_BACKEND)) {
         S3Credentials::load()?
     } else {
         None
