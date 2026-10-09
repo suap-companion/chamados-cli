@@ -194,6 +194,18 @@ chamados cancel 559298 --yes -m "Aberto por engano."
 
 São as mesmas ações do `open --assume` / `open --start`, agora para chamados que já existem. O SUAP só deixa colocar em atendimento quem já assumiu o chamado; sem `--assume`, a recusa dele é mostrada. O `cancel` **não pode ser desfeito**, por isso exige `--yes`; o motivo segue o padrão dos demais textos (várias linhas; `-m`, `-m -` ou entrada padrão) e o SUAP só cancela chamados abertos, reabertos, em atendimento ou suspensos, a pedido do requisitante, do interessado ou de um atendente.
 
+### Baixar anexos
+
+O `show` lista os anexos do chamado, numerados na ordem da linha do tempo. O `download` os grava no disco:
+
+```bash
+chamados download 559298                       # todos, na pasta atual
+chamados download 559298 --anexo 2 -o baixados # só o anexo 2, na pasta "baixados" (criada se preciso)
+chamados download 559298 --force               # sobrescreve arquivos que já existam
+```
+
+O nome do arquivo vem do SUAP, mas é saneado antes de gravar: pastas e `..` são descartados, caracteres que o sistema de arquivos recusa viram `_`, nomes reservados do Windows (`CON`, `NUL`...) ganham um `_` na frente e nomes repetidos viram `nome (2).ext`. Nada é sobrescrito sem `--force`, e a checagem acontece antes de baixar qualquer arquivo. Só são baixados os arquivos que o SUAP serve para chamados (`/djtools/arquivo/centralservicos/chamadoanexo/...`), nunca um endereço qualquer encontrado na página.
+
 ### Ver detalhes de um chamado
 
 ```bash

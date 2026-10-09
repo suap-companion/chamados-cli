@@ -23,6 +23,7 @@ const ASSUME_PATH_PREFIX: &str = "/centralservicos/auto_atribuir_chamado/";
 const START_PATH_PREFIX: &str = "/centralservicos/colocar_em_atendimento/";
 const SUSPEND_PATH_PREFIX: &str = "/centralservicos/suspender_chamado/";
 const RESOLVE_PATH_PREFIX: &str = "/centralservicos/resolver_chamado/";
+const ATTACHMENT_PATH_PREFIX: &str = "/djtools/arquivo/centralservicos/chamadoanexo/";
 const CANCEL_PATH_PREFIX: &str = "/centralservicos/cancelar_chamado/";
 
 /// File types SUAP accepts as ticket attachments (it rejects any other).
@@ -58,6 +59,15 @@ pub struct TimelineEntry {
     pub text: String,
 }
 
+/// A file attached to a ticket, as linked from its timeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentLink {
+    /// File name as shown by SUAP.
+    pub name: String,
+    /// Path of the download link, relative to the SUAP address.
+    pub path: String,
+}
+
 /// Full details of a ticket, as shown on its SUAP page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketDetails {
@@ -67,6 +77,8 @@ pub struct TicketDetails {
     pub statuses: Vec<String>,
     pub fields: Vec<(String, String)>,
     pub timeline: Vec<TimelineEntry>,
+    /// Files attached to the ticket, in the order the timeline lists them.
+    pub attachments: Vec<AttachmentLink>,
     pub details_url: String,
 }
 
@@ -160,6 +172,8 @@ pub trait TicketSource {
     /// Lists the tickets that match `filter` (the page it asks for, or every page).
     async fn list_filtered(&self, filter: &TicketFilter) -> Result<Vec<RemoteTicket>, TicketError>;
     async fn get_ticket(&self, id: &str) -> Result<TicketDetails, TicketError>;
+    /// Downloads the content of an attachment listed in the ticket details.
+    async fn download_attachment(&self, link: &AttachmentLink) -> Result<Vec<u8>, TicketError>;
     /// Opens a new ticket and returns its id.
     async fn open_ticket(&self, ticket: &NewTicket) -> Result<String, TicketError>;
     /// Adds a comment or an internal note (multi-line text) to the ticket.
@@ -364,6 +378,17 @@ impl TicketSource for SuapTicketSource<'_> {
             .await?;
         parse_ticket_details(&html, self.client.base_url(), id)
             .ok_or_else(|| TicketError::Source(format!("could not parse ticket {id}")))
+    }
+
+    async fn download_attachment(&self, link: &AttachmentLink) -> Result<Vec<u8>, TicketError> {
+        if !link.path.starts_with(ATTACHMENT_PATH_PREFIX) {
+            // Only files SUAP serves for tickets: never an arbitrary address found in a page.
+            return Err(TicketError::Source(format!(
+                "{:?} is not a ticket attachment link",
+                link.path
+            )));
+        }
+        Ok(self.client.fetch_bytes(&link.path).await?)
     }
 
     async fn add_message(&self, id: &str, kind: Message, text: &str) -> Result<(), TicketError> {
@@ -838,6 +863,19 @@ pub fn parse_ticket_details(html: &str, base_url: &Url, id: &str) -> Option<Tick
         })
         .collect();
 
+    let mut attachments: Vec<AttachmentLink> = Vec::new();
+    let links = selector("[data-tab=linha_tempo] ul.timeline > li .timeline-content a[href]");
+    for link in document.select(&links) {
+        let path = link.value().attr("href").unwrap_or_default();
+        let known = attachments.iter().any(|known| known.path == path);
+        if path.starts_with(ATTACHMENT_PATH_PREFIX) && !known {
+            attachments.push(AttachmentLink {
+                name: flat_text(link),
+                path: path.to_owned(),
+            });
+        }
+    }
+
     Some(TicketDetails {
         id: id.to_owned(),
         title,
@@ -845,6 +883,7 @@ pub fn parse_ticket_details(html: &str, base_url: &Url, id: &str) -> Option<Tick
         statuses,
         fields,
         timeline,
+        attachments,
         details_url: base_url
             .join(&format!("{TICKET_PATH_PREFIX}{id}/"))
             .expect("ticket path is valid")
@@ -1897,6 +1936,87 @@ mod tests {
             "https://suap.example/centralservicos/chamado/559298/"
         );
         assert_eq!(details.clone(), details);
+    }
+
+    const ATTACHED: &str = r#"<main id="content"><div class="title-container"><h2>Chamado 3</h2></div>
+        <div data-tab="linha_tempo"><ul class="timeline">
+          <li><div class="timeline-date">1</div><div class="timeline-content"><p>Ana adicionou o seguinte anexo:
+            <a href="/djtools/arquivo/centralservicos/chamadoanexo/1/anexo/" target="_blank">dados.csv</a></p></div></li>
+          <li><div class="timeline-date">2</div><div class="timeline-content"><p>de novo
+            <a href="/djtools/arquivo/centralservicos/chamadoanexo/1/anexo/">dados.csv</a>
+            <a href="/djtools/arquivo/centralservicos/chamadoanexo/2/anexo/">foto.png</a>
+            <a href="/rh/servidor/2080882/">Ana</a> <a href="https://fora.example/x.pdf">fora</a> <a>sem href</a></p></div></li>
+        </ul></div></main>"#;
+
+    #[test]
+    fn attachments_are_the_distinct_ticket_files_linked_in_the_timeline() {
+        let details = parse_ticket_details(ATTACHED, &base(), "3").unwrap();
+        assert_eq!(
+            details.attachments,
+            [
+                AttachmentLink {
+                    name: "dados.csv".to_owned(),
+                    path: "/djtools/arquivo/centralservicos/chamadoanexo/1/anexo/".to_owned(),
+                },
+                AttachmentLink {
+                    name: "foto.png".to_owned(),
+                    path: "/djtools/arquivo/centralservicos/chamadoanexo/2/anexo/".to_owned(),
+                },
+            ]
+        );
+        let plain = parse_ticket_details(DETAILS, &base(), "559298").unwrap();
+        assert!(plain.attachments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn downloads_only_ticket_attachments_following_the_redirect() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/djtools/arquivo/centralservicos/chamadoanexo/1/anexo/",
+            ))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "/media/x.csv"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/media/x.csv"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8, 159, 146, 150, 10]))
+            .mount(&server)
+            .await;
+        let (_dir, client) = client_for(&server).await;
+        let source = SuapTicketSource::new(&client, TicketQueue::Support);
+        let link = |path: &str| AttachmentLink {
+            name: "x".to_owned(),
+            path: path.to_owned(),
+        };
+        let bytes = source
+            .download_attachment(&link(
+                "/djtools/arquivo/centralservicos/chamadoanexo/1/anexo/",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            bytes,
+            [0, 159, 146, 150, 10],
+            "binary content is kept as is"
+        );
+        // Anything else (another host, another SUAP path) is refused without a request.
+        for foreign in [
+            "https://fora.example/x.pdf",
+            "/rh/servidor/1/",
+            "/djtools/arquivo/outro/",
+        ] {
+            let refused = source
+                .download_attachment(&link(foreign))
+                .await
+                .unwrap_err();
+            assert!(
+                refused.to_string().contains("not a ticket attachment link"),
+                "{foreign}"
+            );
+        }
+        let missing = link("/djtools/arquivo/centralservicos/chamadoanexo/9/anexo/");
+        assert!(source.download_attachment(&missing).await.is_err());
     }
 
     #[test]

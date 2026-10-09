@@ -75,6 +75,20 @@ enum Command {
     Suspend(MessageArgs),
     /// Resolve um chamado (situação "Resolvido"), com a mensagem de resolução.
     Resolve(ResolveArgs),
+    /// Baixa os anexos de um chamado (todos, ou os escolhidos com --anexo).
+    Download {
+        /// Número do chamado.
+        id: u64,
+        /// Número do anexo, como o `show` lista (repetível). Sem esta opção, baixa todos.
+        #[arg(long)]
+        anexo: Vec<usize>,
+        /// Pasta de destino (criada se não existir); por padrão, a pasta atual.
+        #[arg(long, short = 'o')]
+        saida: Option<PathBuf>,
+        /// Sobrescreve arquivos que já existam no destino.
+        #[arg(long)]
+        force: bool,
+    },
     /// Assume um chamado que já existe (atribui a você).
     Assume {
         /// Número do chamado.
@@ -571,6 +585,12 @@ fn dispatch(
         Some(Command::Sync(args)) => sync(paths, args, input, prompt, out),
         Some(Command::Suspend(args)) => suspend(paths, args, input, out),
         Some(Command::Resolve(args)) => resolve(paths, args, input, out),
+        Some(Command::Download {
+            id,
+            anexo,
+            saida,
+            force,
+        }) => download(paths, id, &anexo, saida, force, out),
         Some(Command::Assume { id }) => assume(paths, id, out),
         Some(Command::Start { id, assume }) => start(paths, id, assume, out),
         Some(Command::Cancel { message, yes }) => cancel(paths, message, yes, input, out),
@@ -964,6 +984,123 @@ fn suspend(
         .block_on(source.suspend_ticket(&id, &text))
         .map_err(explain)?;
     writeln!(out, "Chamado #{id} suspenso.")?;
+    Ok(())
+}
+
+/// Names Windows reserves for devices, whatever the extension.
+const RESERVED_NAMES: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+const MAX_FILE_NAME_CHARS: usize = 150;
+
+/// A file name that is safe to create in a chosen folder, from a name SUAP gave: no folders, no
+/// characters the file systems refuse, no reserved or empty names. `fallback` is used when nothing
+/// usable is left.
+fn safe_file_name(name: &str, fallback: &str) -> String {
+    let last = name.rsplit(['/', '\\']).next().unwrap_or_default();
+    let cleaned: String = last
+        .chars()
+        .map(|c| {
+            if c.is_control() || "<>:\"|?*".contains(c) {
+                '_'
+            } else {
+                c
+            }
+        })
+        .take(MAX_FILE_NAME_CHARS)
+        .collect();
+    let cleaned = cleaned.trim().trim_end_matches('.').trim().to_owned();
+    if cleaned.is_empty() {
+        return fallback.to_owned();
+    }
+    let stem = cleaned.split('.').next().unwrap_or_default().to_uppercase();
+    if RESERVED_NAMES.contains(&stem.as_str()) {
+        return format!("_{cleaned}");
+    }
+    cleaned
+}
+
+/// `name` made different from every name in `taken` by adding " (2)", " (3)"... before the extension.
+fn unique_name(name: &str, taken: &[String]) -> String {
+    let (stem, extension) = match name.rfind('.') {
+        Some(dot) if dot > 0 => name.split_at(dot),
+        _ => (name, ""),
+    };
+    let mut candidate = name.to_owned();
+    let mut number = 1;
+    while taken.contains(&candidate) {
+        number += 1;
+        candidate = format!("{stem} ({number}){extension}");
+    }
+    candidate
+}
+
+fn download(
+    paths: &AppPaths,
+    id: u64,
+    wanted: &[usize],
+    folder: Option<PathBuf>,
+    force: bool,
+    out: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    let (runtime, client) = connect(paths)?;
+    let source = SuapTicketSource::new(&client, TicketQueue::Support);
+    let details = runtime
+        .block_on(source.get_ticket(&id.to_string()))
+        .map_err(explain)?;
+    let total = details.attachments.len();
+    if total == 0 {
+        return Err(format!("o chamado #{id} não tem anexos").into());
+    }
+    let mut numbers: Vec<usize> = if wanted.is_empty() {
+        (1..=total).collect()
+    } else {
+        wanted.to_vec()
+    };
+    let mut seen = Vec::new();
+    numbers.retain(|number| {
+        let first = !seen.contains(number);
+        seen.push(*number);
+        first
+    });
+    if let Some(bad) = numbers.iter().find(|number| !(1..=total).contains(number)) {
+        return Err(format!("o anexo {bad} não existe: o chamado #{id} tem {total}").into());
+    }
+
+    // Decide every destination first, so nothing is downloaded if a file would be overwritten.
+    let folder = folder.unwrap_or(PathBuf::from("."));
+    let mut names: Vec<String> = Vec::new();
+    for number in &numbers {
+        let link = &details.attachments[number - 1];
+        let safe = safe_file_name(&link.name, &format!("anexo-{number}"));
+        let name = unique_name(&safe, &names);
+        names.push(name);
+    }
+    let existing: Vec<String> = names
+        .iter()
+        .filter(|name| folder.join(name).exists())
+        .cloned()
+        .collect();
+    if !force && !existing.is_empty() {
+        return Err(format!(
+            "já existe em {}: {} (use --force para sobrescrever)",
+            folder.display(),
+            existing.join(", ")
+        )
+        .into());
+    }
+    fs::create_dir_all(&folder)?;
+    for (number, name) in numbers.iter().zip(&names) {
+        let link = &details.attachments[number - 1];
+        let bytes = runtime
+            .block_on(source.download_attachment(link))
+            .map_err(explain)?;
+        let target = folder.join(name);
+        fs::write(&target, &bytes)?;
+        let size = bytes.len();
+        writeln!(out, "Anexo {number}: {} ({size} bytes)", target.display())?;
+    }
     Ok(())
 }
 
@@ -1523,6 +1660,13 @@ fn print_details(
     writeln!(out, "URL: {}", details.details_url)?;
     for (label, value) in &details.fields {
         writeln!(out, "{label}: {}", indent_continuation(value, "    "))?;
+    }
+    if !details.attachments.is_empty() {
+        let heading = format!("\nAnexos (baixe com `chamados download {}`):", details.id);
+        writeln!(out, "{heading}")?;
+        for (index, attachment) in details.attachments.iter().enumerate() {
+            writeln!(out, "  {}. {}", index + 1, attachment.name)?;
+        }
     }
     writeln!(out, "\nLinha do tempo:")?;
     for entry in &details.timeline {
@@ -2361,6 +2505,174 @@ mod tests {
     }
 
     #[test]
+    fn file_names_from_suap_are_made_safe_and_unique() {
+        for (given, expected) in [
+            ("dados.csv", "dados.csv"),
+            ("relatório final.pdf", "relatório final.pdf"),
+            ("../../etc/passwd", "passwd"),
+            ("C:\\Users\\x\\segredo.docx", "segredo.docx"),
+            ("a<b>c:d\"e|f?g*h.txt", "a_b_c_d_e_f_g_h.txt"),
+            ("  espaço.png  ", "espaço.png"),
+            ("termina.com.ponto...", "termina.com.ponto"),
+            ("con.txt", "_con.txt"),
+            ("NUL", "_NUL"),
+            ("Lpt1.pdf", "_Lpt1.pdf"),
+            ("com10.txt", "com10.txt"),
+            ("", "anexo-3"),
+            ("...", "anexo-3"),
+            ("..", "anexo-3"),
+            ("pasta/", "anexo-3"),
+            ("tab\there.txt", "tab_here.txt"),
+        ] {
+            assert_eq!(safe_file_name(given, "anexo-3"), expected, "{given:?}");
+        }
+        let long = format!("{}.pdf", "x".repeat(400));
+        assert_eq!(
+            safe_file_name(&long, "f").chars().count(),
+            MAX_FILE_NAME_CHARS
+        );
+
+        let taken = [
+            "a.csv".to_owned(),
+            "a (2).csv".to_owned(),
+            "semponto".to_owned(),
+        ];
+        assert_eq!(unique_name("b.csv", &taken), "b.csv");
+        assert_eq!(unique_name("a.csv", &taken), "a (3).csv");
+        assert_eq!(unique_name("semponto", &taken), "semponto (2)");
+        assert_eq!(
+            unique_name(".oculto", &[".oculto".to_owned()]),
+            ".oculto (2)"
+        );
+    }
+
+    const ATTACHED_TICKET: &str = r#"<main id="content"><div class="title-container"><h2>Chamado 5</h2></div>
+        <div data-tab="linha_tempo"><ul class="timeline">
+          <li><div class="timeline-date">1</div><div class="timeline-content"><p>Ana anexou
+            <a href="/djtools/arquivo/centralservicos/chamadoanexo/1/anexo/">dados.csv</a>
+            <a href="/djtools/arquivo/centralservicos/chamadoanexo/2/anexo/">../foto.png</a>
+            <a href="/djtools/arquivo/centralservicos/chamadoanexo/3/anexo/">dados.csv</a></p></div></li>
+        </ul></div></main>"#;
+
+    const VANISHED_TICKET: &str = r#"<main id="content"><div class="title-container"><h2>Sumiu</h2></div>
+        <div data-tab="linha_tempo"><ul class="timeline"><li><div class="timeline-date">1</div>
+        <div class="timeline-content"><a href="/djtools/arquivo/centralservicos/chamadoanexo/99/anexo/">x.pdf</a></div></li></ul></div></main>"#;
+
+    const PLAIN_TICKET: &str =
+        r#"<main id="content"><div class="title-container"><h2>Sem anexos</h2></div></main>"#;
+
+    #[test]
+    fn show_lists_attachments_and_download_saves_them_safely() {
+        let (dir, paths) = paths();
+        let (runtime, server) = bare_server();
+        run_args(&["profile", "init", "--base-url", &server.uri()], &paths);
+        for (id, body) in [
+            ("5", ATTACHED_TICKET),
+            ("6", PLAIN_TICKET),
+            ("7", VANISHED_TICKET),
+        ] {
+            mount_text(
+                &runtime,
+                &server,
+                "GET",
+                &format!("/centralservicos/chamado/{id}/"),
+                ResponseTemplate::new(200).set_body_string(body),
+            );
+        }
+        for (number, content) in [(1, "um"), (2, "dois"), (3, "três")] {
+            mount_text(
+                &runtime,
+                &server,
+                "GET",
+                &format!("/djtools/arquivo/centralservicos/chamadoanexo/{number}/anexo/"),
+                ResponseTemplate::new(200).set_body_bytes(content.as_bytes().to_vec()),
+            );
+        }
+
+        let (_, shown, _) = run_args(&["show", "5"], &paths);
+        let listed = "Anexos (baixe com `chamados download 5`):\n  1. dados.csv\n  2. ../foto.png\n  3. dados.csv\n";
+        assert!(shown.contains(listed), "{shown}");
+        assert!(!run_args(&["show", "6"], &paths).1.contains("Anexos"));
+
+        // All of them, into a folder that does not exist yet; names are sanitized and made unique.
+        let target = dir.path().join("baixados");
+        let target_text = target.to_str().unwrap();
+        let (code, out, err) = run_args(&["download", "5", "-o", target_text], &paths);
+        assert_eq!((code, err.as_str()), (0, ""));
+        assert_eq!(out.lines().count(), 3, "{out}");
+        assert!(
+            out.contains("Anexo 2: ") && out.contains("(4 bytes)"),
+            "{out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("dados.csv")).unwrap(),
+            "um"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("foto.png")).unwrap(),
+            "dois"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("dados (2).csv")).unwrap(),
+            "três"
+        );
+
+        // An existing file is never overwritten silently, and nothing is downloaded in that case.
+        std::fs::write(target.join("dados.csv"), "meu").unwrap();
+        let before = runtime.block_on(server.received_requests()).unwrap().len();
+        let (code, _, err) = run_args(&["download", "5", "-o", target_text], &paths);
+        assert_eq!(code, 1);
+        let refused = err.contains("já existe") && err.contains("dados.csv");
+        assert!(refused && err.contains("--force"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(target.join("dados.csv")).unwrap(),
+            "meu"
+        );
+        let after = runtime.block_on(server.received_requests()).unwrap().len();
+        assert_eq!(after, before + 1, "only the ticket page was read");
+        let (code, _, _) = run_args(&["download", "5", "-o", target_text, "--force"], &paths);
+        assert_eq!(code, 0);
+        assert_eq!(
+            std::fs::read_to_string(target.join("dados.csv")).unwrap(),
+            "um"
+        );
+
+        // Chosen attachments only (repeated numbers count once).
+        let only = dir.path().join("so-um");
+        let only_text = only.to_str().unwrap();
+        let (code, out, _) = run_args(
+            &[
+                "download", "5", "--anexo", "2", "--anexo", "2", "-o", only_text,
+            ],
+            &paths,
+        );
+        assert_eq!((code, out.lines().count()), (0, 1));
+        assert!(only.join("foto.png").exists() && !only.join("dados.csv").exists());
+
+        // Mistakes.
+        let (code, _, err) = run_args(&["download", "5", "--anexo", "4"], &paths);
+        assert_eq!(code, 1);
+        assert!(
+            err.contains("o anexo 4 não existe") && err.contains("tem 3"),
+            "{err}"
+        );
+        let (code, _, err) = run_args(&["download", "5", "--anexo", "0"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("o anexo 0 não existe"), "{err}");
+        let (code, _, err) = run_args(&["download", "6"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("não tem anexos"), "{err}");
+        let (code, _, err) = run_args(&["download", "9"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("404"), "{err}");
+        // A file SUAP no longer serves is reported, and nothing is left behind.
+        let (code, _, err) = run_args(&["download", "7", "-o", target_text], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("404"), "{err}");
+        assert!(!target.join("x.pdf").exists());
+    }
+
+    #[test]
     fn assume_and_start_work_on_existing_tickets() {
         let (_dir, paths) = paths();
         let (runtime, server) = bare_server();
@@ -2583,8 +2895,9 @@ mod tests {
 
     /// Commands without free text. A new command must be added to one of the two lists, which forces
     /// a decision about RS-02 (and a test for it) whenever a command is created.
-    const NON_TEXT_COMMANDS: [&str; 11] = [
+    const NON_TEXT_COMMANDS: [&str; 12] = [
         "sync",
+        "download",
         "assume",
         "start",
         "paths",
