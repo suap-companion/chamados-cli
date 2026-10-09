@@ -16,11 +16,11 @@ use chamados_core::{
     TicketError, TicketQueue, TicketSource, TitleStore,
 };
 use chamados_sync::{
-    backend_from, key_source_from, load_key, store_key, sync_once, validate_settings, Key,
-    KeySource, S3Credentials, SyncBackend, SyncLock, SyncOptions, DIRECTORY_BACKEND, R2_BACKEND,
-    S3_BACKEND,
+    backend_from, key_exists, key_source_from, load_key, record_removal, store_key, sync_once,
+    validate_settings, Key, KeySource, Passphrase, S3Credentials, SyncBackend, SyncLock,
+    SyncOptions, DIRECTORY_BACKEND, PASSPHRASE_ENV, R2_BACKEND, S3_BACKEND,
 };
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use suap_core::{
     list_profiles, load_config, load_sync_settings, remove_config, save_config, save_sync_settings,
     AppPaths, SuapClient, SuapConfig, SuapError, SyncSettings, DEFAULT_PROFILE,
@@ -183,6 +183,31 @@ enum SyncAction {
         #[command(subcommand)]
         command: CredentialsCommand,
     },
+    /// Mostra (ou instala) o agendamento que roda `chamados sync` de tempos em tempos.
+    Automation(AutomationArgs),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Platform {
+    /// Timer do systemd do usuário (Linux).
+    Systemd,
+    /// Linha para o `crontab`.
+    Cron,
+    /// Tarefa agendada do Windows (`schtasks`).
+    Windows,
+}
+
+#[derive(Debug, Args)]
+struct AutomationArgs {
+    /// Agendador; por padrão, `windows` no Windows e `systemd` nos demais sistemas.
+    #[arg(long, value_enum)]
+    platform: Option<Platform>,
+    /// Intervalo em minutos entre as sincronizações (1 a 59).
+    #[arg(long, default_value_t = 5)]
+    interval: u32,
+    /// Grava os arquivos do timer do systemd em ~/.config/systemd/user (não os ativa).
+    #[arg(long)]
+    install: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -217,10 +242,13 @@ struct SyncSetupArgs {
     /// Se o armazenamento aceita escrita condicional (`If-Match`); `false` usa a leitura de conferência.
     #[arg(long)]
     conditional_writes: Option<bool>,
-    /// Onde fica a chave: `keyring` (padrão), `file` ou `env`.
+    /// Onde fica a chave: `keyring` (padrão), `file`, `protected-file` (arquivo com frase-senha) ou `env`.
     #[arg(long)]
     key_source: Option<String>,
-    /// Arquivo da chave, para `--key-source file` (padrão: ~/.config/suap/sync.key).
+    /// Sincroniza logo após cada alteração local (`title`, `profile ...`), além do agendamento.
+    #[arg(long)]
+    auto: Option<bool>,
+    /// Arquivo da chave, para `--key-source file` ou `protected-file` (padrão: ~/.config/suap/sync.key).
     #[arg(long)]
     key_file: Option<PathBuf>,
 }
@@ -381,7 +409,67 @@ where
     }
 }
 
+/// Whether the command changes data that is synchronized.
+fn changes_synced_data(command: &Option<Command>) -> bool {
+    match command {
+        Some(Command::Title { text, remove, .. }) => text.is_some() || *remove,
+        Some(Command::Profile { command }) => matches!(
+            command,
+            ProfileCommand::Init(_) | ProfileCommand::Update(_) | ProfileCommand::Remove { .. }
+        ),
+        _ => false,
+    }
+}
+
 fn execute(
+    cli: Cli,
+    paths: &AppPaths,
+    password: Option<String>,
+    input: &mut dyn Read,
+    prompt: &mut dyn Prompt,
+    out: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    let changes = changes_synced_data(&cli.command);
+    dispatch(cli, paths, password, input, prompt, out)?;
+    if changes {
+        auto_sync(paths, prompt, out);
+    }
+    Ok(())
+}
+
+/// With `sync.auto` on, synchronizes right after a local change. It never fails the command that
+/// made the change: a problem is only reported.
+fn auto_sync(paths: &AppPaths, prompt: &mut dyn Prompt, out: &mut dyn Write) {
+    let quiet = SyncArgs {
+        action: None,
+        only: None,
+        quiet: true,
+        dry_run: false,
+        check: false,
+    };
+    let outcome = auto_sync_enabled(paths).and_then(|enabled| {
+        if enabled {
+            sync_run(paths, &quiet, prompt, out)
+        } else {
+            Ok(())
+        }
+    });
+    if let Err(error) = outcome {
+        let _ = writeln!(out, "aviso: a sincronização automática falhou: {error}");
+    }
+}
+
+/// `sync.auto` is on, a backend is configured and there is something to synchronize.
+fn auto_sync_enabled(paths: &AppPaths) -> Result<bool, Box<dyn Error>> {
+    let settings = load_sync_settings(paths)?;
+    if settings.auto != Some(true) || settings.backend.is_none() {
+        return Ok(false);
+    }
+    let any_profile = list_profiles(paths)?.iter().any(|(_, config)| config.sync);
+    Ok(any_profile || paths.removed_profiles_file().exists())
+}
+
+fn dispatch(
     cli: Cli,
     paths: &AppPaths,
     password: Option<String>,
@@ -602,14 +690,18 @@ fn profile_remove(
     out: &mut dyn Write,
 ) -> Result<(), Box<dyn Error>> {
     let paths = paths_for(paths, Some(name))?;
-    if load_config(&paths)?.is_none() {
+    let Some(config) = load_config(&paths)? else {
         return Err(missing_profile(name));
-    }
+    };
     if !yes {
         return Err(format!(
             "a remoção apaga a configuração e a sessão do perfil {name:?}: confirme com --yes"
         )
         .into());
+    }
+    if config.sync {
+        // Tell the other devices on the next sync, or the profile would come back from the cloud.
+        record_removal(&paths, name, unix_now())?;
     }
     remove_config(&paths)?;
     let session = paths.session_file();
@@ -811,9 +903,10 @@ fn sync(
 ) -> Result<(), Box<dyn Error>> {
     match args.action {
         Some(SyncAction::Setup(setup)) => sync_setup(paths, *setup, out),
-        Some(SyncAction::Key { command }) => sync_key(paths, command, input, out),
+        Some(SyncAction::Key { command }) => sync_key(paths, command, input, prompt, out),
+        Some(SyncAction::Automation(automation)) => sync_automation(paths, &automation, out),
         Some(SyncAction::Credentials { command }) => sync_credentials(command, input, prompt, out),
-        None => sync_run(paths, &args, out),
+        None => sync_run(paths, &args, prompt, out),
     }
 }
 
@@ -829,6 +922,7 @@ fn sync_setup(
         .or_else(|| settings.path.take().map(PathBuf::from))
         .map(|path| path.display().to_string());
     settings.key_source = args.key_source.or(settings.key_source.take());
+    settings.auto = args.auto.or(settings.auto);
     settings.key_file = args
         .key_file
         .map(|file| file.display().to_string())
@@ -884,37 +978,139 @@ fn sync_credentials(
     Ok(())
 }
 
+fn no_passphrase(_: std::io::Error) -> Box<dyn Error> {
+    format!("sem terminal interativo: informe a frase-senha na variável {PASSPHRASE_ENV}").into()
+}
+
+/// Gets the passphrase of a protected key file from `env` or by asking (twice, when `confirm` is
+/// set, as for a new passphrase). Other key sources need none, and neither does a key file that
+/// does not exist yet when it is only going to be read.
+fn unlock_with(
+    source: KeySource,
+    prompt: &mut dyn Prompt,
+    confirm: bool,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<KeySource, Box<dyn Error>> {
+    if !source.needs_passphrase() || (!confirm && !key_exists(&source)?) {
+        return Ok(source);
+    }
+    if let Some(text) = env(PASSPHRASE_ENV).filter(|text| !text.is_empty()) {
+        return Ok(source.with_passphrase(Passphrase::new(text)));
+    }
+    let first = prompt
+        .secret("Frase-senha da chave: ")
+        .map_err(no_passphrase)?;
+    if confirm {
+        let again = prompt
+            .secret("Repita a frase-senha: ")
+            .map_err(no_passphrase)?;
+        if first != again {
+            return Err("as frases-senha não conferem".into());
+        }
+    }
+    Ok(source.with_passphrase(Passphrase::new(first)))
+}
+
+fn unlock(
+    source: KeySource,
+    prompt: &mut dyn Prompt,
+    confirm: bool,
+) -> Result<KeySource, Box<dyn Error>> {
+    unlock_with(source, prompt, confirm, &|name| std::env::var(name).ok())
+}
+
 fn sync_key(
     paths: &AppPaths,
     command: KeyCommand,
     input: &mut dyn Read,
+    prompt: &mut dyn Prompt,
     out: &mut dyn Write,
 ) -> Result<(), Box<dyn Error>> {
     let (_, source) = key_source(paths)?;
     match command {
         KeyCommand::Generate { force } => {
+            let source = unlock(source, prompt, true)?;
             store_key(&source, &Key::generate(), force)?;
             writeln!(out, "Chave criada ({}).", source.name())?;
         }
         KeyCommand::Export => {
+            let source = unlock(source, prompt, false)?;
             let key = load_key(&source)?.ok_or_else(|| no_key(&source))?;
             writeln!(out, "{}", key.to_hex())?;
         }
         KeyCommand::Import { force } => {
             let key = Key::from_hex(&read_text(None, input)?)?;
+            let source = unlock(source, prompt, true)?;
             store_key(&source, &key, force)?;
             writeln!(out, "Chave importada ({}).", source.name())?;
         }
         KeyCommand::Status => {
-            let present = if load_key(&source)?.is_some() {
-                "sim"
-            } else {
-                "não"
-            };
+            let present = if key_exists(&source)? { "sim" } else { "não" };
             writeln!(out, "fonte: {}", source.name())?;
             writeln!(out, "chave presente: {present}")?;
         }
     }
+    Ok(())
+}
+
+const AUTOMATION_NOTE: &str = "Dica: o chaveiro do sistema só abre com a sessão do usuário; para rodar sozinho, guarde a chave em arquivo (`chamados sync setup --key-source file`) ou na variável CHAMADOS_SYNC_KEY. Uma chave com frase-senha não serve para isso.";
+const SERVICE_UNIT: &str = "chamados-sync.service";
+const TIMER_UNIT: &str = "chamados-sync.timer";
+
+fn systemd_service(exe: &str) -> String {
+    format!("[Unit]\nDescription=Sincroniza os dados do chamados\n\n[Service]\nType=oneshot\nExecStart=\"{exe}\" sync --quiet\n")
+}
+
+fn systemd_timer(interval: u32) -> String {
+    format!("[Unit]\nDescription=Sincroniza o chamados a cada {interval} minuto(s)\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec={interval}min\n\n[Install]\nWantedBy=timers.target\n")
+}
+
+fn sync_automation(
+    paths: &AppPaths,
+    args: &AutomationArgs,
+    out: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    if !(1..=59).contains(&args.interval) {
+        return Err("o intervalo deve ficar entre 1 e 59 minutos".into());
+    }
+    let default = [Platform::Systemd, Platform::Windows][usize::from(cfg!(windows))];
+    let platform = args.platform.unwrap_or(default);
+    if args.install && platform != Platform::Systemd {
+        return Err(
+            "--install só existe para o systemd; nos demais, use o comando mostrado".into(),
+        );
+    }
+    let exe = std::env::current_exe()?.display().to_string();
+    let interval = args.interval;
+    let text = match platform {
+        Platform::Cron => format!("# crontab -e\n*/{interval} * * * * \"{exe}\" sync --quiet"),
+        Platform::Windows => format!(
+            "schtasks /Create /SC MINUTE /MO {interval} /TN chamados-sync /TR \"\\\"{exe}\\\" sync --quiet\" /F"
+        ),
+        Platform::Systemd => {
+            let enable = format!(
+                "systemctl --user daemon-reload && systemctl --user enable --now {TIMER_UNIT}"
+            );
+            if args.install {
+                let base = paths.config_dir().parent().unwrap_or(paths.config_dir());
+                let units = base.join("systemd").join("user");
+                fs::create_dir_all(&units)?;
+                fs::write(units.join(SERVICE_UNIT), systemd_service(&exe))?;
+                fs::write(units.join(TIMER_UNIT), systemd_timer(interval))?;
+                format!(
+                    "Arquivos gravados em {}.\nPara ativar:\n{enable}",
+                    units.display()
+                )
+            } else {
+                format!(
+                    "# ~/.config/systemd/user/{SERVICE_UNIT}\n{}\n# ~/.config/systemd/user/{TIMER_UNIT}\n{}\n# depois:\n{enable}",
+                    systemd_service(&exe),
+                    systemd_timer(interval)
+                )
+            }
+        }
+    };
+    writeln!(out, "{text}\n\n{AUTOMATION_NOTE}")?;
     Ok(())
 }
 
@@ -937,7 +1133,12 @@ fn no_key(source: &KeySource) -> Box<dyn Error> {
     .into()
 }
 
-fn sync_run(paths: &AppPaths, args: &SyncArgs, out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
+fn sync_run(
+    paths: &AppPaths,
+    args: &SyncArgs,
+    prompt: &mut dyn Prompt,
+    out: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
     let (settings, source) = key_source(paths)?;
     if settings.backend.is_none() {
         return Err("sincronização não configurada: execute `chamados sync setup`".into());
@@ -948,6 +1149,7 @@ fn sync_run(paths: &AppPaths, args: &SyncArgs, out: &mut dyn Write) -> Result<()
         None
     };
     let backend = backend_from(&settings, credentials)?;
+    let source = unlock(source, prompt, false)?;
     let key = load_key(&source)?.ok_or_else(|| no_key(&source))?;
     let Some(_lock) = SyncLock::acquire(&paths.sync_lock_file())? else {
         if !args.quiet {
@@ -2143,6 +2345,19 @@ mod tests {
         assert!(out.contains("1 alteração(ões) local(is)"), "{out}");
         let (_, title, _) = run_args(&["title", "5"], &a);
         assert_eq!(title, "Moodle 5.3 (feito)\n");
+
+        // Removing the profile on A removes it on B too, and it does not come back from the cloud.
+        assert_eq!(
+            run_args(&["profile", "remove", "default", "--yes"], &a).0,
+            0
+        );
+        assert_eq!(run_args(&["sync", "--quiet"], &a).0, 0);
+        let (_, out, _) = run_args(&["sync"], &b);
+        assert!(out.contains("1 alteração(ões) local(is)"), "{out}");
+        let unsaved = "perfil padrão ainda não gravado";
+        assert!(run_args(&["profile", "show"], &b).1.contains(unsaved));
+        assert_eq!(run_args(&["sync", "--quiet"], &a).0, 0);
+        assert!(run_args(&["profile", "show"], &a).1.contains(unsaved));
     }
 
     #[test]
@@ -2440,6 +2655,332 @@ mod tests {
     fn without_a_terminal_every_question_fails() {
         assert!(NoPrompt.line("Pergunta: ").is_err());
         assert!(NoPrompt.secret("Segredo: ").is_err());
+    }
+
+    /// A terminal that answers each secret from a queue and remembers what it was asked.
+    struct QueuedTerminal {
+        answers: Vec<String>,
+        asked: Vec<String>,
+    }
+
+    impl QueuedTerminal {
+        fn new(answers: &[&str]) -> Self {
+            Self {
+                answers: answers.iter().map(|text| (*text).to_owned()).collect(),
+                asked: Vec::new(),
+            }
+        }
+    }
+
+    impl Prompt for QueuedTerminal {
+        fn line(&mut self, label: &str) -> std::io::Result<String> {
+            self.asked.push(label.to_owned());
+            Ok(String::new())
+        }
+
+        fn secret(&mut self, label: &str) -> std::io::Result<String> {
+            self.asked.push(label.to_owned());
+            match self.answers.is_empty() {
+                true => Err(std::io::Error::other("sem resposta")),
+                false => Ok(self.answers.remove(0)),
+            }
+        }
+    }
+
+    fn run_prompted(
+        args: &[&str],
+        paths: &AppPaths,
+        prompt: &mut dyn Prompt,
+    ) -> (i32, String, String) {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run(
+            std::iter::once("chamados").chain(args.iter().copied()),
+            paths,
+            None,
+            &mut std::io::empty(),
+            prompt,
+            &mut out,
+            &mut err,
+        );
+        (
+            code,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_key_file_protected_by_a_passphrase_is_unlocked_on_the_terminal() {
+        let root = tempdir().unwrap();
+        let cloud = root.path().join("nuvem");
+        let key_file = root.path().join("protegida.key");
+        let (_dir, paths) = paths();
+        let setup = [
+            "sync",
+            "setup",
+            "--path",
+            cloud.to_str().unwrap(),
+            "--key-source",
+            "protected-file",
+            "--key-file",
+            key_file.to_str().unwrap(),
+        ];
+        assert_eq!(run_args(&setup, &paths).0, 0);
+
+        // Nothing to unlock yet: reading never asks for a passphrase.
+        let mut terminal = QueuedTerminal::new(&["nao deveria perguntar"]);
+        let (code, _, err) = run_prompted(&["sync", "key", "export"], &paths, &mut terminal);
+        assert_eq!(code, 1);
+        assert!(err.contains("nenhuma chave"), "{err}");
+        assert!(terminal.asked.is_empty());
+
+        // Creating one asks twice; without a terminal there is nobody to ask.
+        let (code, _, err) = run_args(&["sync", "key", "generate"], &paths);
+        assert_eq!(code, 1);
+        assert!(
+            err.contains("sem terminal") && err.contains(PASSPHRASE_ENV),
+            "{err}"
+        );
+        let mut terminal = QueuedTerminal::new(&["uma", "outra"]);
+        let (code, _, err) = run_prompted(&["sync", "key", "generate"], &paths, &mut terminal);
+        assert_eq!(code, 1);
+        assert!(err.contains("não conferem"), "{err}");
+        assert!(!key_file.exists());
+        let mut terminal = QueuedTerminal::new(&["frase boa", "frase boa"]);
+        let (code, out, _) = run_prompted(&["sync", "key", "generate"], &paths, &mut terminal);
+        assert_eq!(
+            (code, out.as_str()),
+            (0, "Chave criada (protected-file).\n")
+        );
+        assert_eq!(
+            terminal.asked,
+            ["Frase-senha da chave: ", "Repita a frase-senha: "]
+        );
+        assert!(!std::fs::read_to_string(&key_file).unwrap().is_empty());
+
+        // The status needs no passphrase; exporting does, and the right one.
+        let (_, out, _) = run_args(&["sync", "key", "status"], &paths);
+        assert_eq!(out, "fonte: protected-file\nchave presente: sim\n");
+        let mut terminal = QueuedTerminal::new(&["errada"]);
+        let (code, _, err) = run_prompted(&["sync", "key", "export"], &paths, &mut terminal);
+        assert_eq!(code, 1);
+        assert!(err.contains("wrong passphrase"), "{err}");
+        let mut terminal = QueuedTerminal::new(&["frase boa"]);
+        let (code, hex, _) = run_prompted(&["sync", "key", "export"], &paths, &mut terminal);
+        assert_eq!((code, hex.trim().len()), (0, 64));
+
+        // `sync` unlocks the key the same way.
+        assert_eq!(
+            run_args(
+                &["profile", "init", "--username", "ana", "--sync", "true"],
+                &paths
+            )
+            .0,
+            0
+        );
+        let (code, _, err) = run_args(&["sync"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("sem terminal"), "{err}");
+        let mut terminal = QueuedTerminal::new(&["frase boa"]);
+        let (code, out, err) = run_prompted(&["sync"], &paths, &mut terminal);
+        assert_eq!((code, err.as_str()), (0, ""));
+        assert!(out.contains("nuvem atualizada"), "{out}");
+        assert_eq!(terminal.line("?").unwrap(), "");
+    }
+
+    #[test]
+    fn the_passphrase_may_come_from_the_environment() {
+        let source = KeySource::parse("protected-file", Some(PathBuf::from("k"))).unwrap();
+        let with = |value: Option<&'static str>| {
+            move |name: &str| {
+                assert_eq!(name, PASSPHRASE_ENV);
+                value.map(str::to_owned)
+            }
+        };
+        let mut terminal = QueuedTerminal::new(&["do terminal"]);
+        let unlocked = unlock_with(
+            source.clone(),
+            &mut terminal,
+            true,
+            &with(Some("do ambiente")),
+        );
+        assert!(!unlocked.unwrap().needs_passphrase());
+        assert!(terminal.asked.is_empty());
+        // An empty variable is ignored and the terminal is asked.
+        let asked = unlock_with(source, &mut terminal, false, &with(Some("")));
+        // (the key file does not exist, so reading it needs nothing)
+        assert!(asked.unwrap().needs_passphrase());
+        assert_eq!(terminal.secret("a").unwrap(), "do terminal");
+        assert!(terminal.secret("b").is_err());
+        // Other key sources never need one.
+        let plain = unlock_with(KeySource::Keyring, &mut terminal, true, &with(None));
+        assert_eq!(plain.unwrap(), KeySource::Keyring);
+    }
+
+    #[test]
+    fn auto_sync_sends_each_local_change_and_never_fails_the_command() {
+        let root = tempdir().unwrap();
+        let cloud = root.path().join("nuvem");
+        let object = cloud.join("chamados-sync-v1.bin");
+        let (_dir_a, a) = paths();
+        let (_dir_b, b) = paths();
+        setup_sync(&a, &cloud, &root.path().join("a.key"));
+        setup_sync(&b, &cloud, &root.path().join("b.key"));
+        assert_eq!(run_args(&["sync", "key", "generate"], &a).0, 0);
+        let (_, key, _) = run_args(&["sync", "key", "export"], &a);
+        assert_eq!(run_with_input(&["sync", "key", "import"], &b, &key).0, 0);
+
+        // Off by default: nothing leaves the machine by itself.
+        run_args(
+            &["profile", "init", "--username", "ana", "--sync", "true"],
+            &a,
+        );
+        run_args(&["title", "5", "Primeiro"], &a);
+        assert!(!object.exists());
+
+        // On, with nothing to synchronize yet (a private profile only): still nothing.
+        assert_eq!(run_args(&["sync", "setup", "--auto", "true"], &b).0, 0);
+        let (code, out, _) = run_args(&["profile", "init", "privado"], &b);
+        assert_eq!((code, out.contains("aviso")), (0, false));
+        assert!(!object.exists());
+
+        // On, with a synchronized profile: every change goes up right away.
+        assert_eq!(run_args(&["sync", "setup", "--auto", "true"], &a).0, 0);
+        let (code, out, err) = run_args(&["title", "5", "Segundo"], &a);
+        assert_eq!(
+            (code, out.as_str(), err.as_str()),
+            (0, "Título local do chamado #5 salvo.\n", "")
+        );
+        assert!(object.exists());
+        assert_eq!(run_args(&["sync", "--quiet"], &b).0, 0);
+        assert_eq!(run_args(&["title", "5"], &b).1, "Segundo\n");
+        // Reading a title is not a change.
+        let before = std::fs::read(&object).unwrap();
+        run_args(&["title", "5"], &a);
+        assert_eq!(std::fs::read(&object).unwrap(), before);
+
+        // Removing a synchronized profile is announced too, even though the profile is gone.
+        assert_eq!(
+            run_args(&["profile", "remove", "default", "--yes"], &a).0,
+            0
+        );
+        assert_eq!(run_args(&["sync", "--quiet"], &b).0, 0);
+        let shown = run_args(&["profile", "show"], &b).1;
+        assert!(shown.contains("perfil padrão ainda não gravado"), "{shown}");
+
+        // A failure is only reported; the command itself succeeded.
+        std::fs::remove_file(root.path().join("a.key")).unwrap();
+        let (code, out, err) = run_args(&["profile", "init", "--sync", "true"], &a);
+        assert_eq!((code, err.as_str()), (0, ""));
+        assert!(
+            out.contains("aviso: a sincronização automática falhou"),
+            "{out}"
+        );
+        assert!(out.contains("nenhuma chave"), "{out}");
+
+        // Turned off again.
+        assert_eq!(run_args(&["sync", "setup", "--auto", "false"], &a).0, 0);
+        let (_, out, _) = run_args(&["title", "6", "Terceiro"], &a);
+        assert!(!out.contains("aviso"), "{out}");
+    }
+
+    #[test]
+    fn only_changes_to_synced_data_trigger_the_automatic_sync() {
+        let command = |args: &[&str]| {
+            let argv = std::iter::once("chamados").chain(args.iter().copied());
+            Cli::try_parse_from(argv).unwrap().command
+        };
+        for changes in [
+            &["title", "5", "x"][..],
+            &["title", "5", "--remove"],
+            &["profile", "init"],
+            &["profile", "update", "--sync", "true"],
+            &["profile", "remove", "p", "--yes"],
+        ] {
+            assert!(changes_synced_data(&command(changes)), "{changes:?}");
+        }
+        for reads in [
+            &["title", "5"][..],
+            &["profile", "list"],
+            &["profile", "show"],
+            &["list"],
+            &["status"],
+        ] {
+            assert!(!changes_synced_data(&command(reads)), "{reads:?}");
+        }
+        assert!(!changes_synced_data(&None));
+    }
+
+    #[test]
+    fn the_scheduler_templates_are_printed_or_installed() {
+        let (dir, paths) = paths();
+        let cron = run_args(&["sync", "automation", "--platform", "cron"], &paths).1;
+        assert!(
+            cron.contains("*/5 * * * *") && cron.contains("sync --quiet"),
+            "{cron}"
+        );
+        assert!(cron.contains("Dica:"), "{cron}");
+        let windows = run_args(
+            &[
+                "sync",
+                "automation",
+                "--platform",
+                "windows",
+                "--interval",
+                "15",
+            ],
+            &paths,
+        )
+        .1;
+        assert!(
+            windows.contains("schtasks /Create /SC MINUTE /MO 15"),
+            "{windows}"
+        );
+        let systemd = run_args(&["sync", "automation", "--platform", "systemd"], &paths).1;
+        for expected in [
+            "[Timer]",
+            "OnUnitActiveSec=5min",
+            "ExecStart=",
+            "systemctl --user enable --now chamados-sync.timer",
+        ] {
+            assert!(systemd.contains(expected), "{expected}: {systemd}");
+        }
+        // Without a platform, the one of this system is used.
+        let default = run_args(&["sync", "automation"], &paths);
+        assert_eq!(default.0, 0);
+        assert!(default.1.contains("sync --quiet"));
+
+        for interval in ["0", "60"] {
+            let (code, _, err) = run_args(&["sync", "automation", "--interval", interval], &paths);
+            assert_eq!(code, 1);
+            assert!(err.contains("entre 1 e 59"), "{err}");
+        }
+        let (code, _, err) = run_args(
+            &["sync", "automation", "--platform", "cron", "--install"],
+            &paths,
+        );
+        assert_eq!(code, 1);
+        assert!(err.contains("só existe para o systemd"), "{err}");
+
+        let (code, out, err) = run_args(
+            &[
+                "sync",
+                "automation",
+                "--platform",
+                "systemd",
+                "--install",
+                "--interval",
+                "10",
+            ],
+            &paths,
+        );
+        assert_eq!((code, err.as_str()), (0, ""));
+        assert!(out.contains("Arquivos gravados em"), "{out}");
+        let units = dir.path().join("systemd").join("user");
+        let timer = std::fs::read_to_string(units.join("chamados-sync.timer")).unwrap();
+        assert!(timer.contains("OnUnitActiveSec=10min"));
+        let service = std::fs::read_to_string(units.join("chamados-sync.service")).unwrap();
+        assert!(service.contains("sync --quiet"));
     }
 
     #[test]

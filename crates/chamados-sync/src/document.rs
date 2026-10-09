@@ -3,16 +3,20 @@
 //! One [`ProfileDoc`] per profile that has `sync = true`: the profile settings (one entry) and the
 //! local ticket titles (one entry per ticket). Every entry carries the time of its last change; merging
 //! keeps, per entry, the newest one (ties are broken by comparing the content, so the result does not
-//! depend on the order of the arguments). Removed titles stay as entries without a title (tombstones).
+//! depend on the order of the arguments). Removed titles stay as entries without a title (tombstones),
+//! and so do removed profiles: `removed_at` marks the moment a profile was removed, and a profile is
+//! gone while that moment is not older than its settings (recreating it later brings it back).
 //!
 //! Sessions, passwords and cloud credentials are not part of the document: the types here simply have
 //! nowhere to put them.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fs};
 
 use chamados_core::{TitleEntry, TitleStore};
 use serde::{Deserialize, Serialize};
-use suap_core::{list_profiles, load_config, save_config, AppPaths, OpenDefaults, SuapConfig};
+use suap_core::{
+    list_profiles, load_config, remove_config, save_config, AppPaths, OpenDefaults, SuapConfig,
+};
 use url::Url;
 
 use crate::SyncError;
@@ -62,6 +66,20 @@ impl SettingsEntry {
 pub struct ProfileDoc {
     pub settings: Option<SettingsEntry>,
     pub titles: BTreeMap<String, TitleEntry>,
+    /// When the profile was removed (milliseconds since the epoch), if it ever was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed_at: Option<u64>,
+}
+
+impl ProfileDoc {
+    /// Whether the profile is currently removed: it was removed and not recreated afterwards.
+    pub fn is_removed(&self) -> bool {
+        self.removed_at.is_some_and(|removed_at| {
+            self.settings
+                .as_ref()
+                .is_none_or(|settings| settings.updated_at <= removed_at)
+        })
+    }
 }
 
 /// Everything that is synchronized.
@@ -123,6 +141,7 @@ fn merge_profiles(left: &ProfileDoc, right: &ProfileDoc) -> ProfileDoc {
         (Some(only), None) | (None, Some(only)) => Some(only.clone()),
         (None, None) => None,
     };
+    let removed_at = left.removed_at.max(right.removed_at);
     let mut titles = left.titles.clone();
     for (id, incoming) in &right.titles {
         match titles.get(id) {
@@ -132,12 +151,41 @@ fn merge_profiles(left: &ProfileDoc, right: &ProfileDoc) -> ProfileDoc {
             }
         }
     }
-    ProfileDoc { settings, titles }
+    // Whatever was written before the removal belongs to the profile that no longer exists.
+    if let Some(removed_at) = removed_at {
+        titles.retain(|_, entry| entry.updated_at > removed_at);
+    }
+    ProfileDoc {
+        settings,
+        titles,
+        removed_at,
+    }
+}
+
+/// Profiles removed on this machine, with the time of each removal.
+fn load_removals(paths: &AppPaths) -> Result<BTreeMap<String, u64>, SyncError> {
+    let file = paths.removed_profiles_file();
+    if !file.exists() {
+        return Ok(BTreeMap::new());
+    }
+    Ok(serde_json::from_slice(&fs::read(file)?)?)
+}
+
+/// Remembers that profile `name` was removed at `removed_at`, so the next sync tells the other devices.
+pub fn record_removal(paths: &AppPaths, name: &str, removed_at: u64) -> Result<(), SyncError> {
+    let mut removals = load_removals(paths)?;
+    let latest = removals.entry(name.to_owned()).or_default();
+    *latest = (*latest).max(removed_at);
+    paths.ensure_dirs()?;
+    let bytes = serde_json::to_vec(&removals)?;
+    fs::write(paths.removed_profiles_file(), bytes)?;
+    Ok(())
 }
 
 /// The local state of every profile with `sync = true` (only `only`, when given).
 pub fn collect_local(paths: &AppPaths, only: Option<&str>) -> Result<SyncDocument, SyncError> {
     let mut document = SyncDocument::default();
+    let removals = load_removals(paths)?;
     for (name, config) in list_profiles(paths)? {
         if !config.sync || only.is_some_and(|only| only != name) {
             continue;
@@ -145,12 +193,19 @@ pub fn collect_local(paths: &AppPaths, only: Option<&str>) -> Result<SyncDocumen
         let profile_paths = paths.clone().with_profile(&name)?;
         let titles = TitleStore::open(profile_paths.titles_file())?;
         document.profiles.insert(
-            name,
+            name.clone(),
             ProfileDoc {
                 settings: Some(SettingsEntry::from_config(&config)),
                 titles: titles.entries().clone(),
+                removed_at: removals.get(&name).copied(),
             },
         );
+    }
+    for (name, removed_at) in removals {
+        if only.is_some_and(|only| only != name) {
+            continue;
+        }
+        document.profiles.entry(name).or_default().removed_at = Some(removed_at);
     }
     Ok(document)
 }
@@ -162,13 +217,15 @@ pub struct ApplyReport {
     pub profiles_created: usize,
     /// Profiles whose settings were replaced by a newer copy.
     pub settings_updated: usize,
+    /// Profiles deleted here because they were removed on another device.
+    pub profiles_removed: usize,
     /// Title entries added or replaced.
     pub titles_updated: usize,
 }
 
 impl ApplyReport {
     pub fn total(&self) -> usize {
-        self.profiles_created + self.settings_updated + self.titles_updated
+        self.profiles_created + self.settings_updated + self.profiles_removed + self.titles_updated
     }
 }
 
@@ -190,6 +247,15 @@ pub fn apply_merged(
         let profile_paths = paths.clone().with_profile(name)?;
         let local = load_config(&profile_paths)?;
         if local.as_ref().is_some_and(|local| !local.sync) {
+            continue;
+        }
+        if remote.is_removed() {
+            if local.is_some() {
+                report.profiles_removed += 1;
+                if write {
+                    delete_profile(&profile_paths)?;
+                }
+            }
             continue;
         }
         if let Some(settings) = &remote.settings {
@@ -219,6 +285,17 @@ pub fn apply_merged(
     Ok(report)
 }
 
+/// Deletes what a profile keeps on this machine: its settings, session and titles.
+fn delete_profile(paths: &AppPaths) -> Result<(), SyncError> {
+    remove_config(paths)?;
+    for file in [paths.session_file(), paths.titles_file()] {
+        if file.exists() {
+            fs::remove_file(file)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,6 +319,7 @@ mod tests {
 
     fn profile(settings: Option<SettingsEntry>, titles: &[(&str, TitleEntry)]) -> ProfileDoc {
         ProfileDoc {
+            removed_at: None,
             settings,
             titles: titles
                 .iter()
@@ -471,11 +549,12 @@ mod tests {
             bucket: Some("b".to_owned()),
             prefix: Some("x".to_owned()),
             conditional_writes: Some(true),
+            auto: Some(true),
         };
         let local_only = field_names(&sync_settings);
         assert_eq!(
             local_only.len(),
-            9,
+            10,
             "classify the new sync setting for RS-03"
         );
         let document = document(&[(
@@ -560,6 +639,7 @@ mod tests {
             ApplyReport {
                 profiles_created: 1,
                 settings_updated: 1,
+                profiles_removed: 0,
                 titles_updated: 2
             }
         );
@@ -610,6 +690,111 @@ mod tests {
                 .unwrap()
                 .profiles_created,
             1
+        );
+    }
+
+    fn removed(
+        settings: Option<SettingsEntry>,
+        titles: &[(&str, TitleEntry)],
+        at: u64,
+    ) -> ProfileDoc {
+        ProfileDoc {
+            removed_at: Some(at),
+            ..profile(settings, titles)
+        }
+    }
+
+    #[test]
+    fn a_removal_wins_over_older_data_and_a_later_recreation_wins_over_the_removal() {
+        let alive = document(&[(
+            "p",
+            profile(
+                Some(settings("a", 5)),
+                &[
+                    ("1", entry(Some("velho"), 4)),
+                    ("2", entry(Some("novo"), 9)),
+                ],
+            ),
+        )]);
+        let gone = document(&[("p", removed(None, &[], 7))]);
+        let merged = merge(&alive, &gone);
+        assert_eq!(merged, merge(&gone, &alive));
+        assert_eq!(merge(&merged, &merged), merged);
+        let doc = &merged.profiles["p"];
+        assert!(doc.is_removed());
+        assert_eq!(doc.removed_at, Some(7));
+        assert_eq!(doc.titles.keys().collect::<Vec<_>>(), ["2"]);
+
+        let recreated = document(&[("p", profile(Some(settings("b", 8)), &[]))]);
+        let back = merge(&merged, &recreated);
+        assert_eq!(back, merge(&recreated, &merged));
+        assert!(!back.profiles["p"].is_removed());
+        assert_eq!(back.profiles["p"].removed_at, Some(7));
+        // Removing and recreating in the same instant counts as removed.
+        assert!(removed(Some(settings("c", 7)), &[], 7).is_removed());
+        assert!(!profile(None, &[]).is_removed());
+    }
+
+    #[test]
+    fn removals_are_remembered_and_sent_with_the_next_sync() {
+        let (_dir, paths) = paths();
+        assert_eq!(
+            collect_local(&paths, None).unwrap(),
+            SyncDocument::default()
+        );
+        record_removal(&paths, "velho", 50).unwrap();
+        record_removal(&paths, "velho", 40).unwrap();
+        record_removal(&paths, "outro", 10).unwrap();
+        save(&paths, "ativo", true, 100);
+        record_removal(&paths, "ativo", 20).unwrap();
+
+        let all = collect_local(&paths, None).unwrap();
+        assert_eq!(all.profiles["velho"].removed_at, Some(50));
+        assert!(all.profiles["velho"].settings.is_none());
+        assert_eq!(all.profiles["outro"].removed_at, Some(10));
+        // A profile recreated after its removal keeps the mark, but is not removed.
+        assert_eq!(all.profiles["ativo"].removed_at, Some(20));
+        assert!(!all.profiles["ativo"].is_removed());
+
+        let only = collect_local(&paths, Some("velho")).unwrap();
+        assert_eq!(only.profiles.keys().collect::<Vec<_>>(), ["velho"]);
+        let json = String::from_utf8(all.encode().unwrap()).unwrap();
+        assert!(json.contains("removed_at"));
+        assert!(!SyncDocument::default().encode().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_profile_removed_elsewhere_is_deleted_here() {
+        let (_dir, paths) = paths();
+        let doomed = save(&paths, "velho", true, 5);
+        let mut titles = TitleStore::open(doomed.titles_file()).unwrap();
+        titles.set("1", "t", 6).unwrap();
+        titles.save().unwrap();
+        doomed.ensure_dirs().unwrap();
+        std::fs::write(doomed.session_file(), "x").unwrap();
+        let private = save(&paths, "privado", false, 5);
+        let remote = document(&[
+            ("velho", removed(Some(settings("u", 5)), &[], 9)),
+            ("privado", removed(None, &[], 9)),
+            ("nunca-existiu", removed(None, &[], 9)),
+        ]);
+
+        let dry = apply_merged(&paths, &remote, None, false).unwrap();
+        assert_eq!((dry.profiles_removed, dry.total()), (1, 1));
+        assert!(load_config(&doomed).unwrap().is_some());
+
+        let report = apply_merged(&paths, &remote, None, true).unwrap();
+        assert_eq!(report, dry);
+        assert!(load_config(&doomed).unwrap().is_none());
+        assert!(!doomed.session_file().exists() && !doomed.titles_file().exists());
+        assert!(load_config(&private).unwrap().is_some());
+        assert!(load_config(&profile_paths(&paths, "nunca-existiu"))
+            .unwrap()
+            .is_none());
+        // Once it is gone, applying again has nothing left to do.
+        assert_eq!(
+            apply_merged(&paths, &remote, None, true).unwrap().total(),
+            0
         );
     }
 

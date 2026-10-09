@@ -3,39 +3,83 @@
 //! - [`KeySource::Keyring`]: the system secret store (Windows Credential Manager, macOS Keychain,
 //!   Linux Secret Service). It needs an unlocked desktop session, so it does not suit `cron`.
 //! - [`KeySource::File`]: a hexadecimal key in a file only the owner can read (`0600` on Unix).
+//! - [`KeySource::Protected`]: a key file sealed with a passphrase (see [`crate::protected`]), for
+//!   interactive use on machines without a keyring.
 //! - [`KeySource::Env`]: the hexadecimal key in the [`KEY_ENV`] environment variable (read only).
 
 use std::{fs, path::PathBuf};
 
-use crate::{crypto::Key, SyncError};
+use crate::{
+    crypto::Key,
+    protected::{seal, unseal},
+    SyncError,
+};
 
 /// Environment variable holding the hexadecimal key for [`KeySource::Env`].
 pub const KEY_ENV: &str = "CHAMADOS_SYNC_KEY";
+/// Environment variable with the passphrase of a protected key file (for scripts; the terminal is asked otherwise).
+pub const PASSPHRASE_ENV: &str = "CHAMADOS_SYNC_PASSPHRASE";
 const KEYRING_SERVICE: &str = "chamados-sync";
 const KEYRING_USER: &str = "encryption-key";
+
+/// A passphrase; it is never shown, not even by `Debug`.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Passphrase(String);
+
+impl Passphrase {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self(text.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Passphrase {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Passphrase(..)")
+    }
+}
 
 /// Where the key is read from and written to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeySource {
     Keyring,
     File(PathBuf),
+    /// A key file sealed with a passphrase; the passphrase is empty until it is [provided](Self::with_passphrase).
+    Protected(PathBuf, Passphrase),
     Env,
 }
 
 impl KeySource {
-    /// The source named `name` (`keyring`, `file` or `env`); `file` needs a path.
+    /// The source named `name` (`keyring`, `file`, `protected-file` or `env`); the files need a path.
     pub fn parse(name: &str, file: Option<PathBuf>) -> Result<Self, SyncError> {
         match (name, file) {
             ("keyring", _) => Ok(Self::Keyring),
             ("env", _) => Ok(Self::Env),
             ("file", Some(path)) => Ok(Self::File(path)),
-            ("file", None) => Err(SyncError::Key(
-                "the file key source needs a key file path".to_owned(),
+            ("protected-file", Some(path)) => Ok(Self::Protected(path, Passphrase::default())),
+            ("file" | "protected-file", None) => Err(SyncError::Key(
+                "the file key sources need a key file path".to_owned(),
             )),
             (other, _) => Err(SyncError::Key(format!(
-                "unknown key source {other:?}: use keyring, file or env"
+                "unknown key source {other:?}: use keyring, file, protected-file or env"
             ))),
         }
+    }
+
+    /// This source with `passphrase` set (only a protected file uses it).
+    pub fn with_passphrase(self, passphrase: Passphrase) -> Self {
+        match self {
+            Self::Protected(path, _) => Self::Protected(path, passphrase),
+            other => other,
+        }
+    }
+
+    /// Whether a passphrase is still missing before the key can be read or written.
+    pub fn needs_passphrase(&self) -> bool {
+        matches!(self, Self::Protected(_, passphrase) if passphrase.as_str().is_empty())
     }
 
     /// Short name, as accepted by [`KeySource::parse`].
@@ -43,6 +87,7 @@ impl KeySource {
         match self {
             Self::Keyring => "keyring",
             Self::File(_) => "file",
+            Self::Protected(..) => "protected-file",
             Self::Env => "env",
         }
     }
@@ -67,10 +112,25 @@ pub fn load_key_with_env(
             check_private(path)?;
             Ok(Some(Key::from_hex(&fs::read_to_string(path)?)?))
         }
+        KeySource::Protected(path, passphrase) => {
+            if !path.exists() {
+                return Ok(None);
+            }
+            check_private(path)?;
+            unseal(&fs::read_to_string(path)?, passphrase.as_str()).map(Some)
+        }
         KeySource::Keyring => match keyring_entry()?.get_secret() {
             Err(keyring_core::Error::NoEntry) => Ok(None),
             found => Ok(Some(Key::from_bytes(&found?)?)),
         },
+    }
+}
+
+/// Whether a key is stored in `source`. Unlike [`load_key`], it never needs the passphrase.
+pub fn key_exists(source: &KeySource) -> Result<bool, SyncError> {
+    match source {
+        KeySource::Protected(path, _) => Ok(path.exists()),
+        other => Ok(load_key(other)?.is_some()),
     }
 }
 
@@ -81,7 +141,7 @@ pub fn store_key(source: &KeySource, key: &Key, overwrite: bool) -> Result<(), S
             "the env key source is read only: set {KEY_ENV} yourself"
         )));
     }
-    if !overwrite && load_key(source)?.is_some() {
+    if !overwrite && key_exists(source)? {
         return Err(SyncError::Key(
             "a key already exists; use --force to replace it (data encrypted with it becomes unreadable)"
                 .to_owned(),
@@ -89,6 +149,9 @@ pub fn store_key(source: &KeySource, key: &Key, overwrite: bool) -> Result<(), S
     }
     match source {
         KeySource::File(path) => write_private(path, &key.to_hex()),
+        KeySource::Protected(path, passphrase) => {
+            write_private(path, &seal(key, passphrase.as_str())?)
+        }
         _ => Ok(keyring_entry()?.set_secret(key.as_bytes())?),
     }
 }
@@ -208,11 +271,61 @@ mod tests {
             KeySource::Keyring,
             KeySource::Env,
             KeySource::File(PathBuf::new()),
+            KeySource::Protected(PathBuf::new(), Passphrase::default()),
         ]
         .iter()
         .map(KeySource::name)
         .collect();
-        assert_eq!(names, ["keyring", "env", "file"]);
+        assert_eq!(names, ["keyring", "env", "file", "protected-file"]);
+        assert_eq!(
+            KeySource::parse("protected-file", Some(PathBuf::from("k"))).unwrap(),
+            KeySource::Protected(PathBuf::from("k"), Passphrase::default())
+        );
+        assert!(KeySource::parse("protected-file", None).is_err());
+    }
+
+    #[test]
+    fn a_protected_file_needs_its_passphrase_and_hides_it() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("sub").join("protegida.key");
+        let locked = KeySource::parse("protected-file", Some(path.clone())).unwrap();
+        assert!(locked.needs_passphrase());
+        assert!(!KeySource::Keyring.needs_passphrase());
+        assert!(!key_exists(&locked).unwrap());
+        assert_eq!(load_key(&locked).unwrap(), None);
+
+        let source = locked.clone().with_passphrase(Passphrase::new("frase"));
+        assert!(!source.needs_passphrase());
+        assert!(!format!("{source:?}").contains("frase"));
+        let key = Key::generate();
+        store_key(&source, &key, false).unwrap();
+        assert!(
+            key_exists(&locked).unwrap(),
+            "existence needs no passphrase"
+        );
+        assert_eq!(load_key(&source).unwrap(), Some(key.clone()));
+        assert!(!fs::read_to_string(&path).unwrap().contains(&key.to_hex()));
+
+        // Replacing needs --force; reading needs the right passphrase.
+        assert!(store_key(&source, &Key::generate(), false).is_err());
+        let wrong = locked.clone().with_passphrase(Passphrase::new("outra"));
+        assert!(load_key(&wrong)
+            .unwrap_err()
+            .to_string()
+            .contains("wrong passphrase"));
+        assert!(
+            load_key(&locked).is_err(),
+            "an empty passphrase opens nothing"
+        );
+        assert!(store_key(&locked, &key, true).is_err());
+        let other = Key::generate();
+        store_key(&source, &other, true).unwrap();
+        assert_eq!(load_key(&source).unwrap(), Some(other));
+        // Other sources ignore a passphrase.
+        assert_eq!(
+            KeySource::Env.with_passphrase(Passphrase::new("x")),
+            KeySource::Env
+        );
     }
 
     #[test]

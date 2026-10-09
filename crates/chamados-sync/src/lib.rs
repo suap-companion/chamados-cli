@@ -20,6 +20,7 @@ pub mod engine;
 #[cfg(test)]
 mod fake_s3;
 pub mod keys;
+pub mod protected;
 pub mod s3;
 pub mod setup;
 pub mod sigv4;
@@ -28,10 +29,11 @@ pub use backend::{Condition, DirectoryBackend, Object, PutOutcome, SyncBackend};
 pub use credentials::S3Credentials;
 pub use crypto::Key;
 pub use document::{
-    apply_merged, collect_local, merge, ApplyReport, ProfileDoc, SettingsEntry, SyncDocument,
+    apply_merged, collect_local, merge, record_removal, ApplyReport, ProfileDoc, SettingsEntry,
+    SyncDocument,
 };
 pub use engine::{sync_once, SyncLock, SyncOptions, SyncReport, OBJECT_NAME};
-pub use keys::{load_key, store_key, KeySource, KEY_ENV};
+pub use keys::{key_exists, load_key, store_key, KeySource, Passphrase, KEY_ENV, PASSPHRASE_ENV};
 pub use s3::{S3Backend, S3Settings};
 pub use setup::{
     backend_from, key_source_from, validate_settings, AnyBackend, DIRECTORY_BACKEND, R2_BACKEND,

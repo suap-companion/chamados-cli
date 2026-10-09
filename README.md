@@ -180,7 +180,7 @@ Os **títulos locais** e as **configurações dos perfis** podem ser sincronizad
 
 ```bash
 # 1. Onde guardar (por enquanto, uma pasta: sincronizada por outro programa, disco de rede ou, para testar, qualquer diretório)
-chamados sync setup --path /caminho/da/pasta --key-source file    # key-source: keyring (padrão), file ou env
+chamados sync setup --path /caminho/da/pasta --key-source file    # key-source: keyring (padrão), file, protected-file ou env
 
 # 2. A chave (uma só, para todos os seus dispositivos)
 chamados sync key generate
@@ -228,9 +228,12 @@ Em um script, `chamados sync credentials set` também aceita as duas linhas pela
 |----------------|------|-------------|
 | `keyring` (padrão) | repositório de segredos do sistema (Windows Credential Manager, macOS Keychain, Linux Secret Service) | desktop com sessão aberta |
 | `file` | arquivo `~/.config/suap/sync.key` (ou `--key-file`), permissão `0600` verificada no Linux e no macOS | servidores, SSH e **automação** |
+| `protected-file` | o mesmo arquivo, mas **cifrado com uma frase-senha** (Argon2id + XChaCha20-Poly1305) | uso interativo em máquina sem chaveiro |
 | `env` | variável de ambiente `CHAMADOS_SYNC_KEY` (somente leitura) | contêineres e CI |
 
 O chaveiro de um desktop só abre numa sessão gráfica desbloqueada, então `cron` e timers devem usar `file` ou `env`.
+
+**Frase-senha.** Com `--key-source protected-file`, `sync key generate` e `sync key import` pedem a frase duas vezes; `sync` e `sync key export` pedem uma. A frase também pode vir da variável `CHAMADOS_SYNC_PASSPHRASE`, mas guardá-la ao lado do arquivo anula a proteção, e um `cron` não consegue digitá-la: para automação, use `file` ou `env`. Quem esquecer a frase perde a chave (e, sem outra cópia dela, os dados da nuvem).
 
 ### Opções do `sync`
 
@@ -245,11 +248,17 @@ Duas execuções ao mesmo tempo não se atrapalham: a segunda vê o bloqueio (`s
 
 Cada título e cada bloco de configurações carrega o instante da última alteração (em milissegundos) e **o mais novo vence**, entrada por entrada; em empate de instante, vence o conteúdo maior (sempre o mesmo resultado, em qualquer ordem). Remover um título deixa uma marca de remoção, para a remoção também chegar aos outros dispositivos. Se alguém gravar na nuvem durante a sua rodada, ela recomeça do download (até 5 tentativas). Backends sem escrita condicional gravam e **releem para confirmar**.
 
-Limite desta versão: remover um perfil (`profile remove`) **não** o remove da nuvem, e um perfil que existe na nuvem é recriado no próximo `sync`.
+Remover um perfil que sincroniza (`profile remove`) também deixa uma marca de remoção: no próximo `sync`, os outros dispositivos apagam o perfil (configuração, sessão e títulos) e ele não volta da nuvem. Recriar o perfil depois (`profile init`) o traz de volta, sem os títulos anteriores à remoção.
+
+### Sincronizar a cada alteração
+
+`chamados sync setup --auto true` faz o `title` e os comandos `profile init/update/remove` sincronizarem logo após gravar, para reduzir o intervalo entre dispositivos sem esperar o agendamento. Só dispara se houver algum perfil com `sync` ligado, e uma falha (sem rede, por exemplo) apenas mostra um aviso: o comando que alterou o dado continua valendo, e o agendamento ou um `chamados sync` posterior recuperam. Com chave em `protected-file`, cada alteração pede a frase-senha (use `file` se isso incomodar).
 
 ### Automatizar (a cada 5 minutos)
 
-Com a chave em `file` ou `env`. No Linux, um **timer do systemd de usuário** (`~/.config/systemd/user/chamados-sync.service` e `.timer`):
+`chamados sync automation` mostra os modelos prontos para o seu sistema (`--platform systemd|cron|windows`, `--interval <minutos>`), já com o caminho do `chamados` em uso. No Linux, `chamados sync automation --install` grava os arquivos do timer em `~/.config/systemd/user` e mostra o `systemctl --user enable --now chamados-sync.timer` para ativar. Os modelos usam `chamados sync --quiet`.
+
+Com a chave em `file` ou `env`. À mão, no Linux, um **timer do systemd de usuário** (`~/.config/systemd/user/chamados-sync.service` e `.timer`):
 
 ```ini
 # chamados-sync.service
