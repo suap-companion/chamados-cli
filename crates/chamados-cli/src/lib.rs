@@ -13,14 +13,15 @@ use std::{
 
 use chamados_core::{
     validate_title, Attachment, Message, NewTicket, Resolution, SuapTicketSource, TicketDetails,
-    TicketError, TicketQueue, TicketSource, TitleStore,
+    TicketError, TicketFilter, TicketQueue, TicketSource, TitleStore, ASSIGNMENTS, ORDERS,
+    RELATIONS, STATUSES,
 };
 use chamados_sync::{
     backend_from, key_exists, key_source_from, load_key, record_removal, store_key, sync_once,
     validate_settings, Key, KeySource, Passphrase, S3Credentials, SyncBackend, SyncLock,
     SyncOptions, DIRECTORY_BACKEND, PASSPHRASE_ENV, R2_BACKEND, S3_BACKEND,
 };
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{builder::PossibleValuesParser, Args, Parser, Subcommand, ValueEnum};
 use suap_core::{
     list_profiles, load_config, load_sync_settings, remove_config, save_config, save_sync_settings,
     AppPaths, SuapClient, SuapConfig, SuapError, SyncSettings, DEFAULT_PROFILE,
@@ -57,12 +58,8 @@ enum Command {
         #[arg(long)]
         username: Option<String>,
     },
-    /// Lista os chamados do SUAP usando a sessão salva por `login`.
-    List {
-        /// Lista os "Meus chamados" ativos em vez da fila de suporte.
-        #[arg(long)]
-        meus: bool,
-    },
+    /// Lista os chamados do SUAP usando a sessão salva por `login`, com filtros, busca e páginas.
+    List(Box<ListArgs>),
     /// Exibe os detalhes de um chamado do SUAP usando a sessão salva por `login`.
     Show {
         /// Número do chamado (ex.: 559298).
@@ -303,6 +300,63 @@ struct MessageArgs {
     message: Option<String>,
 }
 
+/// The readable names of a table of options, for clap to accept and list.
+fn names(table: &[(&'static str, &'static str)]) -> Vec<&'static str> {
+    table.iter().map(|(name, _)| *name).collect()
+}
+
+#[derive(Debug, Args)]
+struct ListArgs {
+    /// Lista os "Meus chamados" ativos em vez da fila de suporte.
+    #[arg(long)]
+    meus: bool,
+    /// Só este número de chamado.
+    #[arg(long)]
+    id: Option<u64>,
+    /// Texto procurado nas descrições, comentários e notas internas (fila de suporte).
+    #[arg(long)]
+    busca: Option<String>,
+    /// Situação (repetível; fila de suporte). Sem esta opção o SUAP esconde os chamados já encerrados.
+    #[arg(long, value_parser = PossibleValuesParser::new(names(&STATUSES)))]
+    status: Vec<String>,
+    /// Todas as situações, inclusive resolvidos, fechados e cancelados.
+    #[arg(long)]
+    todos: bool,
+    /// Abertos a partir deste dia (AAAA-MM-DD).
+    #[arg(long)]
+    desde: Option<String>,
+    /// Abertos até este dia (AAAA-MM-DD).
+    #[arg(long)]
+    ate: Option<String>,
+    /// Atribuição (fila de suporte).
+    #[arg(long, value_parser = PossibleValuesParser::new(names(&ASSIGNMENTS)))]
+    atribuidos: Option<String>,
+    /// Ordem (fila de suporte).
+    #[arg(long, value_parser = PossibleValuesParser::new(names(&ORDERS)))]
+    ordenar: Option<String>,
+    /// Do último para o primeiro (precisa de --ordenar).
+    #[arg(long)]
+    desc: bool,
+    /// Só os chamados com SLA estourado (fila de suporte).
+    #[arg(long)]
+    sla_estourado: bool,
+    /// Minha relação com o chamado (com --meus).
+    #[arg(long, value_parser = PossibleValuesParser::new(names(&RELATIONS)))]
+    relacao: Option<String>,
+    /// Página a mostrar (o SUAP mostra 15 chamados por página).
+    #[arg(long, conflicts_with = "todas_paginas")]
+    pagina: Option<u32>,
+    /// Percorre todas as páginas.
+    #[arg(long)]
+    todas_paginas: bool,
+    /// Só os chamados cujo título local contém este texto (sem diferenciar maiúsculas).
+    #[arg(long)]
+    titulo: Option<String>,
+    /// Mostra no máximo este número de chamados.
+    #[arg(long)]
+    limite: Option<usize>,
+}
+
 #[derive(Debug, Args)]
 struct ResolveArgs {
     #[command(flatten)]
@@ -509,7 +563,7 @@ fn dispatch(
         },
         Some(Command::SessionStatus) => session_status(paths, out),
         Some(Command::Login { username }) => login(paths, username, password, out),
-        Some(Command::List { meus }) => list(paths, meus, out),
+        Some(Command::List(args)) => list(paths, *args, out),
         Some(Command::Show { id }) => show(paths, id, out),
         Some(Command::Open(args)) => open(paths, args, input, out),
         Some(Command::Comment(args)) => send_message(paths, args, Message::Comment, input, out),
@@ -788,12 +842,27 @@ fn login(
     Ok(())
 }
 
-fn list(paths: &AppPaths, mine: bool, out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
+fn list(paths: &AppPaths, args: ListArgs, out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
     let config = profile_config(paths)?;
-    let queue = if mine {
+    let queue = if args.meus {
         TicketQueue::Mine
     } else {
         TicketQueue::Support
+    };
+    let filter = TicketFilter {
+        id: args.id,
+        text: args.busca,
+        statuses: args.status,
+        all_statuses: args.todos,
+        since: args.desde,
+        until: args.ate,
+        assignment: args.atribuidos,
+        order_by: args.ordenar,
+        descending: args.desc,
+        sla_exceeded: args.sla_estourado,
+        relation: args.relacao,
+        page: args.pagina,
+        all_pages: args.todas_paginas,
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -801,8 +870,23 @@ fn list(paths: &AppPaths, mine: bool, out: &mut dyn Write) -> Result<(), Box<dyn
     let client = SuapClient::open(paths, &config)?;
     let source = SuapTicketSource::new(&client, queue);
 
-    let tickets = runtime.block_on(source.list_tickets()).map_err(explain)?;
+    let tickets = runtime
+        .block_on(source.list_filtered(&filter))
+        .map_err(explain)?;
     let titles = TitleStore::open(paths.titles_file())?;
+    // The local titles never leave this machine, so this filter is applied here.
+    let needle = args.titulo.map(|text| text.to_lowercase());
+    let matches_title = |id: &str| {
+        needle.as_ref().is_none_or(|needle| {
+            let title = titles.get(id).unwrap_or_default();
+            title.to_lowercase().contains(needle.as_str())
+        })
+    };
+    let tickets: Vec<_> = tickets
+        .into_iter()
+        .filter(|ticket| matches_title(&ticket.id))
+        .take(args.limite.unwrap_or(usize::MAX))
+        .collect();
 
     if tickets.is_empty() {
         writeln!(out, "Nenhum chamado encontrado.")?;
@@ -1956,6 +2040,124 @@ mod tests {
             assert_eq!((code, err.as_str()), (0, ""));
             assert_eq!(out, "#7\tEm atendimento\t-\tAssunto\n#8\t-\t-\t-\n");
         }
+    }
+
+    #[test]
+    fn list_filters_searches_and_pages() {
+        let (_dir, paths) = paths();
+        let (runtime, server) = mock_server(true);
+        run_args(&["profile", "init", "--base-url", &server.uri()], &paths);
+        let html = r#"<div class="general-box"><span class="status">Em atendimento</span>
+            <h4><a href="/centralservicos/chamado/7/">REQ #7 <strong>Assunto</strong></a></h4></div>
+            <div class="general-box"><h4><a href="/centralservicos/chamado/8/">REQ #8</a></h4></div>"#;
+        for queue in ["listar_chamados_suporte", "meus_chamados"] {
+            mount_listing(
+                &runtime,
+                &server,
+                &format!("/centralservicos/{queue}/"),
+                ResponseTemplate::new(200).set_body_string(html),
+            );
+        }
+        run_args(&["title", "7", "Atualizar o Moodle"], &paths);
+        let queries = || -> Vec<String> {
+            let requests = runtime.block_on(server.received_requests()).unwrap();
+            requests
+                .iter()
+                .map(|request| request.url.query().unwrap_or_default().to_owned())
+                .collect()
+        };
+
+        // The options go to SUAP, which does the filtering.
+        let (code, out, err) = run_args(
+            &[
+                "list",
+                "--busca",
+                "moodle",
+                "--status",
+                "aberto",
+                "--status",
+                "suspenso",
+                "--desde",
+                "2026-01-02",
+                "--ate",
+                "2026-10-08",
+                "--atribuidos",
+                "mim",
+                "--ordenar",
+                "abertura",
+                "--desc",
+                "--sla-estourado",
+                "--id",
+                "7",
+                "--pagina",
+                "2",
+            ],
+            &paths,
+        );
+        assert_eq!((code, err.as_str()), (0, ""));
+        assert!(out.starts_with("#7\t"), "{out}");
+        assert_eq!(
+            queries()[0],
+            "texto=moodle&status=1&status=6&atribuicoes=1&ordenar_por=aberto_em&tipo_ordenacao=-\
+             &sla_estourado=on&chamado_id=7&data_inicial=02%2F01%2F2026&data_final=08%2F10%2F2026&page=2"
+        );
+        let (code, _, _) = run_args(&["list", "--todos"], &paths);
+        assert_eq!(code, 0);
+        assert_eq!(queries()[1], "todos_status=on");
+        let (code, _, _) = run_args(
+            &[
+                "list",
+                "--meus",
+                "--todos",
+                "--relacao",
+                "algum",
+                "--id",
+                "7",
+            ],
+            &paths,
+        );
+        assert_eq!(code, 0);
+        assert_eq!(queries()[2], "tab=todos&tipo_usuario=RIO&chamado_id=7");
+
+        // The local title and the limit are applied here.
+        let (_, out, _) = run_args(&["list", "--titulo", "MOODLE"], &paths);
+        assert_eq!(out, "#7\tEm atendimento\tAtualizar o Moodle\tAssunto\n");
+        let (_, out, _) = run_args(&["list", "--titulo", "nada"], &paths);
+        assert!(out.contains("Nenhum chamado"), "{out}");
+        let (_, out, _) = run_args(&["list", "--limite", "1"], &paths);
+        assert_eq!(out.lines().count(), 1);
+
+        // Every page: it stops at the first page with nothing new (the mock repeats itself).
+        let before = queries().len();
+        let (code, out, _) = run_args(&["list", "--todas-paginas"], &paths);
+        assert_eq!((code, out.lines().count()), (0, 2));
+        assert_eq!(&queries()[before..], ["", "page=2"]);
+
+        // Mistakes are reported before anything is sent.
+        let before = queries().len();
+        for (args, expected) in [
+            (&["list", "--desc"][..], "needs a sort key"),
+            (&["list", "--relacao", "algum"], "--meus"),
+            (&["list", "--meus", "--busca", "x"], "support queue"),
+            (&["list", "--desde", "ontem"], "invalid date"),
+            (&["list", "--status", "pronto"], "pronto"),
+            (
+                &["list", "--pagina", "2", "--todas-paginas"],
+                "cannot be used",
+            ),
+        ] {
+            let (code, _, err) = run_args(args, &paths);
+            // clap itself refuses some of them (a usage error, code 2)
+            let expected_code =
+                if err.starts_with("error: invalid") || err.contains("cannot be used") {
+                    2
+                } else {
+                    1
+                };
+            assert_eq!(code, expected_code, "{args:?}: {err}");
+            assert!(err.contains(expected), "{args:?}: {err}");
+        }
+        assert_eq!(queries().len(), before);
     }
 
     #[test]
