@@ -2,6 +2,8 @@
 
 Cliente local para acompanhar chamados do SUAP, inicialmente como uma CLI em Rust e futuramente com aplicativo Android.
 
+> **Nota:** Este NÃO é um projeto oficial do IFRN, é um projeto pessoal. Construído sem qualquer apoio ou incentivo institucional.
+
 ## Arquitetura
 
 O projeto é um workspace Cargo com três crates:
@@ -230,6 +232,42 @@ Como nos outros comandos, o `chamados` abre o formulário do SUAP, preenche o qu
 - **`reclassify`**: informe ao menos um entre `--servico`, `--campus` e `--centro`; o que não for informado fica como está (o campus padrão é o do chamado e o centro atual é mantido enquanto o SUAP o oferecer para o novo serviço/campus; senão, escolha com `--centro`). O SUAP recusa quando nada muda e volta o chamado para "Aberto". Não existe "prioridade" na Central de Serviços: trocar o serviço é por aqui.
 - **`tag`**: as tags oferecidas dependem da área dos grupos de atendimento do seu usuário.
 - **`interested`**: a busca de pessoas é a do próprio SUAP (matrícula ou nome); para remover, vale a matrícula, o nome ou o id do usuário.
+
+### Acompanhar mudanças (`watch`)
+
+```bash
+chamados watch                         # seus chamados ativos, consultando a cada 60 s
+chamados watch --mensagens             # avisa também de cada mensagem nova
+chamados watch --suporte --todos       # a fila de suporte, com os encerrados
+chamados watch --rodadas 1 --json      # uma consulta só, uma linha JSON por evento (para cron)
+```
+
+A primeira consulta (ou a primeira de outra lista) só **registra o estado**, sem avisar nada. Depois, cada consulta compara a lista com a anterior e imprime uma linha por mudança:
+
+| Evento (`event` no JSON) | Quando |
+|---|---|
+| `new` | o chamado apareceu na lista |
+| `status` | a situação mudou (`from` → `to`) |
+| `left` | o chamado saiu da lista (em geral, foi resolvido ou fechado; use `--todos` para ele ficar e aparecer como `status`) |
+| `message` | há uma entrada nova na linha do tempo (só com `--mensagens`, que lê a página de cada chamado a cada consulta) |
+
+O estado fica só nesta máquina, em `watch.json` (`watch-<perfil>.json`) no diretório de dados, e **não** é sincronizado. Uma consulta que falha (rede, SUAP fora) vira um aviso e a próxima rodada tenta de novo; sessão expirada encerra o comando pedindo `chamados login`. Para notificar, ligue a saída a outro programa, por exemplo `chamados watch --json | jq -r '"\(.id): \(.event)"'`. `--intervalo` (1 a 86400 s) e `--rodadas` controlam o ritmo; `Ctrl+C` interrompe.
+
+### Saída JSON para scripts
+
+`list`, `show`, `profile show`, `profile list`, `sync --check`, `sync` e `watch` aceitam `--json`. As chaves são estáveis e em inglês (podem ganhar novas, nunca mudar de nome), os ids são números e o que não existe é `null`:
+
+| Comando | Formato |
+|---|---|
+| `list --json` | `[{"id": 7, "status": "...", "title": "título local ou null", "subject": "...", "url": "..."}]` |
+| `show --json` | `{"id", "title", "local_title", "statuses": [...], "service", "url", "fields": [{"label", "value"}], "attachments": [{"number", "name", "path"}], "timeline": [{"date", "text"}]}` |
+| `profile show --json` | `{"profile", "base_url", "username", "open": {"service", "interested", "campus", "center"}, "sync", "session_saved", "file"}` |
+| `profile list --json` | `[{"name", "default", "base_url", "username", "sync"}]` |
+| `sync --check --json` | `{"backend", "conditional_writes", "matches_configuration", "key_source", "key_present"}` |
+| `sync --json` | `{"profiles", "local_changes", "cloud_updated", "dry_run"}` |
+| `watch --json` | um objeto por linha: `{"time", "event", "id", ...campos do evento, "title"}` (e `{"event": "error", "message"}` numa consulta que falhou) |
+
+Mensagens de erro continuam no `stderr`, em texto, com código de saída diferente de zero.
 
 ### Ver detalhes de um chamado
 

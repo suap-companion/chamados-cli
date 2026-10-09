@@ -2,6 +2,8 @@
 //!
 //! The binary entry point (`main.rs`) is a thin wrapper; everything testable lives here.
 
+mod render;
+
 use std::{
     error::Error,
     ffi::OsString,
@@ -12,9 +14,11 @@ use std::{
 };
 
 use chamados_core::{
-    validate_title, Attachment, Direction, Message, NewTicket, Reclassification, Resolution,
-    SuapTicketSource, TicketDetails, TicketError, TicketFilter, TicketQueue, TicketSource,
-    TitleStore, ASSIGNMENTS, ORDERS, RELATIONS, STATUSES,
+    validate_title,
+    watch::{poll, Snapshot},
+    Attachment, Direction, Message, NewTicket, Reclassification, Resolution, SuapTicketSource,
+    TicketDetails, TicketError, TicketFilter, TicketQueue, TicketSource, TitleStore, ASSIGNMENTS,
+    ORDERS, RELATIONS, STATUSES,
 };
 use chamados_sync::{
     backend_from, key_exists, key_source_from, load_key, record_removal, store_key, sync_once,
@@ -64,7 +68,12 @@ enum Command {
     Show {
         /// Número do chamado (ex.: 559298).
         id: u64,
+        /// Imprime JSON (para scripts) em vez de texto.
+        #[arg(long)]
+        json: bool,
     },
+    /// Acompanha chamados e avisa quando algo muda (situação, chamado novo, saída da lista, mensagens).
+    Watch(WatchArgs),
     /// Abre um novo chamado no SUAP usando a sessão salva por `login`.
     Open(OpenArgs),
     /// Adiciona um comentário (visível ao interessado) a um chamado, usando a sessão salva por `login`.
@@ -201,9 +210,16 @@ enum ProfileCommand {
     Show {
         /// Nome do perfil; por padrão, o selecionado por --profile.
         name: Option<String>,
+        /// Imprime JSON (para scripts) em vez de texto.
+        #[arg(long)]
+        json: bool,
     },
     /// Lista os perfis configurados.
-    List,
+    List {
+        /// Imprime JSON (para scripts) em vez de texto.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -248,6 +264,9 @@ struct SyncArgs {
     /// Confere o backend (escrita condicional) e a chave, sem sincronizar.
     #[arg(long)]
     check: bool,
+    /// Imprime JSON (para scripts) em vez de texto.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -421,6 +440,31 @@ struct ListArgs {
     /// Mostra no máximo este número de chamados.
     #[arg(long)]
     limite: Option<usize>,
+    /// Imprime JSON (para scripts) em vez de texto.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct WatchArgs {
+    /// Acompanha a fila de suporte em vez dos seus chamados.
+    #[arg(long)]
+    suporte: bool,
+    /// Inclui os chamados já encerrados (sem isto, o que sai da lista aparece como "saiu da lista").
+    #[arg(long)]
+    todos: bool,
+    /// Avisa também de cada mensagem nova na linha do tempo (lê a página de cada chamado a cada rodada).
+    #[arg(long)]
+    mensagens: bool,
+    /// Segundos entre uma consulta e a seguinte.
+    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=86_400))]
+    intervalo: u64,
+    /// Para depois de tantas consultas (a primeira só registra o estado); sem a opção, segue até ser interrompido.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    rodadas: Option<u32>,
+    /// Imprime um objeto JSON por linha em vez de texto.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -636,6 +680,7 @@ fn auto_sync(paths: &AppPaths, prompt: &mut dyn Prompt, out: &mut dyn Write) {
         quiet: true,
         dry_run: false,
         check: false,
+        json: false,
     };
     let outcome = auto_sync_enabled(paths).and_then(|enabled| {
         if enabled {
@@ -673,13 +718,14 @@ fn dispatch(
             ProfileCommand::Init(args) => profile_init(paths, args, out),
             ProfileCommand::Update(args) => profile_update(paths, args, out),
             ProfileCommand::Remove { name, yes } => profile_remove(paths, &name, yes, out),
-            ProfileCommand::Show { name } => profile_show(paths, name.as_deref(), out),
-            ProfileCommand::List => profile_list(paths, out),
+            ProfileCommand::Show { name, json } => profile_show(paths, name.as_deref(), json, out),
+            ProfileCommand::List { json } => profile_list(paths, json, out),
         },
         Some(Command::SessionStatus) => session_status(paths, out),
         Some(Command::Login { username }) => login(paths, username, password, out),
         Some(Command::List(args)) => list(paths, *args, out),
-        Some(Command::Show { id }) => show(paths, id, out),
+        Some(Command::Show { id, json }) => show(paths, id, json, out),
+        Some(Command::Watch(args)) => watch(paths, &args, out),
         Some(Command::Open(args)) => open(paths, args, input, out),
         Some(Command::Comment(args)) => send_message(paths, args, Message::Comment, input, out),
         Some(Command::Note(args)) => send_message(paths, args, Message::InternalNote, input, out),
@@ -797,14 +843,25 @@ fn print_profile(
 fn profile_show(
     paths: &AppPaths,
     name: Option<&str>,
+    json: bool,
     out: &mut dyn Write,
 ) -> Result<(), Box<dyn Error>> {
     let paths = paths_for(paths, name)?;
+    let present = |paths: &AppPaths, config: &SuapConfig, out: &mut dyn Write| {
+        if json {
+            let profile = render::profile_json(paths, config);
+            writeln!(out, "{profile}")?;
+            return Ok(());
+        }
+        print_profile(paths, config, out)
+    };
     match load_config(&paths)? {
-        Some(config) => print_profile(&paths, &config, out),
+        Some(config) => present(&paths, &config, out),
         None if paths.profile() == DEFAULT_PROFILE => {
-            writeln!(out, "{UNSAVED_DEFAULT_NOTE}")?;
-            print_profile(&paths, &SuapConfig::default(), out)
+            if !json {
+                writeln!(out, "{UNSAVED_DEFAULT_NOTE}")?;
+            }
+            present(&paths, &SuapConfig::default(), out)
         }
         None => Err(missing_profile(paths.profile())),
     }
@@ -814,8 +871,13 @@ fn missing_profile(name: &str) -> Box<dyn Error> {
     format!("o perfil {name:?} não existe: crie-o com `chamados profile init {name}`").into()
 }
 
-fn profile_list(paths: &AppPaths, out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
+fn profile_list(paths: &AppPaths, json: bool, out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
     let profiles = list_profiles(paths)?;
+    if json {
+        let profiles = render::profiles_json(&profiles, DEFAULT_PROFILE);
+        writeln!(out, "{profiles}")?;
+        return Ok(());
+    }
     if profiles.is_empty() {
         writeln!(out, "{NO_PROFILES_HINT}")?;
     }
@@ -1028,6 +1090,12 @@ fn list(paths: &AppPaths, args: ListArgs, out: &mut dyn Write) -> Result<(), Box
         .filter(|ticket| matches_title(&ticket.id))
         .take(args.limite.unwrap_or(usize::MAX))
         .collect();
+    if args.json {
+        let local_title = |id: &str| titles.get(id).map(str::to_owned);
+        let json = render::tickets_json(&tickets, &local_title);
+        writeln!(out, "{json}")?;
+        return Ok(());
+    }
 
     if tickets.is_empty() {
         writeln!(out, "Nenhum chamado encontrado.")?;
@@ -1041,7 +1109,7 @@ fn list(paths: &AppPaths, args: ListArgs, out: &mut dyn Write) -> Result<(), Box
     Ok(())
 }
 
-fn show(paths: &AppPaths, id: u64, out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
+fn show(paths: &AppPaths, id: u64, json: bool, out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
     let config = profile_config(paths)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1052,7 +1120,13 @@ fn show(paths: &AppPaths, id: u64, out: &mut dyn Write) -> Result<(), Box<dyn Er
         .block_on(source.get_ticket(&id.to_string()))
         .map_err(explain)?;
     let titles = TitleStore::open(paths.titles_file())?;
-    print_details(&details, titles.get(&id.to_string()), out)?;
+    let local_title = titles.get(&id.to_string());
+    if json {
+        let details = render::details_json(&details, local_title);
+        writeln!(out, "{details}")?;
+        return Ok(());
+    }
+    print_details(&details, local_title, out)?;
     Ok(())
 }
 
@@ -1720,6 +1794,12 @@ fn sync_run(
     if args.check {
         let probed = runtime.block_on(backend.probe_conditional_writes())?;
         let name = settings.backend.as_deref().unwrap_or_default();
+        if args.json {
+            let configured = backend.supports_conditional_writes();
+            let check = render::sync_check_json(name, probed, configured, source.name());
+            writeln!(out, "{check}")?;
+            return Ok(());
+        }
         writeln!(out, "backend: {name}")?;
         writeln!(out, "escrita condicional: {}", support_text(probed))?;
         if probed != backend.supports_conditional_writes() {
@@ -1734,6 +1814,16 @@ fn sync_run(
     };
     let report = runtime.block_on(sync_once(paths, &backend, &key, &options))?;
     if args.quiet {
+        return Ok(());
+    }
+    if args.json {
+        let done = render::sync_report_json(
+            report.profiles,
+            report.local_changes,
+            report.uploaded,
+            args.dry_run,
+        );
+        writeln!(out, "{done}")?;
         return Ok(());
     }
     let cloud = match (report.uploaded, args.dry_run) {
@@ -1752,6 +1842,78 @@ fn sync_run(
     );
     writeln!(out, "{message}")?;
     Ok(())
+}
+
+/// Looks at a list again and again, saying what changed since the previous look.
+fn watch(paths: &AppPaths, args: &WatchArgs, out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
+    let (queue, kind) = match args.suporte {
+        true => (TicketQueue::Support, "support"),
+        false => (TicketQueue::Mine, "mine"),
+    };
+    let scope = format!("{kind}:{}", if args.todos { "all" } else { "active" });
+    let filter = TicketFilter {
+        all_statuses: args.todos,
+        all_pages: true,
+        ..TicketFilter::default()
+    };
+    let (runtime, client) = connect(paths)?;
+    let source = SuapTicketSource::new(&client, queue);
+    let titles = TitleStore::open(paths.titles_file())?;
+    let state_file = paths.watch_file();
+    let mut previous = Snapshot::load(&state_file).map_err(explain)?;
+    if previous.as_ref().is_none_or(|known| known.scope != scope) && !args.json {
+        let note =
+            format!("Acompanhando ({kind}); a primeira consulta só registra o estado atual.");
+        writeln!(out, "{note}")?;
+    }
+    let mut round = 0;
+    loop {
+        round += 1;
+        let polled = runtime.block_on(poll(
+            &source,
+            &filter,
+            &scope,
+            args.mensagens,
+            previous.as_ref(),
+        ));
+        match polled {
+            Ok((snapshot, events)) => {
+                let now = unix_now() / 1_000;
+                for event in &events {
+                    let title = titles.get(event.id());
+                    let line = match args.json {
+                        true => {
+                            let mut object = event.to_json(now);
+                            object["title"] = title.into();
+                            object.to_string()
+                        }
+                        false => render::watch_line(event, now, title),
+                    };
+                    writeln!(out, "{line}")?;
+                }
+                snapshot.save(&state_file).map_err(explain)?;
+                previous = Some(snapshot);
+            }
+            // Without a session there is nothing to retry: the user has to log in again.
+            Err(TicketError::Suap(SuapError::NotAuthenticated)) => {
+                return Err(explain(TicketError::Suap(SuapError::NotAuthenticated)));
+            }
+            // A failed look (network, SUAP busy) is reported and tried again at the next round.
+            Err(error) => {
+                let message = error.to_string();
+                let line = match args.json {
+                    true => serde_json::json!({"time": unix_now() / 1_000, "event": "error", "message": message}).to_string(),
+                    false => format!("aviso: consulta falhou ({message}); tento de novo na próxima rodada"),
+                };
+                writeln!(out, "{line}")?;
+            }
+        }
+        out.flush()?;
+        if args.rodadas.is_some_and(|limit| round >= limit) {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(args.intervalo));
+    }
 }
 
 fn unix_now() -> u64 {
@@ -3201,8 +3363,9 @@ mod tests {
 
     /// Commands without free text. A new command must be added to one of the two lists, which forces
     /// a decision about RS-02 (and a test for it) whenever a command is created.
-    const NON_TEXT_COMMANDS: [&str; 15] = [
+    const NON_TEXT_COMMANDS: [&str; 16] = [
         "sync",
+        "watch",
         "assign",
         "tag",
         "interested",
@@ -3475,6 +3638,370 @@ mod tests {
             let (code, _, err) = run_args(args, &paths);
             assert_eq!(code, 2, "{args:?}: {err}");
         }
+    }
+
+    fn json_of(text: &str) -> serde_json::Value {
+        serde_json::from_str(text.trim()).expect("the command printed valid JSON")
+    }
+
+    #[test]
+    fn reading_commands_print_json_for_scripts() {
+        use serde_json::json;
+        let (_empty_dir, empty) = paths();
+        let (_dir, paths) = paths();
+        let (runtime, server) = bare_server();
+        run_args(
+            &[
+                "profile",
+                "init",
+                "--base-url",
+                &server.uri(),
+                "--username",
+                "ana",
+            ],
+            &paths,
+        );
+        let listing = r#"<div class="general-box"><span class="status">Em atendimento</span>
+            <h4><a href="/centralservicos/chamado/7/">REQ #7 <strong>Assunto</strong></a></h4></div>
+            <div class="general-box"><h4><a href="/centralservicos/chamado/8/">REQ #8</a></h4></div>"#;
+        mount_text(
+            &runtime,
+            &server,
+            "GET",
+            "/centralservicos/listar_chamados_suporte/",
+            ResponseTemplate::new(200).set_body_string(listing),
+        );
+        mount_text(
+            &runtime,
+            &server,
+            "GET",
+            "/centralservicos/chamado/5/",
+            ResponseTemplate::new(200).set_body_string(ATTACHED_TICKET),
+        );
+        mount_text(
+            &runtime,
+            &server,
+            "GET",
+            "/centralservicos/chamado/6/",
+            ResponseTemplate::new(200).set_body_string(
+                r#"<main id="content"><div class="title-container"><h2>Chamado 6</h2></div>
+                <div class="accordion"><button class="accordion-button">1.2 Gestão</button><div class="accordion-body">
+                <dl class="definition-list"><div class="list-item"><dt>Interessado</dt><dd>Ana</dd></div></dl></div></div></main>"#,
+            ),
+        );
+        run_args(&["title", "7", "Meu título"], &paths);
+
+        // list: ids are numbers, missing values are null.
+        let (code, out, err) = run_args(&["list", "--json"], &paths);
+        assert_eq!((code, err.as_str()), (0, ""));
+        let tickets = json_of(&out);
+        assert_eq!(tickets[0]["id"], json!(7));
+        assert_eq!(tickets[0]["status"], json!("Em atendimento"));
+        assert_eq!(tickets[0]["title"], json!("Meu título"));
+        assert_eq!(tickets[0]["subject"], json!("Assunto"));
+        assert!(tickets[0]["url"]
+            .as_str()
+            .unwrap()
+            .ends_with("/centralservicos/chamado/7/"));
+        assert_eq!(tickets[1]["status"], json!(null));
+        assert_eq!(tickets[1]["title"], json!(null));
+        let (_, out, _) = run_args(&["list", "--json", "--titulo", "nada"], &paths);
+        assert_eq!(json_of(&out), json!([]));
+
+        // show
+        let (code, out, _) = run_args(&["show", "5", "--json"], &paths);
+        assert_eq!(code, 0);
+        let details = json_of(&out);
+        assert_eq!(details["id"], json!(5));
+        assert_eq!(details["title"], json!("Chamado 5"));
+        assert_eq!(details["local_title"], json!(null));
+        assert_eq!(
+            details["attachments"][1],
+            json!({
+                "number": 2,
+                "name": "../foto.png",
+                "path": "/djtools/arquivo/centralservicos/chamadoanexo/2/anexo/",
+            })
+        );
+        assert_eq!(details["timeline"][0]["date"], json!("1"));
+        assert!(details["fields"].as_array().unwrap().is_empty());
+        let (_, out, _) = run_args(&["show", "6", "--json"], &paths);
+        let with_fields = json_of(&out);
+        assert_eq!(
+            with_fields["fields"],
+            json!([{"label": "Interessado", "value": "Ana"}])
+        );
+        assert_eq!(with_fields["service"], json!("1.2 Gestão"));
+
+        // profile show / list
+        let (_, out, _) = run_args(&["profile", "show", "--json"], &paths);
+        let profile = json_of(&out);
+        assert_eq!(profile["profile"], json!("default"));
+        assert_eq!(profile["username"], json!("ana"));
+        assert_eq!(profile["sync"], json!(false));
+        assert_eq!(profile["session_saved"], json!(false));
+        assert_eq!(profile["open"]["service"], json!(null));
+        let (_, out, _) = run_args(&["profile", "list", "--json"], &paths);
+        let profiles = json_of(&out);
+        assert_eq!(profiles[0]["name"], json!("default"));
+        assert_eq!(profiles[0]["default"], json!(true));
+        // Without a saved profile the built-in default is described, with no hint line before the JSON.
+
+        let (_, out, _) = run_args(&["profile", "show", "--json"], &empty);
+        assert_eq!(json_of(&out)["username"], json!(null));
+        let (_, out, _) = run_args(&["profile", "list", "--json"], &empty);
+        assert_eq!(json_of(&out), json!([]));
+    }
+
+    #[test]
+    fn sync_prints_json_for_scripts() {
+        use serde_json::json;
+        let root = tempdir().unwrap();
+        let cloud = root.path().join("nuvem");
+        let (_dir, paths) = paths();
+        setup_sync(&paths, &cloud, &root.path().join("k"));
+        run_args(&["sync", "key", "generate"], &paths);
+        run_args(&["profile", "init", "--sync", "true"], &paths);
+
+        let (code, out, _) = run_args(&["sync", "--check", "--json"], &paths);
+        assert_eq!(code, 0);
+        assert_eq!(
+            json_of(&out),
+            json!({
+                "backend": "directory",
+                "conditional_writes": true,
+                "matches_configuration": true,
+                "key_source": "file",
+                "key_present": true,
+            })
+        );
+        let (_, out, _) = run_args(&["sync", "--dry-run", "--json"], &paths);
+        assert_eq!(
+            json_of(&out),
+            json!({"profiles": 1, "local_changes": 0, "cloud_updated": true, "dry_run": true})
+        );
+        let (_, out, _) = run_args(&["sync", "--json"], &paths);
+        assert_eq!(json_of(&out)["dry_run"], json!(false));
+        // Quiet wins over JSON.
+        assert_eq!(run_args(&["sync", "--json", "--quiet"], &paths).1, "");
+    }
+
+    #[test]
+    fn watch_reports_what_changed_between_looks() {
+        use serde_json::json;
+        let (_dir, paths) = paths();
+        let (runtime, server) = bare_server();
+        run_args(&["profile", "init", "--base-url", &server.uri()], &paths);
+        let boxes = |tickets: &[(u32, &str)]| -> String {
+            let items: Vec<String> = tickets
+                .iter()
+                .map(|(id, status)| {
+                    format!(
+                        r#"<div class="general-box"><span class="status">{status}</span>
+                        <h4><a href="/centralservicos/chamado/{id}/">REQ #{id} <strong>Assunto {id}</strong></a></h4></div>"#
+                    )
+                })
+                .collect();
+            items.concat()
+        };
+        let serve = |body: String| {
+            runtime.block_on(server.reset());
+            mount_text(
+                &runtime,
+                &server,
+                "GET",
+                "/centralservicos/meus_chamados/",
+                ResponseTemplate::new(200).set_body_string(body),
+            );
+        };
+        run_args(&["title", "7", "Meu título"], &paths);
+
+        // First look: only a baseline, and it says so.
+        serve(boxes(&[(7, "Aberto"), (8, "Aberto")]));
+        let (code, out, err) = run_args(&["watch", "--rodadas", "1"], &paths);
+        assert_eq!((code, err.as_str()), (0, ""));
+        assert!(
+            out.contains("Acompanhando (mine)") && out.lines().count() == 1,
+            "{out}"
+        );
+        assert!(paths.watch_file().exists());
+        // Looking again at the same list: nothing to say.
+        let (_, out, _) = run_args(&["watch", "--rodadas", "1"], &paths);
+        assert_eq!(out, "");
+
+        // #7 changes, #8 leaves, #9 appears.
+        serve(boxes(&[(7, "Resolvido"), (9, "Aberto")]));
+        let (_, out, _) = run_args(&["watch", "--rodadas", "1"], &paths);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3, "{out}");
+        assert!(
+            lines[0].contains("#7 (Meu título)  situação: Aberto -> Resolvido"),
+            "{out}"
+        );
+        assert!(lines[1].contains("#9  novo: Aberto - Assunto 9"), "{out}");
+        assert!(
+            lines[2].contains("#8  saiu da lista (última situação: Aberto)"),
+            "{out}"
+        );
+        assert!(lines[0].starts_with("20") && lines[0].contains('T') && lines[0].contains("Z  #"));
+
+        // JSON lines, with the local title.
+        serve(boxes(&[(7, "Fechado"), (9, "Aberto")]));
+        let (_, out, _) = run_args(&["watch", "--rodadas", "1", "--json"], &paths);
+        let event = json_of(&out);
+        assert_eq!(event["event"], json!("status"));
+        assert_eq!(event["id"], json!(7));
+        assert_eq!(event["from"], json!("Resolvido"));
+        assert_eq!(event["to"], json!("Fechado"));
+        assert_eq!(event["title"], json!("Meu título"));
+        assert!(event["time"].as_u64().unwrap() > 1_700_000_000);
+
+        // Another list (the support queue) is another baseline.
+        mount_text(
+            &runtime,
+            &server,
+            "GET",
+            "/centralservicos/listar_chamados_suporte/",
+            ResponseTemplate::new(200).set_body_string(boxes(&[(1, "Aberto")])),
+        );
+        let (_, out, _) = run_args(&["watch", "--rodadas", "1", "--suporte", "--todos"], &paths);
+        assert!(
+            out.contains("Acompanhando (support)") && out.lines().count() == 1,
+            "{out}"
+        );
+
+        // A failed look is reported and the next round tries again (here it recovers).
+        serve(boxes(&[(7, "Fechado")]));
+        let (_, _, _) = run_args(&["watch", "--rodadas", "1"], &paths);
+        runtime.block_on(server.reset());
+        mount_text(
+            &runtime,
+            &server,
+            "GET",
+            "/centralservicos/meus_chamados/",
+            ResponseTemplate::new(500),
+        );
+        let (code, out, _) = run_args(&["watch", "--rodadas", "1"], &paths);
+        assert_eq!(code, 0);
+        assert!(
+            out.contains("aviso: consulta falhou") && out.contains("próxima rodada"),
+            "{out}"
+        );
+        let (_, out, _) = run_args(&["watch", "--rodadas", "1", "--json"], &paths);
+        let failure = json_of(&out);
+        assert_eq!(failure["event"], json!("error"));
+        assert!(failure["message"].as_str().unwrap().contains("500"));
+    }
+
+    #[test]
+    fn watch_pauses_between_rounds_follows_messages_and_needs_a_session() {
+        use serde_json::json;
+        let (_dir, paths) = paths();
+        let (runtime, server) = bare_server();
+        run_args(&["profile", "init", "--base-url", &server.uri()], &paths);
+        let listing = r#"<div class="general-box"><span class="status">Aberto</span>
+            <h4><a href="/centralservicos/chamado/7/">REQ #7 <strong>Assunto</strong></a></h4></div>"#;
+        mount_text(
+            &runtime,
+            &server,
+            "GET",
+            "/centralservicos/meus_chamados/",
+            ResponseTemplate::new(200).set_body_string(listing),
+        );
+        let page = |entries: &str| {
+            format!(
+                r#"<main id="content"><div class="title-container"><h2>Chamado 7</h2></div>
+                <div data-tab="linha_tempo"><ul class="timeline">{entries}</ul></div></main>"#
+            )
+        };
+        let entry = |date: &str, text: &str| {
+            format!(
+                r#"<li><div class="timeline-date">{date}</div><div class="timeline-content"><p>{text}</p></div></li>"#
+            )
+        };
+        mount_text(
+            &runtime,
+            &server,
+            "GET",
+            "/centralservicos/chamado/7/",
+            ResponseTemplate::new(200).set_body_string(page(&entry("10:00", "abri"))),
+        );
+        let (_, _, _) = run_args(&["watch", "--rodadas", "1", "--mensagens"], &paths);
+
+        runtime.block_on(server.reset());
+        mount_text(
+            &runtime,
+            &server,
+            "GET",
+            "/centralservicos/meus_chamados/",
+            ResponseTemplate::new(200).set_body_string(listing),
+        );
+        let newest = format!(
+            "{}{}",
+            entry("11:00", "resposta nova"),
+            entry("10:00", "abri")
+        );
+        mount_text(
+            &runtime,
+            &server,
+            "GET",
+            "/centralservicos/chamado/7/",
+            ResponseTemplate::new(200).set_body_string(page(&newest)),
+        );
+        // Two rounds, one second apart: the second one has nothing new to say.
+        let started = std::time::Instant::now();
+        let (code, out, err) = run_args(
+            &[
+                "watch",
+                "--rodadas",
+                "2",
+                "--intervalo",
+                "1",
+                "--mensagens",
+                "--json",
+            ],
+            &paths,
+        );
+        assert_eq!((code, err.as_str()), (0, ""));
+        assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+        let event = json_of(&out);
+        assert_eq!(event["event"], json!("message"));
+        assert_eq!(event["text"], json!("resposta nova"));
+        assert_eq!(out.lines().count(), 1, "{out}");
+
+        // Out-of-range options are refused by clap.
+        for bad in [
+            &["watch", "--intervalo", "0"][..],
+            &["watch", "--rodadas", "0"],
+        ] {
+            assert_eq!(run_args(bad, &paths).0, 2, "{bad:?}");
+        }
+
+        // Without a session the loop does not spin: it asks for a login.
+        runtime.block_on(server.reset());
+        mount_text(
+            &runtime,
+            &server,
+            "GET",
+            "/centralservicos/meus_chamados/",
+            ResponseTemplate::new(302).insert_header("location", "/accounts/login/"),
+        );
+        mount_text(
+            &runtime,
+            &server,
+            "GET",
+            "/accounts/login/",
+            ResponseTemplate::new(200),
+        );
+        let (code, _, err) = run_args(&["watch", "--rodadas", "3", "--intervalo", "1"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("chamados login"), "{err}");
+
+        // A damaged state file is reported, not discarded.
+        std::fs::write(paths.watch_file(), "isto nao e json").unwrap();
+        let (code, _, err) = run_args(&["watch", "--rodadas", "1"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("watch state"), "{err}");
     }
 
     #[test]
