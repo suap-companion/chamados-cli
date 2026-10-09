@@ -16,6 +16,8 @@ use crate::{
 pub const DIRECTORY_BACKEND: &str = "directory";
 /// Name of the S3-compatible backend in the settings.
 pub const S3_BACKEND: &str = "s3";
+/// Cloudflare R2: the same protocol as `s3` (default region `auto`), named after the provider.
+pub const R2_BACKEND: &str = "r2";
 
 /// Whichever backend the settings name.
 pub enum AnyBackend {
@@ -74,7 +76,7 @@ fn directory_from(settings: &SyncSettings) -> Result<DirectoryBackend, SyncError
 fn unavailable(settings: &SyncSettings) -> SyncError {
     match settings.backend.as_deref() {
         Some(other) => SyncError::Backend(format!(
-            "unknown backend {other:?}: use {DIRECTORY_BACKEND:?} or {S3_BACKEND:?}"
+            "unknown backend {other:?}: use {DIRECTORY_BACKEND:?}, {S3_BACKEND:?} or {R2_BACKEND:?}"
         )),
         None => SyncError::Backend("no backend configured".to_owned()),
     }
@@ -84,7 +86,7 @@ fn unavailable(settings: &SyncSettings) -> SyncError {
 pub fn validate_settings(settings: &SyncSettings) -> Result<(), SyncError> {
     match settings.backend.as_deref() {
         Some(DIRECTORY_BACKEND) => directory_from(settings).map(drop),
-        Some(S3_BACKEND) => S3Settings::from_settings(settings).map(drop),
+        Some(S3_BACKEND | R2_BACKEND) => S3Settings::from_settings(settings).map(drop),
         _ => Err(unavailable(settings)),
     }
 }
@@ -96,7 +98,7 @@ pub fn backend_from(
 ) -> Result<AnyBackend, SyncError> {
     match settings.backend.as_deref() {
         Some(DIRECTORY_BACKEND) => Ok(AnyBackend::Directory(directory_from(settings)?)),
-        Some(S3_BACKEND) => {
+        Some(S3_BACKEND | R2_BACKEND) => {
             let s3_settings = S3Settings::from_settings(settings)?;
             let credentials = credentials.ok_or_else(|| {
                 SyncError::Key(
@@ -187,6 +189,17 @@ mod tests {
             .contains("unknown backend"));
         let none = backend_from(&SyncSettings::default(), None).err().unwrap();
         assert!(none.to_string().contains("no backend configured"));
+    }
+
+    #[test]
+    fn r2_is_the_s3_protocol_under_the_provider_name() {
+        let settings = SyncSettings {
+            backend: Some(R2_BACKEND.to_owned()),
+            ..s3(Some("https://conta.r2.cloudflarestorage.com"), Some("b"))
+        };
+        assert!(validate_settings(&settings).is_ok());
+        let backend = backend_from(&settings, credentials()).unwrap();
+        assert!(matches!(backend, AnyBackend::S3(_)));
     }
 
     #[test]

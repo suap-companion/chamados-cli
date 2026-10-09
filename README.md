@@ -197,7 +197,7 @@ Em outro dispositivo, repita o `setup` e **leve a chave por um canal seu** (nunc
 
 ### Cloudflare R2 (ou outro S3-compatível)
 
-Em vez de uma pasta, o `sync` pode usar um bucket S3-compatível (Cloudflare R2, AWS S3, MinIO, Backblaze B2...) por HTTPS, com requisições assinadas (SigV4). O provedor é escolha sua; nada no código o fixa. O `chamados` só faz `GET`, `PUT` e `DELETE` de um objeto: não usa ACLs, links pré-assinados nem listagens, então não há como tornar o objeto público.
+Para o Cloudflare R2 use `--backend r2`; para qualquer outro S3-compatível, `--backend s3` (o protocolo é o mesmo, só muda o nome mostrado). Em vez de uma pasta, o `sync` pode usar um bucket S3-compatível (Cloudflare R2, AWS S3, MinIO, Backblaze B2...) por HTTPS, com requisições assinadas (SigV4). O provedor é escolha sua; nada no código o fixa. O `chamados` só faz `GET`, `PUT` e `DELETE` de um objeto: não usa ACLs, links pré-assinados nem listagens, então não há como tornar o objeto público.
 
 No Cloudflare R2:
 
@@ -206,7 +206,7 @@ No Cloudflare R2:
 3. O endpoint é `https://<ACCOUNT_ID>.r2.cloudflarestorage.com` (o `ACCOUNT_ID` aparece no painel do R2).
 
 ```bash
-chamados sync setup --backend s3 \
+chamados sync setup --backend r2 \
   --endpoint https://<ACCOUNT_ID>.r2.cloudflarestorage.com \
   --bucket meu-bucket --prefix chamados --key-source file     # região padrão: auto (R2)
 

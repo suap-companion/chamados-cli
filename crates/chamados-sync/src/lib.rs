@@ -34,7 +34,8 @@ pub use engine::{sync_once, SyncLock, SyncOptions, SyncReport, OBJECT_NAME};
 pub use keys::{load_key, store_key, KeySource, KEY_ENV};
 pub use s3::{S3Backend, S3Settings};
 pub use setup::{
-    backend_from, key_source_from, validate_settings, AnyBackend, DIRECTORY_BACKEND, S3_BACKEND,
+    backend_from, key_source_from, validate_settings, AnyBackend, DIRECTORY_BACKEND, R2_BACKEND,
+    S3_BACKEND,
 };
 
 /// Everything that can go wrong while synchronizing.
