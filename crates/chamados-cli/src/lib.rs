@@ -186,8 +186,8 @@ enum SyncAction {
 
 #[derive(Debug, Subcommand)]
 enum CredentialsCommand {
-    /// Guarda no chaveiro as credenciais lidas da entrada padrão: a primeira linha é o Access Key ID
-    /// e a segunda, o Secret Access Key. Nunca passe segredos como argumento.
+    /// Pede o Access Key ID e o Secret Access Key (sem eco) e os guarda no chaveiro. Com entrada
+    /// redirecionada, lê duas linhas: o Access Key ID e o Secret. Nunca passe segredos como argumento.
     Set,
     /// Informa se há credenciais (variáveis de ambiente ou chaveiro), sem mostrá-las.
     Status,
@@ -308,18 +308,41 @@ const UNSAVED_DEFAULT_NOTE: &str = "(perfil padrão ainda não gravado; valores 
 const NO_PROFILES_HINT: &str = "Nenhum perfil configurado. Crie um com `chamados profile init`.";
 const HELP_HINT: &str = "Use `chamados --help` para consultar os comandos disponíveis.";
 
+/// Asks the user for values interactively; `main` implements it over the terminal.
+pub trait Prompt {
+    /// Asks for a value that may be shown on screen.
+    fn line(&mut self, label: &str) -> std::io::Result<String>;
+    /// Asks for a secret, without echoing it.
+    fn secret(&mut self, label: &str) -> std::io::Result<String>;
+}
+
+/// The prompt used when there is no interactive terminal: every question fails.
+pub struct NoPrompt;
+
+impl Prompt for NoPrompt {
+    fn line(&mut self, _label: &str) -> std::io::Result<String> {
+        Err(std::io::Error::other("no interactive terminal"))
+    }
+
+    fn secret(&mut self, _label: &str) -> std::io::Result<String> {
+        Err(std::io::Error::other("no interactive terminal"))
+    }
+}
+
 /// Name of the environment variable that holds the SUAP password.
 pub const PASSWORD_ENV: &str = "SUAP_PASSWORD";
 
 /// Runs the CLI with `args`, writing to `out`/`err`, and returns the process exit code.
 ///
-/// `password` is the value of [`PASSWORD_ENV`] and `input` the standard input (empty when it is a terminal);
-/// both are read by the caller so they can be injected in tests.
+/// `password` is the value of [`PASSWORD_ENV`], `input` the standard input (empty when it is a terminal)
+/// and `prompt` how to ask the user questions; all are provided by the caller so they can be injected
+/// in tests.
 pub fn run<I, T>(
     args: I,
     paths: &AppPaths,
     password: Option<String>,
     input: &mut dyn Read,
+    prompt: &mut dyn Prompt,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32
@@ -348,7 +371,7 @@ where
         }
     };
 
-    match execute(cli, &paths, password, input, out) {
+    match execute(cli, &paths, password, input, prompt, out) {
         Ok(()) => 0,
         Err(error) => {
             let _ = writeln!(err, "erro: {error}");
@@ -362,6 +385,7 @@ fn execute(
     paths: &AppPaths,
     password: Option<String>,
     input: &mut dyn Read,
+    prompt: &mut dyn Prompt,
     out: &mut dyn Write,
 ) -> Result<(), Box<dyn Error>> {
     match cli.command {
@@ -380,7 +404,7 @@ fn execute(
         Some(Command::Open(args)) => open(paths, args, input, out),
         Some(Command::Comment(args)) => send_message(paths, args, Message::Comment, input, out),
         Some(Command::Note(args)) => send_message(paths, args, Message::InternalNote, input, out),
-        Some(Command::Sync(args)) => sync(paths, args, input, out),
+        Some(Command::Sync(args)) => sync(paths, args, input, prompt, out),
         Some(Command::Suspend(args)) => suspend(paths, args, input, out),
         Some(Command::Resolve(args)) => resolve(paths, args, input, out),
         Some(Command::Title { id, text, remove }) => title(paths, id, text, remove, out),
@@ -781,12 +805,13 @@ fn sync(
     paths: &AppPaths,
     args: SyncArgs,
     input: &mut dyn Read,
+    prompt: &mut dyn Prompt,
     out: &mut dyn Write,
 ) -> Result<(), Box<dyn Error>> {
     match args.action {
         Some(SyncAction::Setup(setup)) => sync_setup(paths, *setup, out),
         Some(SyncAction::Key { command }) => sync_key(paths, command, input, out),
-        Some(SyncAction::Credentials { command }) => sync_credentials(command, input, out),
+        Some(SyncAction::Credentials { command }) => sync_credentials(command, input, prompt, out),
         None => sync_run(paths, &args, out),
     }
 }
@@ -821,15 +846,29 @@ fn sync_setup(
     Ok(())
 }
 
+fn no_terminal(_: std::io::Error) -> Box<dyn Error> {
+    "sem terminal interativo: envie as duas linhas (Access Key ID e Secret) pela entrada padrão"
+        .into()
+}
+
 fn sync_credentials(
     command: CredentialsCommand,
     input: &mut dyn Read,
+    prompt: &mut dyn Prompt,
     out: &mut dyn Write,
 ) -> Result<(), Box<dyn Error>> {
     match command {
         CredentialsCommand::Set => {
             let mut text = String::new();
             input.read_to_string(&mut text)?;
+            if text.trim().is_empty() {
+                // Nothing piped in: ask on the terminal, keeping the secret off the screen.
+                let id = prompt.line("Access Key ID: ").map_err(no_terminal)?;
+                let secret = prompt
+                    .secret("Secret Access Key (não aparece na tela): ")
+                    .map_err(no_terminal)?;
+                text = format!("{id}\n{secret}");
+            }
             S3Credentials::parse(&text)?.store()?;
             writeln!(out, "Credenciais guardadas no chaveiro.")?;
         }
@@ -1175,6 +1214,7 @@ mod tests {
             paths,
             None,
             &mut std::io::empty(),
+            &mut NoPrompt,
             &mut out,
             &mut err,
         );
@@ -1505,6 +1545,7 @@ mod tests {
             paths,
             password.map(str::to_owned),
             &mut std::io::empty(),
+            &mut NoPrompt,
             &mut out,
             &mut err,
         );
@@ -2290,11 +2331,15 @@ mod tests {
         let (_dir, paths) = paths();
         let (_, out, _) = run_args(&["sync", "credentials", "status"], &paths);
         assert_eq!(out, "credenciais presentes: não\n");
-        for bad in ["", "so-uma-linha", "a\nb\nc"] {
+        for bad in ["so-uma-linha", "a\nb\nc"] {
             let (code, _, err) = run_with_input(&["sync", "credentials", "set"], &paths, bad);
             assert_eq!(code, 1, "{bad:?}");
             assert!(err.contains("expected two lines"), "{err}");
         }
+        // No input and no terminal: there is nobody to ask.
+        let (code, _, err) = run_args(&["sync", "credentials", "set"], &paths);
+        assert_eq!(code, 1);
+        assert!(err.contains("sem terminal interativo"), "{err}");
         let (code, out, err) = run_with_input(
             &["sync", "credentials", "set"],
             &paths,
@@ -2305,6 +2350,89 @@ mod tests {
         assert!(!out.contains("segredo") && !out.contains("AKIA"));
         let (_, out, _) = run_args(&["sync", "credentials", "status"], &paths);
         assert_eq!(out, "credenciais presentes: sim\n");
+    }
+
+    /// A terminal that answers from a script and remembers what it was asked.
+    struct ScriptedTerminal {
+        id: String,
+        secret: Option<String>,
+        asked: Vec<String>,
+    }
+
+    impl Prompt for ScriptedTerminal {
+        fn line(&mut self, label: &str) -> std::io::Result<String> {
+            self.asked.push(label.to_owned());
+            Ok(self.id.clone())
+        }
+
+        fn secret(&mut self, label: &str) -> std::io::Result<String> {
+            self.asked.push(label.to_owned());
+            self.secret
+                .clone()
+                .ok_or_else(|| std::io::Error::other("sem resposta"))
+        }
+    }
+
+    #[test]
+    fn credentials_are_asked_for_on_the_terminal_when_nothing_is_piped() {
+        let _guard = use_mock_keyring();
+        let (_dir, paths) = paths();
+        let mut terminal = ScriptedTerminal {
+            id: "AKIAINTERATIVO".to_owned(),
+            secret: Some("segredo-digitado".to_owned()),
+            asked: Vec::new(),
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run(
+            ["chamados", "sync", "credentials", "set"],
+            &paths,
+            None,
+            &mut std::io::empty(),
+            &mut terminal,
+            &mut out,
+            &mut err,
+        );
+        let (out, err) = (
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        );
+        assert_eq!(
+            (code, err.as_str(), out.as_str()),
+            (0, "", "Credenciais guardadas no chaveiro.\n")
+        );
+        assert_eq!(
+            terminal.asked,
+            [
+                "Access Key ID: ",
+                "Secret Access Key (não aparece na tela): "
+            ]
+        );
+        assert!(!out.contains("segredo-digitado"));
+        let (_, status, _) = run_args(&["sync", "credentials", "status"], &paths);
+        assert_eq!(status, "credenciais presentes: sim\n");
+
+        // Cancelled or failing prompts are reported, and nothing is stored.
+        terminal.secret = None;
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run(
+            ["chamados", "sync", "credentials", "set"],
+            &paths,
+            None,
+            &mut std::io::empty(),
+            &mut terminal,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 1);
+        assert!(String::from_utf8(err)
+            .unwrap()
+            .contains("sem terminal interativo"));
+    }
+
+    #[test]
+    fn without_a_terminal_every_question_fails() {
+        assert!(NoPrompt.line("Pergunta: ").is_err());
+        assert!(NoPrompt.secret("Segredo: ").is_err());
     }
 
     #[test]
@@ -2684,6 +2812,7 @@ mod tests {
             paths,
             None,
             &mut input.as_bytes(),
+            &mut NoPrompt,
             &mut out,
             &mut err,
         );
@@ -3125,6 +3254,7 @@ mod tests {
             &paths,
             None,
             &mut std::io::empty(),
+            &mut NoPrompt,
             &mut FailingWriter,
             &mut err,
         );

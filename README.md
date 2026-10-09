@@ -210,15 +210,15 @@ chamados sync setup --backend s3 \
   --endpoint https://<ACCOUNT_ID>.r2.cloudflarestorage.com \
   --bucket meu-bucket --prefix chamados --key-source file     # região padrão: auto (R2)
 
-# credenciais: pela entrada padrão (nunca como argumento): linha 1 = Access Key ID, linha 2 = Secret
-printf '%s\n%s\n' "$ACCESS_KEY_ID" "$SECRET_ACCESS_KEY" | chamados sync credentials set
+# credenciais: o comando pergunta o Access Key ID e o Secret Access Key (este sem aparecer na tela)
+chamados sync credentials set
 
 chamados sync key generate
 chamados sync --check      # confere o acesso e se o bucket aceita escrita condicional
 chamados sync
 ```
 
-As credenciais ficam no **chaveiro do sistema** ou, para automação, nas variáveis `CHAMADOS_S3_ACCESS_KEY_ID` e `CHAMADOS_S3_SECRET_ACCESS_KEY` (o `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` também valem); **nunca** vão para o `config.toml` nem para a nuvem. `chamados sync credentials status` informa se existem, sem mostrá-las. O endpoint precisa ser `https` (`http` só é aceito em `localhost`, para testar contra um servidor local).
+Em um script, `chamados sync credentials set` também aceita as duas linhas pela entrada padrão (Access Key ID, depois o Secret); segredos nunca são aceitos como argumento. As credenciais ficam no **chaveiro do sistema** ou, para automação, nas variáveis `CHAMADOS_S3_ACCESS_KEY_ID` e `CHAMADOS_S3_SECRET_ACCESS_KEY` (o `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` também valem); **nunca** vão para o `config.toml` nem para a nuvem. `chamados sync credentials status` informa se existem, sem mostrá-las. O endpoint precisa ser `https` (`http` só é aceito em `localhost`, para testar contra um servidor local).
 
 `sync --check` faz duas escritas `If-None-Match: *` de um objeto temporário (que depois apaga) para descobrir se o bucket honra **escrita condicional**. Se não honrar (como alguns servidores), ajuste `chamados sync setup --conditional-writes false`: o `sync` passa a reler o que gravou para confirmar que ninguém gravou ao mesmo tempo.
 
