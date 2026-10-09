@@ -98,6 +98,11 @@ impl AppPaths {
         self.data_dir.join("sync.lock")
     }
 
+    /// Names of the synchronized profiles removed on this machine, with the time of the removal.
+    pub fn removed_profiles_file(&self) -> PathBuf {
+        self.data_dir.join("removed-profiles.json")
+    }
+
     /// Default location of the encryption key file (`file` key source).
     pub fn default_key_file(&self) -> PathBuf {
         self.config_dir.join("sync.key")
@@ -184,6 +189,9 @@ pub struct SyncSettings {
     /// Whether the storage honors conditional writes (`If-Match`); assumed true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conditional_writes: Option<bool>,
+    /// Synchronize right after each local change (`title`, `profile ...`); off when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto: Option<bool>,
 }
 
 /// Per-profile defaults used when opening tickets; every explicit option overrides them.
@@ -771,6 +779,7 @@ mod tests {
             bucket: Some("meu-bucket".to_owned()),
             prefix: Some("chamados".to_owned()),
             conditional_writes: Some(false),
+            auto: Some(true),
         };
         save_sync_settings(&paths, &settings).unwrap();
         assert_eq!(load_config(&paths).unwrap(), Some(config.clone()));

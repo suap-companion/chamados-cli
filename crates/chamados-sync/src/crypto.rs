@@ -48,30 +48,41 @@ impl Key {
 
     /// Lowercase hexadecimal form (64 characters), used to export and import the key.
     pub fn to_hex(&self) -> String {
-        self.0.iter().map(|byte| format!("{byte:02x}")).collect()
+        to_hex(&self.0)
     }
 
     /// Parses the hexadecimal form; surrounding whitespace is ignored.
     pub fn from_hex(text: &str) -> Result<Self, SyncError> {
         let text = text.trim();
-        if text.len() != KEY_LEN * 2 || !text.is_ascii() {
+        if text.len() != KEY_LEN * 2 {
             return Err(SyncError::Key(format!(
                 "expected {} hexadecimal characters",
                 KEY_LEN * 2
             )));
         }
-        let mut bytes = Vec::with_capacity(KEY_LEN);
-        for index in (0..text.len()).step_by(2) {
-            let byte = u8::from_str_radix(&text[index..index + 2], 16)
-                .map_err(|_| SyncError::Key("the key must be hexadecimal".to_owned()))?;
-            bytes.push(byte);
-        }
-        Self::from_bytes(&bytes)
+        Self::from_bytes(&from_hex_bytes(text)?)
     }
 
     fn cipher(&self) -> XChaCha20Poly1305 {
         XChaCha20Poly1305::new(&CipherKey::from(self.0))
     }
+}
+
+/// Lowercase hexadecimal form of `bytes`.
+pub(crate) fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The bytes written by [`to_hex`] (either case); anything that is not hexadecimal is refused.
+pub(crate) fn from_hex_bytes(text: &str) -> Result<Vec<u8>, SyncError> {
+    let invalid = || SyncError::Key("expected hexadecimal text".to_owned());
+    if !text.len().is_multiple_of(2) || !text.is_ascii() {
+        return Err(invalid());
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&text[index..index + 2], 16).map_err(|_| invalid()))
+        .collect()
 }
 
 /// Encrypts `plaintext` with a fresh random nonce.
